@@ -17,6 +17,18 @@ A mikrofonhoz helyi operációsrendszer-engedély szükséges. Hanghívás és m
 
 ## Windows
 
+### Windows PC → ez a Mac: első próba
+
+A külön **Experimental microphone Windows client** GitHub Actions workflow x64 hordozható alkalmazásmappát készít, kiadási publikálás és aláírókulcsok nélkül. Csak sikeres futás után töltsd le a `rustdesk-microphone-windows-x64-…` artifactot. A workflow hozzáadása önmagában nem jelenti, hogy már van letölthető vagy tesztelt Windows build.
+
+1. Csomagold ki az egész ZIP-et egy külön mappába; a DLL-eket és a `data` mappát hagyd az EXE mellett. Indítsd a `rustdesk.exe` fájlt. Ez helyi tesztbuild, nem gyártó által aláírt telepítő.
+2. Állítsd be a privát Rust-Remote útmutatóban szereplő ID-szervert és nyilvános kulcsot. Csatlakozz a Mac azonosítójához a meglévő jelszóval.
+3. Windowsban engedélyezd az asztali alkalmazások mikrofonját. A Macen a saját buildben engedélyezd a továbbított mikrofon fogadását; a BlackHole 2ch legyen telepítve.
+4. A Windows vezérlősávján nyomd meg a REC melletti mikrofont. A Mac célalkalmazásában válaszd a BlackHole 2ch bemenetet, majd indítsd újra a hangmódot.
+5. Beszélj a Windows mikrofonjába. Ellenőrizd a Mac bemeneti jelszintjét és a tényleges hangot, majd kapcsold ki a továbbítást: a korábbi Mac-bemenetnek vissza kell állnia.
+
+Ehhez az irányhoz Windowsban **nem kell VB-CABLE**: az csak akkor szükséges, ha a Windows a fogadó gép. A teljes ellenőrzőlista a [tesztleírásban](TESTING.md) található.
+
 **Küldés:** saját Windows build, Beállítások → Adatvédelem és biztonság → Mikrofon → asztali alkalmazások mikrofonhozzáférése bekapcsolva. A kívánt fizikai mikrofon legyen alapértelmezett.
 
 **Fogadás:** telepítsd a [VB-CABLE](https://vb-audio.com/Cable/) gyártói illesztőprogramját, majd az [AudioDeviceCmdlets](https://github.com/frgnca/AudioDeviceCmdlets) modult Windows PowerShellben:

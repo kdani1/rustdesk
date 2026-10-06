@@ -13,7 +13,10 @@ if [[ "$MODE" != --build-only ]]; then
   pids="$(pgrep -f "^${APP}/Contents/MacOS/RustDesk$" || true)"
   if [[ -n "$pids" ]]; then kill $pids; fi
 fi
-MACOSX_DEPLOYMENT_TARGET=10.14 cargo build --locked --release --features flutter --lib --bin service
+# Keep clang and its SDK from the same selected Xcode installation.
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+if [[ "$(uname -m)" == arm64 ]]; then export MACOSX_DEPLOYMENT_TARGET=11.0; else export MACOSX_DEPLOYMENT_TARGET=10.14; fi
+cargo build --locked --release --features flutter --lib --bin service
 cp target/release/liblibrustdesk.dylib target/release/librustdesk.dylib
 (
   cd flutter
