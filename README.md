@@ -1,3 +1,5 @@
+> **Fork: experimental remote microphone forwarding.** [Installation and usage (Hungarian)](docs/microphone/README.hu.md) · [Validation, test steps and current limits](docs/microphone/TESTING.md). Both endpoints need this feature build; this is not an official RustDesk release.
+
 <p align="center">
   <img src="res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
   <a href="#raw-steps-to-build">Build</a> •
