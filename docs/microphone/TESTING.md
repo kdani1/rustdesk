@@ -1,6 +1,6 @@
 # Verification and installation gate
 
-This is an experimental feature branch, not a supported release. Do not replace a working remote-access installation until the native build and a two-device test pass. Normal remote desktop connections continue using the existing server; only microphone forwarding requires this fork at both ends.
+This is an experimental feature branch, not a supported release. Preserve a working remote-access installation before installing a test build, and do not rely on the new build for unattended access until the two-device test passes. Normal remote desktop connections continue using the existing server; only microphone forwarding requires this fork at both ends.
 
 ## Automated/local checks
 
@@ -12,7 +12,8 @@ This is an experimental feature branch, not a supported release. Do not replace 
 - `tests/microphone/run-macos-route.sh`: passed both the missing-driver failure path and, after installing BlackHole 2ch 0.7.1 and rebooting, the actual default-input switch/restore path.
 - `cargo test --locked --features flutter --lib microphone_blackhole_opus_loopback -- --ignored --nocapture`: passed with BlackHole installed. This encodes a synthetic tone with Opus, sends it through the new dedicated output worker, and verifies decoded samples on BlackHole's input. It does not record the physical microphone or test a network connection.
 - Windows/Linux routing modules passed a Rust syntax/type check on macOS; their actual operating-system behavior remains untested.
-- Full native application build and microphone end-to-end test: pending. No release binaries are currently promised by this document.
+- macOS ARM64 release application build: passed with Flutter 3.24.5, selected Xcode SDK and Rosetta for the Flutter build tool. Local ad-hoc signature verification passed; the app launched and displayed both new settings. The experimental app was installed on the development Mac with the stable app backed up. macOS screen-recording permission must be renewed for the changed signature.
+- Windows x64 artifact build: GitHub Actions workflow added; only use an artifact from a successful run. Two-device microphone acceptance, including Windows -> Mac, remains pending. No tested cross-platform release is claimed.
 
 ## Required two-device acceptance test
 

@@ -82,3 +82,5 @@ A konkrét saját szerver címe és a gép csatlakozási adatai a külön, priv�
 ## Fordítás
 
 Az upstream [buildleírás](https://rustdesk.com/docs/en/dev/build/) és az adott platform [Flutter build workflow-ja](../../.github/workflows/flutter-build.yml) tartalmazza a verziókat és rendszerfüggőségeket. Ebből a forkból a `feature/remote-microphone` ágat klónozd rekurzív submodule-okkal. A `.github/workflows/bridge.yml` szerint generáld a Rust–Dart kötéseket. macOS-en a `script/build_and_run.sh --build-only` a helyi build belépési pontja, miután a toolchain, vcpkg, CocoaPods és Flutter rendelkezésre állnak.
+
+Apple Siliconon a Flutter 3.24.5 kiadási fordítóeszköze Rosettát is igényel. Ez buildfüggőség; a kész Mac alkalmazás ettől ARM64 marad. A buildszkript a kiválasztott Xcode saját SDK-ját használja, így nem keveri azt egy másik Command Line Tools SDK-val.
