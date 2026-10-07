@@ -668,12 +668,10 @@ impl<T: InvokeUiSession> Remote<T> {
             // It's better to distinguish the server side and client side.
             // But it' not necessary for now, because it's not a common case.
             // And it is immediately known when the input device is changed.
-            if crate::audio_service::get_voice_call_input_device().is_some() { return None; }
-            let capture_lease = crate::microphone_forwarding::CaptureLease::acquire()?;
             let input = get_default_sound_input();
             #[cfg(not(target_os = "android"))]
             if input.is_none() { return None; }
-            crate::audio_service::set_voice_call_input_device(input, false);
+            let capture_lease = crate::microphone_forwarding::CaptureLease::acquire(input)?;
             // Create a channel to receive error or closed message
             let (tx, rx) = std::sync::mpsc::channel();
             let (tx_audio_data, mut rx_audio_data) =
@@ -701,7 +699,6 @@ impl<T: InvokeUiSession> Remote<T> {
                                 client_conn_inner,
                                 false,
                             );
-                            crate::audio_service::set_voice_call_input_device(None, true);
                             break;
                         }
                         _ => {}

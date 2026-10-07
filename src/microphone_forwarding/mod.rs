@@ -1,5 +1,5 @@
 use hbb_common::{bail, ResultType};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 
 pub use base::config::keys::OPTION_ALLOW_FORWARDED_MICROPHONE as ALLOW;
 pub const TOGGLE: &str = "forward-microphone";
@@ -81,25 +81,35 @@ pub fn message(
     message
 }
 
-static CAPTURE_IN_USE: AtomicBool = AtomicBool::new(false);
+static CAPTURE_USERS: Mutex<usize> = Mutex::new(0);
 pub fn capture_in_use() -> bool {
-    CAPTURE_IN_USE.load(Ordering::Acquire)
+    *CAPTURE_USERS.lock().unwrap() != 0
 }
-pub struct CaptureLease;
+pub struct CaptureLease(());
 impl CaptureLease {
-    pub fn acquire() -> Option<Self> {
-        CAPTURE_IN_USE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
+    #[cfg(not(target_os = "ios"))]
+    pub fn acquire(input: Option<String>) -> Option<Self> {
+        let mut users = CAPTURE_USERS.lock().unwrap();
+        if *users == 0 {
+            if crate::audio_service::get_voice_call_input_device().is_some() {
+                return None;
+            }
+            crate::audio_service::set_voice_call_input_device(input, false);
+        }
+        *users += 1;
+        Some(Self(()))
     }
 }
 impl Drop for CaptureLease {
     fn drop(&mut self) {
-        CAPTURE_IN_USE.store(false, Ordering::Release);
+        let mut users = CAPTURE_USERS.lock().unwrap();
+        *users -= 1;
+        #[cfg(not(target_os = "ios"))]
+        if *users == 0 {
+            crate::audio_service::set_voice_call_input_device(None, true);
+        }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,16 +117,23 @@ mod tests {
     use hbb_common::protobuf::Message as ProtobufMessage;
 
     #[test]
-    fn capture_lease_excludes_another_session_and_releases_on_drop() {
-        let lease = CaptureLease::acquire().unwrap();
+    #[cfg(not(target_os = "ios"))]
+    fn forwarding_connections_share_capture_until_the_last_disconnect() {
+        let first = CaptureLease::acquire(Some("first microphone".to_owned())).unwrap();
+        let second = CaptureLease::acquire(Some("other microphone".to_owned())).unwrap();
         assert!(capture_in_use());
-        assert!(CaptureLease::acquire().is_none());
-        drop(lease);
-        let replacement = CaptureLease::acquire().unwrap();
-        drop(replacement);
+        assert_eq!(crate::audio_service::get_voice_call_input_device().as_deref(), Some("first microphone"));
+        drop(first);
+        assert!(capture_in_use());
+        assert_eq!(crate::audio_service::get_voice_call_input_device().as_deref(), Some("first microphone"));
+        drop(second);
         assert!(!capture_in_use());
+        assert!(crate::audio_service::get_voice_call_input_device().is_none());
+        crate::audio_service::set_voice_call_input_device(Some("voice call".to_owned()), false);
+        assert!(CaptureLease::acquire(Some("microphone".to_owned())).is_none());
+        assert_eq!(crate::audio_service::get_voice_call_input_device().as_deref(), Some("voice call"));
+        crate::audio_service::set_voice_call_input_device(None, true);
     }
-
     #[test]
     fn forwarding_response_preserves_session_and_error_without_legacy_audio() {
         let wire = message(123, false, true, "Permission revoked")
