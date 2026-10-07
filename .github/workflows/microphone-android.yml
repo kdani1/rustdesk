@@ -2,8 +2,6 @@ name: Experimental microphone Android client
 
 on:
   workflow_dispatch:
-  push:
-    branches: [build/microphone-android]
 
 permissions:
   contents: read
@@ -79,7 +77,6 @@ jobs:
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           cargo install cargo-ndk --version 3.1.2 --locked
-          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android"
           ./flutter/ndk_arm64.sh
           mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
           cp target/aarch64-linux-android/release/liblibrustdesk.so flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so

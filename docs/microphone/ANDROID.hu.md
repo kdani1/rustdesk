@@ -31,3 +31,13 @@ A fordítás sikere nem helyettesíti a telefonon végzett hangtesztet. Telefonz
 ## Build hatóköre
 
 A külön `microphone-android.yml` workflow a meglévő Android Rust/Flutter fordítási útvonalat használja. Az alkalmazás futási kódját nem módosítja; az ideiglenes Gradle memória- és aláírásbeállítás csak a CI munkakönyvtárában változik. A külön buildág nem indítja újra a Windows PR-buildet.
+
+## Helyi fordítás
+
+A saját Android- és Windows-workflow csak kézzel indítható; a normál feltöltés nem indítja ezeket a GitHub gépein. A további fordítás a saját gépeken történik. A korábbi kész Windows-artifactot és Mac-kiadást ez nem törli.
+
+Android ARM64: macOS vagy Linux gépen Flutter 3.24.5, JDK 17, Android SDK 36, NDK r28c, Rust (aarch64-linux-android target), cargo-ndk 3.1.2 és a projekt vcpkg-függőségei szükségesek. Az `ANDROID_NDK_HOME` az NDK könyvtárára mutasson. A generált Flutter-híd elkészítése után a repó gyökeréből a `./flutter/ndk_arm64.sh` fordítja a Rust könyvtárat. Ez a script már az NDK fejléceit adja a bindgennek, és hiányzó NDK esetén egyértelmű hibával leáll. A kész `target/aarch64-linux-android/release/liblibrustdesk.so` fájlt `flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so` néven kell elhelyezni az NDK megfelelő `libc++_shared.so` fájlja mellett, majd a Flutter mappában `flutter build apk --release --target-platform android-arm64 --split-per-abi` futtatható. Kiadáshoz saját Gradle signing config vagy utólagos, megőrzött kulcsos aláírás szükséges.
+
+A Windows PC-n a `.github/workflows/microphone-windows.yml` parancsai követhetők a Visual Studio C++ buildeszközökkel. A csomagolás parancsa a repó gyökerében: `python build.py --portable --flutter --skip-portable-pack`. A Flutter-híd és a natív függőségek előkészítése itt is szükséges. A munkakönyvtárat és a vcpkg/Cargo gyorsítótárakat őrizd meg a következő fordításhoz.
+
+Az NDK-fejlécjavítás teljes Android-fordítással még nincs igazolva; a GitHub próbát a felhasználó kérésére leállítottuk, a helyi build és a telefonos teszt következik.
