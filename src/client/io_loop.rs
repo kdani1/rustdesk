@@ -335,7 +335,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
-                            if self.microphone_request.as_ref().map(|(_, since)| since.elapsed() > Duration::from_secs(10)).unwrap_or(false) {
+                            if self.microphone_request.as_ref().map(|(_, since)| {
+                                let seconds = if self.peer_info.platform == "Windows" { 30 } else { 10 };
+                                since.elapsed() > Duration::from_secs(seconds)
+                            }).unwrap_or(false) {
                                 self.microphone_request = None;
                                 self.microphone_id = None;
                                 self.stop_voice_call();
