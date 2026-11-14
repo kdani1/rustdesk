@@ -1989,12 +1989,50 @@ class ImageModel with ChangeNotifier {
   }
 
   onRgba(int display, Uint8List rgba) async {
+    final imageWatch =
+        _paintLatency.isActive(parent.target?.qualityMonitorModel)
+            ? (Stopwatch()..start())
+            : null;
+    final imageBefore = _image;
     try {
       await decodeAndUpdate(display, rgba);
+      if (imageWatch != null && !identical(_image, imageBefore)) {
+        _paintLatency.addImage(imageWatch.elapsedMicroseconds);
+        _measurePaint();
+      }
     } catch (e) {
       debugPrint('onRgba error: $e');
     }
     platformFFI.nextRgba(sessionId, display);
+  }
+
+  final _paintLatency = _PaintLatencyStats();
+  bool _paintCallbackPending = false;
+  Stopwatch? _paintWatch;
+
+  // From the new ui.Image being set (just before nextRgba, where Rust's ui_take
+  // ends) to the end of the frame that painted it. UI thread only:
+  // rasterization and compositing come after this point.
+  // At most one callback is pending: addPostFrameCallback does not schedule a
+  // frame, so while frames are off (app paused, headset off) callbacks would
+  // pile up. An image replaced before any frame painted it is not counted.
+  void _measurePaint() {
+    final binding = SchedulerBinding.instance;
+    if (!binding.framesEnabled) {
+      _paintWatch = null;
+      return;
+    }
+    _paintWatch = Stopwatch()..start();
+    if (_paintCallbackPending) return;
+    _paintCallbackPending = true;
+    binding.addPostFrameCallback((_) {
+      _paintCallbackPending = false;
+      final watch = _paintWatch;
+      _paintWatch = null;
+      if (watch == null) return;
+      _paintLatency.add(watch.elapsedMicroseconds);
+      _paintLatency.maybeReport(parent.target?.qualityMonitorModel);
+    });
   }
 
   // web only: image already created from a decoded WebCodecs frame
@@ -3924,6 +3962,89 @@ class QualityMonitorData {
   String? targetBitrate;
   String? codecFormat;
   String? chroma;
+  // Latest Rust-side latency p50s (ms) of the shown display, see docs/LATENCY-METRICS.md.
+  Map<String, dynamic>? latency;
+  double? paintP50Ms;
+  double? paintP95Ms;
+
+  String? get latencyText {
+    final l = latency;
+    final paint = paintP50Ms;
+    if (l == null && paint == null) return null;
+    String f(dynamic v) => v is num ? v.toStringAsFixed(1) : '?';
+    final total = l?['total'];
+    final take = l?['take'];
+    num? sum = total is num ? total : null;
+    if (sum != null && take is num) sum += take;
+    if (sum != null && paint != null) sum += paint;
+    return 'Lat: net+srv ~${f(l?['net'])} | queue ${f(l?['queue'])} | '
+        'dec ${f(l?['dec'])} | ui ${f(l?['ui'])} | take ${f(take)} | '
+        'paint ${f(paint)} | total ~${f(sum)} ms';
+  }
+}
+
+class _PaintLatencyStats {
+  static const _window = Duration(seconds: 5);
+  static const _maxSamples = 1024;
+  // Longer means the frame waited for frames to resume, not for paint.
+  static const _maxSampleUs = 1000000;
+  final List<int> _imageUs = [];
+  final List<int> _paintUs = [];
+  final Stopwatch _windowWatch = Stopwatch()..start();
+  final Stopwatch _optionWatch = Stopwatch()..start();
+  bool? _logOption;
+
+  bool isActive(QualityMonitorModel? qualityMonitor) {
+    if (qualityMonitor?.show == true) return true;
+    if (_logOption == null || _optionWatch.elapsed >= _window) {
+      _optionWatch.reset();
+      _logOption = bind.mainGetLocalOption(key: 'enable-latency-log') == 'Y';
+    }
+    return _logOption == true;
+  }
+
+  void _add(List<int> samples, int us) {
+    // After a pause, start a fresh window instead of reporting one sample.
+    if (_imageUs.isEmpty &&
+        _paintUs.isEmpty &&
+        _windowWatch.elapsed >= _window) {
+      _windowWatch.reset();
+    }
+    if (us <= _maxSampleUs && samples.length < _maxSamples) samples.add(us);
+  }
+
+  void addImage(int us) => _add(_imageUs, us);
+
+  void add(int us) => _add(_paintUs, us);
+
+  // [p50, p95, max] in ms, nearest rank.
+  static List<double>? _summary(List<int> samplesUs) {
+    if (samplesUs.isEmpty) return null;
+    final sorted = List<int>.from(samplesUs)..sort();
+    double at(double p) {
+      final rank = (p * sorted.length).ceil().clamp(1, sorted.length).toInt();
+      return sorted[rank - 1] / 1000.0;
+    }
+
+    return [at(0.5), at(0.95), sorted.last / 1000.0];
+  }
+
+  static String _format(List<double>? s) =>
+      s == null ? 'n/a' : s.map((v) => v.toStringAsFixed(1)).join('/');
+
+  void maybeReport(QualityMonitorModel? qualityMonitor) {
+    if (_windowWatch.elapsed < _window) return;
+    _windowWatch.reset();
+    final image = _summary(_imageUs);
+    final paint = _summary(_paintUs);
+    final frames = _paintUs.length;
+    _imageUs.clear();
+    _paintUs.clear();
+    if (paint == null) return;
+    qualityMonitor?.updatePaintLatency(paint[0], paint[1]);
+    debugPrint('LATENCY flutter image=${_format(image)} '
+        'paint=${_format(paint)} frames=$frames');
+  }
 }
 
 class QualityMonitorModel with ChangeNotifier {
@@ -3935,6 +4056,31 @@ class QualityMonitorModel with ChangeNotifier {
 
   bool get show => _show;
   QualityMonitorData get data => _data;
+  final Map<String, dynamic> _latencyLogSeq = {};
+
+  void updatePaintLatency(double p50Ms, double p95Ms) {
+    _data.paintP50Ms = p50Ms;
+    _data.paintP95Ms = p95Ms;
+  }
+
+  void _updateLatency(Map<String, dynamic> byDisplay) {
+    for (final entry in byDisplay.entries) {
+      final v = entry.value;
+      if (v is! Map<String, dynamic>) continue;
+      final seq = v['seq'];
+      if (seq != _latencyLogSeq[entry.key]) {
+        _latencyLogSeq[entry.key] = seq;
+        final line = v['line'];
+        // Rust logs go to a file in release Android builds; this puts them in logcat too.
+        if (line is String) debugPrint(line);
+      }
+    }
+    final currentDisplay = parent.target?.ffiModel.pi.currentDisplay;
+    final shown = currentDisplay != null && currentDisplay != kAllDisplayValue
+        ? byDisplay[currentDisplay.toString()]
+        : (byDisplay.isNotEmpty ? byDisplay.values.first : null);
+    _data.latency = shown is Map<String, dynamic> ? shown : null;
+  }
 
   // Only a WebRTC session on the web names its transport here: web has no
   // session tab to show it on (the desktop tab's tooltip already does), and
@@ -3954,6 +4100,12 @@ class QualityMonitorModel with ChangeNotifier {
         true;
     if (_show != show) {
       _show = show;
+      if (show) {
+        // Numbers from before the monitor was hidden are not current.
+        _data.latency = null;
+        _data.paintP50Ms = null;
+        _data.paintP95Ms = null;
+      }
       notifyListeners();
     }
   }
@@ -3997,6 +4149,16 @@ class QualityMonitorModel with ChangeNotifier {
       }
       if (evt.containsKey('chroma') && (evt['chroma'] as String).isNotEmpty) {
         _data.chroma = evt['chroma'];
+      }
+      if (evt.containsKey('latency') &&
+          (evt['latency'] as String).isNotEmpty) {
+        _updateLatency(jsonDecode(evt['latency']) as Map<String, dynamic>);
+      } else if (evt.containsKey('latency') &&
+          evt.containsKey('speed') &&
+          (evt['speed'] as String).isNotEmpty) {
+        // Only the 1 s status event carries speed. The TestDelay event never
+        // carries latency, so it must not clear it.
+        _data.latency = null;
       }
       notifyListeners();
     } catch (e) {

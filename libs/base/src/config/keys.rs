@@ -182,6 +182,9 @@ pub const OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS: &str = "keep-awake-during-
 pub const OPTION_DISABLE_GROUP_PANEL: &str = "disable-group-panel";
 pub const OPTION_DISABLE_DISCOVERY_PANEL: &str = "disable-discovery-panel";
 pub const OPTION_PRE_ELEVATE_SERVICE: &str = "pre-elevate-service";
+// "Y" turns on the LATENCY log lines: local option on the viewer, server option on the host.
+// Compared with "Y" directly because option2bool() treats "enable-*" as on by default.
+pub const OPTION_ENABLE_LATENCY_LOG: &str = "enable-latency-log";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";

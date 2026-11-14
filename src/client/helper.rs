@@ -11,6 +11,8 @@ pub struct QualityStatus {
     pub target_bitrate: Option<i32>,
     pub codec_format: Option<CodecFormat>,
     pub chroma: Option<String>,
+    // JSON from client::latency::refresh_streams; None while latency measurement is off.
+    pub latency: Option<String>,
 }
 
 #[inline]

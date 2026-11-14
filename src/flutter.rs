@@ -258,6 +258,7 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
+    ui_handoff: Option<crate::client::latency::UiHandoff>,
 }
 
 pub type FlutterRgbaRendererPluginOnRgba = unsafe extern "C" fn(
@@ -714,6 +715,7 @@ impl InvokeUiSession for FlutterHandler {
                     &status.codec_format.map_or(NULL, |it| it.to_string()),
                 ),
                 ("chroma", &status.chroma.map_or(NULL, |it| it.to_string())),
+                ("latency", &status.latency.map_or(NULL, |it| it)),
             ],
             &[],
         );
@@ -1087,8 +1089,15 @@ impl InvokeUiSession for FlutterHandler {
 
     #[inline]
     fn next_rgba(&self, _display: usize) {
-        if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&_display) {
-            rgba_data.valid = false;
+        let ui_handoff =
+            if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&_display) {
+                rgba_data.valid = false;
+                rgba_data.ui_handoff.take()
+            } else {
+                None
+            };
+        if let Some(ui_handoff) = ui_handoff {
+            crate::client::latency::on_ui_taken(ui_handoff);
         }
     }
 
@@ -1184,9 +1193,11 @@ impl FlutterHandler {
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
         if let Some(rgba_data) = rgba_write_lock.get_mut(&display) {
             if rgba_data.valid {
+                crate::client::latency::mark_ui_dropped();
                 return;
             } else {
                 rgba_data.valid = true;
+                rgba_data.ui_handoff = crate::client::latency::ui_handoff();
             }
             // Return the rgba buffer to the video handler for reusing allocated rgba buffer.
             std::mem::swap::<Vec<u8>>(&mut rgba.raw, &mut rgba_data.data);
@@ -1194,6 +1205,7 @@ impl FlutterHandler {
             let mut rgba_data = RgbaData::default();
             std::mem::swap::<Vec<u8>>(&mut rgba.raw, &mut rgba_data.data);
             rgba_data.valid = true;
+            rgba_data.ui_handoff = crate::client::latency::ui_handoff();
             rgba_write_lock.insert(display, rgba_data);
         }
         drop(rgba_write_lock);
@@ -1226,6 +1238,7 @@ impl FlutterHandler {
         if !is_sent {
             if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&display) {
                 rgba_data.valid = false;
+                rgba_data.ui_handoff = None;
             }
         }
     }

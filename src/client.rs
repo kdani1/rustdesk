@@ -105,6 +105,7 @@ mod microphone_loopback_test;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;
+pub mod latency;
 pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
@@ -4024,8 +4025,10 @@ pub fn start_video_thread<F, T>(
     let mut video_callback = video_callback;
     let mut last_chroma = None;
     let is_view_camera = session.is_view_camera();
+    let latency_key = latency::stream_key(&video_queue);
 
     std::thread::spawn(move || {
+        latency::set_thread_stream(latency_key);
         #[cfg(windows)]
         sync_cpu_usage();
         get_hwcodec_config();
@@ -4060,6 +4063,7 @@ pub fn start_video_thread<F, T>(
                         let display = vf.display as usize;
                         let start = std::time::Instant::now();
                         let format = CodecFormat::from(&vf);
+                        let latency_pts = latency::frame_pts(&vf);
                         if video_handler.is_none() {
                             let mut handler = VideoHandler::new(format, display);
                             let record_state = session.lc.read().unwrap().record_state;
@@ -4074,13 +4078,27 @@ pub fn start_video_thread<F, T>(
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
                             let format_changed = handler.decoder.format() != format;
+                            let decode_start = std::time::Instant::now();
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
+                                    let decode_end = std::time::Instant::now();
                                     video_callback(
                                         display,
                                         &mut handler.rgb,
                                         handler.texture.texture,
                                         pixelbuffer,
+                                    );
+                                    latency::on_frame_done(
+                                        latency_key,
+                                        latency::DecodedFrame {
+                                            pts: latency_pts,
+                                            dequeued: start,
+                                            decode_start,
+                                            decode_end,
+                                            format,
+                                            gpu_texture: !pixelbuffer,
+                                        },
+                                        video_queue.read().unwrap().len(),
                                     );
 
                                     // chroma
@@ -4156,6 +4174,7 @@ pub fn start_video_thread<F, T>(
                 break;
             }
         }
+        latency::remove_stream(latency_key);
         log::info!("Video decoder loop exits");
     });
 }

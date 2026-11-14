@@ -730,6 +730,7 @@ fn run(vs: VideoService) -> ResultType<()> {
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
+    let mut latency_stats = super::latency_stats::LatencyStats::new(display_idx);
 
     while sp.ok() {
         #[cfg(windows)]
@@ -796,8 +797,10 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
+        let grab_begin = Instant::now();
         let res = match c.frame(spf) {
             Ok(frame) => {
+                let grab_done = Instant::now();
                 repeat_encode_counter = 0;
                 if frame.valid() {
                     let screenshot_key = (vs.source, display_idx);
@@ -860,6 +863,11 @@ fn run(vs: VideoService) -> ResultType<()> {
                         capture_width,
                         capture_height,
                     )?;
+                    latency_stats.on_frame(
+                        grab_done.saturating_duration_since(grab_begin),
+                        grab_done.elapsed(),
+                        !send_conn_ids.is_empty(),
+                    );
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
                 }
@@ -878,6 +886,7 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         match res {
             Err(ref e) if e.kind() == WouldBlock => {
+                latency_stats.on_idle();
                 #[cfg(windows)]
                 if dxgi_recovery_started
                     .map(|started| started.elapsed() >= DXGI_RECOVERY_FRAME_GRACE)
@@ -985,14 +994,20 @@ fn run(vs: VideoService) -> ResultType<()> {
                 break;
             }
         }
+        latency_stats.on_wait(
+            !frame_controller.send_conn_ids.is_empty(),
+            wait_begin.elapsed(),
+        );
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
         let elapsed = now.elapsed();
         // may need to enable frame(timeout)
         log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
         if elapsed < spf {
+            latency_stats.on_sleep(spf - elapsed);
             std::thread::sleep(spf - elapsed);
         }
+        latency_stats.tick(spf);
     }
 
     Ok(())

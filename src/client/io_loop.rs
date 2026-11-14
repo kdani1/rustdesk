@@ -411,11 +411,17 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 Some(self.video_format.clone())
                             };
+                            let show_quality_monitor = self.handler.lc.read().unwrap().get_toggle_option("show-quality-monitor");
+                            let latency = client::latency::refresh_streams(
+                                self.video_threads.iter().map(|(display, v)| (*display, client::latency::stream_key(&v.video_queue))),
+                                show_quality_monitor,
+                            );
                             self.handler.update_quality_status(QualityStatus {
                                 speed: Some(speed),
                                 fps,
                                 chroma,
                                 codec_format,
+                                latency,
                                 ..Default::default()
                             });
                         }
@@ -1688,6 +1694,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     let Some(thread) = self.video_threads.get_mut(&display) else {
                         return true;
                     };
+                    client::latency::on_received(client::latency::stream_key(&thread.video_queue), &vf);
                     if Self::contains_key_frame(&vf) {
                         thread
                             .video_sender
@@ -2413,6 +2420,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     _ => {}
                 },
                 Some(message::Union::TestDelay(t)) => {
+                    client::latency::on_test_delay(
+                        self.video_threads.values().map(|v| client::latency::stream_key(&v.video_queue)),
+                        &t,
+                    );
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
