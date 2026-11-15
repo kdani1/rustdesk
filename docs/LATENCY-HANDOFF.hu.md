@@ -9,9 +9,10 @@ a meglévő `D:\RustDeskBuild` környezettel.
 - Commit `4c9104ea8` a `feature/microphone-fast-multi` (`e6ed0fcbb`) fölött: csak mérés, a videóút viselkedése, a protokoll,
   az fps, a bitráta és a sorok változatlanok.
 - A mérőszámok jelentése, a hibahatárok és a naplók helye: `docs/LATENCY-METRICS.md`.
-- Háttér: a Meta Quest Remote Desktop elemzése (miért „azonnali”, mit érdemes átvenni). A jelentések a laptopon vannak:
-  `C:\Users\kdani\Documents\QuestApks\rea-out\REPORT.hu.md` és `REPORT-PC.hu.md`. Ha az új gépen kellenek, a tulajdonos
-  átmásolja őket. A javaslatok sorrendje: 0. mérés (ez az ág), 1. rebase az upstreamre és a `hwcodec.rs:239` hibaelnyelés,
+- Háttér: a Meta Quest Remote Desktop elemzése (miért „azonnali”, mit érdemes átvenni) a privát
+  `kdani1/quest-remote-desktop-research` tárolóban van (`gh repo clone kdani1/quest-remote-desktop-research`).
+  Kezdd a `README.md`-vel, a fő jelentés a `REPORT.hu.md` (a 8. fejezete felülírja a korábbi állításokat), a PC-oldal a
+  `REPORT-PC.hu.md`, a részletek a `notes/` alatt. A mérési eredményt oda, egy `MEASUREMENTS.hu.md` fájlba írd. A javaslatok sorrendje: 0. mérés (ez az ág), 1. rebase az upstreamre és a `hwcodec.rs:239` hibaelnyelés,
   2. eseményvezérelt rögzítés és LAN-profil (60 fps, 10–20 Mbps, alacsony késésű kódoló), 3. „mindig a legújabb kép”
   (`video_ack_required`, 1–2 kép úton), 4. hardveres MediaCodec dekódolás a Questen Surface-be, 5. később UDP/QUIC videó és
   csíkonkénti kódolás.
