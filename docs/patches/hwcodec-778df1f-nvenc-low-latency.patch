@@ -1,3 +1,63 @@
+diff --git a/cpp/common/ffmpeg_ffi.h b/cpp/common/ffmpeg_ffi.h
+index 505c6fa..c9ee74c 100644
+--- a/cpp/common/ffmpeg_ffi.h
++++ b/cpp/common/ffmpeg_ffi.h
+@@ -20,5 +20,8 @@ int av_log_get_level(void);
+ void av_log_set_level(int level);
+ void hwcodec_set_av_log_callback();
+ void hwcodec_set_flag_could_not_find_ref_with_poc();
++// VBV size in frames for nvenc encoders opened from now on: rc_buffer_size = frames * bitrate /
++// framerate, kept on every bitrate change. 0 (default) keeps FFmpeg's default VBV.
++void hwcodec_set_nvenc_vbv_frames(int frames);
+ 
+ #endif
+\ No newline at end of file
+diff --git a/cpp/common/log.cpp b/cpp/common/log.cpp
+index 039b7cf..ba8f4f2 100644
+--- a/cpp/common/log.cpp
++++ b/cpp/common/log.cpp
+@@ -1,5 +1,7 @@
+ 
+ #include "log.h"
++#include <atomic>
++#include <string.h>
+ extern "C" {
+   #include <libavutil/log.h>
+ }
+@@ -36,9 +38,19 @@ void trace(const std::string &message) {
+   log_to_rust(LOG_LEVEL_TRACE, message);
+ }
+ 
++static std::atomic<int> g_reconfig_log_lines{0};
++
++void allow_reconfig_log(int lines) { g_reconfig_log_lines.store(lines); }
++
+ void av_log_callback(void *ptr, int level, const char *fmt, va_list vl) {
+   (void)ptr;
+   if (level > av_log_get_level()) {
++    if (fmt && g_reconfig_log_lines.load(std::memory_order_relaxed) > 0 &&
++        strstr(fmt, " change: ") && g_reconfig_log_lines.fetch_sub(1) > 0) {
++      char line[1024] = {0};
++      vsnprintf(line, sizeof(line), fmt, vl);
++      info(std::string("[FFMPEG] ") + line);
++    }
+     return;
+   }
+   char line[1024] = {0};
+diff --git a/cpp/common/log.h b/cpp/common/log.h
+index fc72b30..3211ef1 100644
+--- a/cpp/common/log.h
++++ b/cpp/common/log.h
+@@ -19,6 +19,9 @@ void warn(const std::string &message);
+ void info(const std::string &message);
+ void debug(const std::string &message);
+ void trace(const std::string &message);
++// Logs the next `lines` FFmpeg messages containing " change: " (nvenc reconfig_encoder's
++// "avg bitrate change" / "vbv buffer size change") at info level, whatever the av_log level.
++void allow_reconfig_log(int lines);
+ } // namespace gol
+ 
+ #define LOG_ERROR(message)                                                     \
 diff --git a/cpp/common/platform/win/win.cpp b/cpp/common/platform/win/win.cpp
 index 2004166..f1477e7 100644
 --- a/cpp/common/platform/win/win.cpp
@@ -46,10 +106,22 @@ index 2004166..f1477e7 100644
    return bResult == TRUE;
  }
 diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
-index 45810b4..b251804 100644
+index 45810b4..ac0ded8 100644
 --- a/cpp/common/util.cpp
 +++ b/cpp/common/util.cpp
-@@ -70,6 +70,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
+@@ -3,8 +3,11 @@ extern "C" {
+ }
+ 
+ #include "util.h"
++#include <atomic>
+ #include <limits>
+ #include <map>
++#include <mutex>
++#include <set>
+ #include <string.h>
+ #include <vector>
+ 
+@@ -70,6 +73,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
        LOG_ERROR(std::string("nvenc set_lantency_free failed, ret = ") + av_err2str(ret));
        return false;
      }
@@ -70,20 +142,261 @@ index 45810b4..b251804 100644
    }
    if (name.find("amf") != std::string::npos) {
      if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
+@@ -304,6 +321,60 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
+   return true;
+ }
+ 
++static std::mutex g_forced_idr_broken_mutex;
++static std::set<std::string> g_forced_idr_broken;
++
++void set_forced_idr_broken(const std::string &name) {
++  std::lock_guard<std::mutex> lock(g_forced_idr_broken_mutex);
++  g_forced_idr_broken.insert(name);
++}
++
++bool set_forced_idr(void *priv_data, const std::string &name) {
++  if (name.find("nvenc") == std::string::npos) {
++    return false;
++  }
++  {
++    std::lock_guard<std::mutex> lock(g_forced_idr_broken_mutex);
++    if (g_forced_idr_broken.count(name)) {
++      return false;
++    }
++  }
++  int ret = av_opt_set(priv_data, "forced-idr", "1", 0);
++  if (ret < 0) {
++    LOG_WARN(std::string("nvenc set forced-idr=1 failed, forced keyframes off, ret = ") +
++             av_err2str(ret));
++    return false;
++  }
++  return true;
++}
++
++static std::atomic<int> g_nvenc_vbv_frames{0};
++
++int nvenc_vbv_frames() { return g_nvenc_vbv_frames.load(); }
++
++void set_vbv(AVCodecContext *c, const std::string &name, int kbs, int fps, int frames) {
++  if (frames <= 0 || kbs <= 0 || fps <= 0 || name.find("nvenc") == std::string::npos) {
++    return;
++  }
++  int64_t bits = (int64_t)kbs * 1000 * frames / fps;
++  if (bits > std::numeric_limits<int>::max()) {
++    bits = std::numeric_limits<int>::max();
++  }
++  c->rc_buffer_size = (int)bits;
++}
++
++void log_open_rate(AVCodecContext *c, const std::string &name, int fps, int vbv_frames,
++                   bool forced_idr) {
++  if (name.find("nvenc") == std::string::npos) {
++    return;
++  }
++  LOG_INFO(name + " open: bit_rate=" + std::to_string(c->bit_rate) +
++           " fps=" + std::to_string(fps) +
++           " rc_buffer_size=" + std::to_string(c->rc_buffer_size) +
++           " vbv_frames=" + std::to_string(vbv_frames) +
++           " forced_idr=" + std::to_string(forced_idr ? 1 : 0));
++}
++
+ void vram_encode_test_callback(const uint8_t *data, int32_t len, int32_t key, const void *obj, int64_t pts) {
+   (void)data;
+   (void)len;
+@@ -328,6 +399,20 @@ bool has_flag_could_not_find_ref_with_poc() {
+ 
+ } // namespace util_decode
+ 
++extern "C" void hwcodec_set_nvenc_vbv_frames(int frames) {
++  if (frames < 0) {
++    frames = 0;
++  } else if (frames > 60) {
++    frames = 60;
++  }
++  int old = util_encode::g_nvenc_vbv_frames.exchange(frames);
++  if (frames > 0 && old != frames) {
++    // Shows FFmpeg's own reconfig lines ("vbv buffer size change: a -> b") for the next few
++    // bitrate changes: the proof that a reconfigure re-applies rc_buffer_size.
++    gol::allow_reconfig_log(8);
++  }
++}
++
+ extern "C" void hwcodec_set_flag_could_not_find_ref_with_poc() {
+   util_decode::g_flag_could_not_find_ref_with_poc = true;
+ }
+\ No newline at end of file
+diff --git a/cpp/common/util.h b/cpp/common/util.h
+index 711fd2a..d31e2a2 100644
+--- a/cpp/common/util.h
++++ b/cpp/common/util.h
+@@ -20,6 +20,25 @@ bool force_hw(void *priv_data, const std::string &name);
+ bool set_others(void *priv_data, const std::string &name);
+ 
+ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs);
++
++// nvenc only: forced-idr=1, so a frame sent with pict_type I is coded as an IDR and its packet
++// carries AV_PKT_FLAG_KEY (without it nvenc codes a non-key intra frame). False when the encoder is
++// not nvenc, the option was refused, or a forced IDR of an encoder with this name already came out
++// without the key flag in this process (set_forced_idr_broken): forced keyframes are then unsupported.
++bool set_forced_idr(void *priv_data, const std::string &name);
++// A forced IDR came out without the key flag: forced keyframes stay off for encoders with this name
++// for the rest of the process, so later encoders do not repeat the useless forced frame.
++void set_forced_idr_broken(const std::string &name);
++// VBV size in frames for nvenc encoders opened from now on (hwcodec_set_nvenc_vbv_frames); 0 keeps
++// FFmpeg's default.
++int nvenc_vbv_frames();
++// nvenc only, frames > 0: rc_buffer_size = frames * kbs * 1000 / fps bits. Before avcodec_open2 it
++// sets the VBV; on an open encoder FFmpeg's reconfig_encoder applies it with the next frame.
++void set_vbv(AVCodecContext *c, const std::string &name, int kbs, int fps, int frames);
++// nvenc only: one line with the rate-control values FFmpeg settled on at open (rc_buffer_size reads
++// back FFmpeg's default VBV when none was set).
++void log_open_rate(AVCodecContext *c, const std::string &name, int fps, int vbv_frames,
++                   bool forced_idr);
+ void vram_encode_test_callback(const uint8_t *data, int32_t len, int32_t key, const void *obj, int64_t pts);
+ 
+ } // namespace util
 diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-index 0a8d1b1..4f1da97 100644
+index 0a8d1b1..5b24cfd 100644
 --- a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
 +++ b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-@@ -363,7 +363,8 @@ private:
+@@ -122,6 +122,14 @@ public:
+   AVBufferRef *hw_device_ctx_ = NULL;
+   AVFrame *hw_frame_ = NULL;
+ 
++  // nvenc took forced-idr=1: request_keyframe is supported.
++  bool forced_idr_ok_ = false;
++  // The next do_encode sends its frame with pict_type I (an IDR with forced-idr).
++  bool force_idr_ = false;
++  bool forced_idr_logged_ = false;
++  // VBV size in frames (0: FFmpeg's default), kept on bitrate changes. nvenc only.
++  int vbv_frames_ = 0;
++
+   FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
+                    int pixfmt, int align, int fps, int gop, int rc, int quality,
+                    int kbs, int q, int thread_count, int gpu,
+@@ -240,6 +248,11 @@ public:
+     util_encode::set_gpu(c_->priv_data, name_, gpu_);
+     util_encode::force_hw(c_->priv_data, name_);
+     util_encode::set_others(c_->priv_data, name_);
++    if (name_.find("nvenc") != std::string::npos) {
++      forced_idr_ok_ = util_encode::set_forced_idr(c_->priv_data, name_);
++      vbv_frames_ = util_encode::nvenc_vbv_frames();
++      util_encode::set_vbv(c_, name_, kbs_, fps_, vbv_frames_);
++    }
+     if (name_.find("mediacodec") != std::string::npos) {
+       if (mc_name_.length() > 0) {
+         LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);
+@@ -255,6 +268,7 @@ public:
+                 ", name: " + name_);
+       return false;
+     }
++    util_encode::log_open_rate(c_, name_, fps_, vbv_frames_, forced_idr_ok_);
+ 
+     if (ffmpeg_ram_get_linesize_offset_length(pixfmt_, width_, height_, align_,
+                                               NULL, offset_, length) != 0)
+@@ -304,7 +318,21 @@ public:
+   }
+ 
+   int set_bitrate(int kbs) {
+-    return util_encode::change_bit_rate(c_, name_, kbs) ? 0 : -1;
++    if (!util_encode::change_bit_rate(c_, name_, kbs))
++      return -1;
++    if (kbs > 0)
++      kbs_ = kbs;
++    util_encode::set_vbv(c_, name_, kbs_, fps_, vbv_frames_);
++    return 0;
++  }
++
++  // The next encode is an IDR. -1: not supported (not nvenc, or forced-idr was refused, or a
++  // forced IDR came out without the key flag).
++  int request_keyframe() {
++    if (!forced_idr_ok_)
++      return -1;
++    force_idr_ = true;
++    return 0;
+   }
+ 
+ private:
+@@ -339,11 +367,19 @@ private:
+   int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
+     int ret;
+     bool encoded = false;
++    const bool forced = force_idr_;
++    bool forced_key = false;
++    int forced_size = 0;
+     frame->pts = ms;
+-    if ((ret = avcodec_send_frame(c_, frame)) < 0) {
++    frame->pict_type = forced ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
++    ret = avcodec_send_frame(c_, frame);
++    frame->pict_type = AV_PICTURE_TYPE_NONE;
++    if (ret < 0) {
+       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
+       return ret;
+     }
++    if (forced)
++      force_idr_ = false;
+ 
+     auto start = util::now();
+     while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
+@@ -358,12 +394,28 @@ private:
+         goto _exit;
+       }
+       encoded = true;
++      if (forced && !forced_key) {
++        forced_key = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
++        forced_size = pkt_->size;
++      }
+       callback_(pkt_->data, pkt_->size, pkt_->pts,
+                 pkt_->flags & AV_PKT_FLAG_KEY, obj);
      }
    _exit:
      av_packet_unref(pkt_);
 -    return encoded ? 0 : -1;
++    if (forced && encoded) {
++      if (!forced_key) {
++        LOG_WARN(std::string("forced IDR gave no key frame, forced keyframes off, ") + name_);
++        forced_idr_ok_ = false;
++        util_encode::set_forced_idr_broken(name_);
++      } else if (!forced_idr_logged_) {
++        forced_idr_logged_ = true;
++        LOG_INFO(std::string("forced IDR verified: key frame of ") +
++                 std::to_string(forced_size) + " bytes, " + name_);
++      }
++    }
 +    // Callers only test for nonzero; pass FFmpeg's code (e.g. EAGAIN) on.
 +    return encoded ? 0 : (ret < 0 ? ret : -1);
    }
  
    int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
+@@ -463,4 +515,13 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
+     LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
+   }
+   return -1;
+-}
+\ No newline at end of file
++}
++
++extern "C" int ffmpeg_ram_request_keyframe(FFmpegRamEncoder *encoder) {
++  try {
++    return encoder->request_keyframe();
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("ffmpeg_ram_request_keyframe failed, ") + std::string(e.what()));
++  }
++  return -1;
++}
+diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_ffi.h b/cpp/ffmpeg_ram/ffmpeg_ram_ffi.h
+index b1057b2..71b24bd 100644
+--- a/cpp/ffmpeg_ram/ffmpeg_ram_ffi.h
++++ b/cpp/ffmpeg_ram/ffmpeg_ram_ffi.h
+@@ -30,5 +30,7 @@ int ffmpeg_ram_get_linesize_offset_length(int pix_fmt, int width, int height,
+                                           int align, int *linesize, int *offset,
+                                           int *length);
+ int ffmpeg_ram_set_bitrate(void *encoder, int kbs);
++// The next encode is an IDR (nvenc with forced-idr only). 0: requested, -1: not supported.
++int ffmpeg_ram_request_keyframe(void *encoder);
+ 
+ #endif // FFMPEG_RAM_FFI_H
+\ No newline at end of file
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp
 index f8a0f92..6dfb0cf 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp
@@ -172,10 +485,85 @@ index f8a0f92..6dfb0cf 100644
                                         int32_t maxDescNum, int32_t *outDescNum,
                                         DataFormat dataFormat,
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-index 2b21b73..63789ed 100644
+index 2b21b73..5f773b6 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 +++ b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-@@ -256,9 +256,11 @@ public:
+@@ -76,6 +76,15 @@ public:
+   int32_t kbs_;
+   int32_t framerate_;
+   int32_t gop_;
++  // nvenc took forced-idr=1: request_keyframe is supported.
++  bool forced_idr_ok_ = false;
++  // The next do_encode sends its frame with pict_type I (an IDR with forced-idr).
++  bool force_idr_ = false;
++  bool forced_idr_logged_ = false;
++  // frame_ holds the last converted image, so encode_last can encode it again.
++  bool has_last_ = false;
++  // VBV size in frames (0: FFmpeg's default), kept on bitrate changes.
++  int vbv_frames_ = 0;
+ 
+   const int align_ = 0;
+   const bool full_range_ = false;
+@@ -136,6 +145,11 @@ public:
+     // util_encode::set_quality(c_->priv_data, encoder_->name_, Quality_Default);
+     util_encode::set_rate_control(c_, encoder_->name_, RC_CBR, -1);
+     util_encode::set_others(c_->priv_data, encoder_->name_);
++    if (encoder_->driver_ == EncoderDriver::NVENC) {
++      forced_idr_ok_ = util_encode::set_forced_idr(c_->priv_data, encoder_->name_);
++      vbv_frames_ = util_encode::nvenc_vbv_frames();
++      util_encode::set_vbv(c_, encoder_->name_, kbs_, framerate_, vbv_frames_);
++    }
+ 
+     hw_device_ctx_ = av_hwdevice_ctx_alloc(encoder_->device_type_);
+     if (!hw_device_ctx_) {
+@@ -184,6 +198,7 @@ public:
+                 ", name: " + encoder_->name_);
+       return false;
+     }
++    util_encode::log_open_rate(c_, encoder_->name_, framerate_, vbv_frames_, forced_idr_ok_);
+ 
+     if (!(frame_ = av_frame_alloc())) {
+       LOG_ERROR(std::string("Could not allocate video frame"));
+@@ -227,10 +242,28 @@ public:
+ 
+     if (!convert(texture))
+       return -1;
++    has_last_ = true;
+ 
+     return do_encode(callback, obj, ms);
+   }
+ 
++  // Encodes the image of the last encode() again (the NV12 surface is kept), e.g. a forced IDR
++  // or a refinement of a static screen without a new capture.
++  int encode_last(EncodeCallback callback, void *obj, int64_t ms) {
++    if (!has_last_)
++      return -1;
++    return do_encode(callback, obj, ms);
++  }
++
++  // The next encode or encode_last is an IDR. -1: not supported (not nvenc, or forced-idr was
++  // refused, or a forced IDR came out without the key flag, in this process).
++  int request_keyframe() {
++    if (!forced_idr_ok_)
++      return -1;
++    force_idr_ = true;
++    return 0;
++  }
++
+   void destroy() {
+     if (pkt_)
+       av_packet_free(&pkt_);
+@@ -252,13 +285,20 @@ public:
+   }
+ 
+   int set_bitrate(int kbs) {
+-    return util_encode::change_bit_rate(c_, encoder_->name_, kbs) ? 0 : -1;
++    if (!util_encode::change_bit_rate(c_, encoder_->name_, kbs))
++      return -1;
++    if (kbs > 0)
++      kbs_ = kbs;
++    util_encode::set_vbv(c_, encoder_->name_, kbs_, framerate_, vbv_frames_);
++    return 0;
    }
  
    int set_framerate(int framerate) {
@@ -190,17 +578,63 @@ index 2b21b73..63789ed 100644
    }
  
  private:
-@@ -339,7 +341,8 @@ private:
+@@ -314,11 +354,19 @@ private:
+   int do_encode(EncodeCallback callback, const void *obj, int64_t ms) {
+     int ret;
+     bool encoded = false;
++    const bool forced = force_idr_;
++    bool forced_key = false;
++    int forced_size = 0;
+     frame_->pts = ms;
+-    if ((ret = avcodec_send_frame(c_, frame_)) < 0) {
++    frame_->pict_type = forced ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
++    ret = avcodec_send_frame(c_, frame_);
++    frame_->pict_type = AV_PICTURE_TYPE_NONE;
++    if (ret < 0) {
+       LOG_ERROR(std::string("avcodec_send_frame failed, ret = ") + av_err2str(ret));
+       return ret;
+     }
++    if (forced)
++      force_idr_ = false;
+ 
+     auto start = util::now();
+     while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
+@@ -333,13 +381,33 @@ private:
+         goto _exit;
+       }
+       encoded = true;
++      if (forced && !forced_key) {
++        forced_key = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
++        forced_size = pkt_->size;
++      }
+       if (callback)
+         callback(pkt_->data, pkt_->size, pkt_->flags & AV_PKT_FLAG_KEY, obj,
+                  pkt_->pts);
      }
    _exit:
      av_packet_unref(pkt_);
 -    return encoded ? 0 : -1;
++    if (forced && encoded) {
++      if (!forced_key) {
++        // pict_type I did not give a key-flagged packet (e.g. coded as a non-IDR intra
++        // frame): report keyframes as unsupported from now on, also for the encoders opened
++        // later in this process (the caller restarts the encoder after this frame).
++        LOG_WARN(std::string("forced IDR gave no key frame, forced keyframes off, ") +
++                 encoder_->name_);
++        forced_idr_ok_ = false;
++        util_encode::set_forced_idr_broken(encoder_->name_);
++      } else if (!forced_idr_logged_) {
++        forced_idr_logged_ = true;
++        LOG_INFO(std::string("forced IDR verified: key frame of ") +
++                 std::to_string(forced_size) + " bytes, " + encoder_->name_);
++      }
++    }
 +    // Callers only test for nonzero; pass FFmpeg's code (e.g. EAGAIN) on.
 +    return encoded ? 0 : (ret < 0 ? ret : -1);
    }
  
    bool convert(void *texture) {
-@@ -486,7 +489,7 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
+@@ -486,13 +554,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
  
  int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
    try {
@@ -209,8 +643,33 @@ index 2b21b73..63789ed 100644
    } catch (const std::exception &e) {
      LOG_ERROR(std::string("ffmpeg_vram_set_framerate failed, ") + std::string(e.what()));
    }
+   return -1;
+ }
+ 
++int ffmpeg_vram_request_keyframe(FFmpegVRamEncoder *encoder) {
++  try {
++    return encoder->request_keyframe();
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("ffmpeg_vram_request_keyframe failed, ") + std::string(e.what()));
++  }
++  return -1;
++}
++
++int ffmpeg_vram_encode_last(FFmpegVRamEncoder *encoder, EncodeCallback callback, void *obj,
++                            int64_t ms) {
++  try {
++    return encoder->encode_last(callback, obj, ms);
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("ffmpeg_vram_encode_last failed, ") + std::string(e.what()));
++  }
++  return -1;
++}
++
+ int ffmpeg_vram_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum,
+                             int32_t *outDescNum, DataFormat dataFormat,
+                             int32_t width, int32_t height, int32_t kbs,
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h b/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
-index 7a7f5f8..33231eb 100644
+index 7a7f5f8..b8613b1 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
 +++ b/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
 @@ -8,6 +8,9 @@ void *ffmpeg_vram_new_decoder(void *device, int64_t luid,
@@ -223,6 +682,150 @@ index 7a7f5f8..33231eb 100644
  int ffmpeg_vram_destroy_decoder(void *decoder);
  int ffmpeg_vram_test_decode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum,
                              int32_t *outDescNum,
+@@ -28,5 +31,11 @@ int ffmpeg_vram_test_encode(int64_t *outLuids, int32_t *outVendors, int32_t maxD
+                             const int64_t *excludedLuids, const int32_t *excludeFormats, int32_t excludeCount);
+ int ffmpeg_vram_set_bitrate(void *encoder, int32_t kbs);
+ int ffmpeg_vram_set_framerate(void *encoder, int32_t framerate);
++// The next encode or encode_last is an IDR (nvenc with forced-idr only). 0: requested, -1: not
++// supported, the caller has to restart the encoder instead.
++int ffmpeg_vram_request_keyframe(void *encoder);
++// Encodes the last converted image again, without a new texture. -1 if there is none yet.
++int ffmpeg_vram_encode_last(void *encoder, EncodeCallback callback, void *obj,
++                            int64_t ms);
+ 
+ #endif // FFMPEG_VRAM_FFI_H
+\ No newline at end of file
+diff --git a/cpp/nv/nv_encode.cpp b/cpp/nv/nv_encode.cpp
+index 0887d0b..ae031b8 100644
+--- a/cpp/nv/nv_encode.cpp
++++ b/cpp/nv/nv_encode.cpp
+@@ -75,6 +75,8 @@ public:
+   bool full_range_ = false;
+   bool bt709_ = false;
+   NV_ENC_CONFIG encodeConfig_ = {0};
++  // The next encode is an IDR with SPS/PPS (request_keyframe).
++  bool force_idr_ = false;
+ 
+   NvencEncoder(void *handle, int64_t luid, DataFormat dataFormat,
+                int32_t width, int32_t height, int32_t kbs, int32_t framerate,
+@@ -187,7 +189,12 @@ public:
+ 
+     NV_ENC_PIC_PARAMS picParams = {0};
+     picParams.inputTimeStamp = ms;
+-    pEnc_->EncodeFrame(vPacket);
++    if (force_idr_) {
++      picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
++      force_idr_ = false;
++    }
++    // Pass the parameters: without them the timestamp (and any forced IDR) never reached NVENC.
++    pEnc_->EncodeFrame(vPacket, &picParams);
+     for (NvPacket &packet : vPacket) {
+       int32_t key = (packet.pictureType == NV_ENC_PIC_TYPE_IDR ||
+                      packet.pictureType == NV_ENC_PIC_TYPE_I)
+@@ -450,6 +457,17 @@ int nv_set_bitrate(void *e, int32_t kbs) {
+   return -1;
+ }
+ 
++int nv_request_keyframe(void *e) {
++  try {
++    NvencEncoder *enc = (NvencEncoder *)e;
++    enc->force_idr_ = true;
++    return 0;
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("request keyframe failed: ") + e.what());
++  }
++  return -1;
++}
++
+ int nv_set_framerate(void *e, int32_t framerate) {
+   try {
+     RECONFIGURE_HEAD
+diff --git a/cpp/nv/nv_ffi.h b/cpp/nv/nv_ffi.h
+index 06a82fc..900290d 100644
+--- a/cpp/nv/nv_ffi.h
++++ b/cpp/nv/nv_ffi.h
+@@ -37,4 +37,7 @@ int nv_set_bitrate(void *encoder, int32_t kbs);
+ 
+ int nv_set_framerate(void *encoder, int32_t framerate);
+ 
++// The next encode is an IDR with SPS/PPS. 0: requested.
++int nv_request_keyframe(void *encoder);
++
+ #endif // NV_FFI_H
+\ No newline at end of file
+diff --git a/src/ffmpeg.rs b/src/ffmpeg.rs
+index bb57dd7..8f19e4c 100644
+--- a/src/ffmpeg.rs
++++ b/src/ffmpeg.rs
+@@ -50,6 +50,12 @@ pub extern "C" fn hwcodec_av_log_callback(level: i32, message: *const std::os::r
+     }
+ }
+ 
++/// VBV size in frames for nvenc encoders (VRAM and RAM) opened from now on: rc_buffer_size =
++/// frames * bitrate / framerate, kept on every bitrate change. 0 keeps FFmpeg's default VBV.
++pub fn set_nvenc_vbv_frames(frames: i32) {
++    unsafe { hwcodec_set_nvenc_vbv_frames(frames) }
++}
++
+ pub(crate) fn init_av_log() {
+     static INIT: std::sync::Once = std::sync::Once::new();
+     INIT.call_once(|| unsafe {
+diff --git a/src/ffmpeg_ram/encode.rs b/src/ffmpeg_ram/encode.rs
+index 73417b4..f202803 100644
+--- a/src/ffmpeg_ram/encode.rs
++++ b/src/ffmpeg_ram/encode.rs
+@@ -6,7 +6,8 @@ use crate::{
+     ffmpeg::{init_av_log, AVPixelFormat},
+     ffmpeg_ram::{
+         ffmpeg_linesize_offset_length, ffmpeg_ram_encode, ffmpeg_ram_free_encoder,
+-        ffmpeg_ram_new_encoder, ffmpeg_ram_set_bitrate, CodecInfo, AV_NUM_DATA_POINTERS,
++        ffmpeg_ram_new_encoder, ffmpeg_ram_request_keyframe, ffmpeg_ram_set_bitrate, CodecInfo,
++        AV_NUM_DATA_POINTERS,
+     },
+ };
+ use log::trace;
+@@ -150,6 +151,16 @@ impl Encoder {
+         }
+     }
+ 
++    /// The next `encode` produces an IDR (nvenc only). Err: not supported by this encoder.
++    pub fn request_keyframe(&mut self) -> Result<(), ()> {
++        let ret = unsafe { ffmpeg_ram_request_keyframe(self.codec) };
++        if ret == 0 {
++            Ok(())
++        } else {
++            Err(())
++        }
++    }
++
+     pub fn format_from_name(name: String) -> Result<DataFormat, ()> {
+         if name.contains("h264") {
+             return Ok(H264);
+diff --git a/src/vram/amf.rs b/src/vram/amf.rs
+index cb43a28..ce130fc 100644
+--- a/src/vram/amf.rs
++++ b/src/vram/amf.rs
+@@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/amf_ffi.rs"));
+ 
+ use crate::{
+     common::DataFormat::*,
+-    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
++    vram::inner::{
++        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
++        InnerDecodeContext, InnerEncodeContext,
++    },
+ };
+ 
+ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,8 @@ pub fn encode_calls() -> EncodeCalls {
+         test: amf_test_encode,
+         set_bitrate: amf_set_bitrate,
+         set_framerate: amf_set_framerate,
++        request_keyframe: request_keyframe_unsupported,
++        encode_last: encode_last_unsupported,
+     }
+ }
+ 
 diff --git a/src/vram/decode.rs b/src/vram/decode.rs
 index aa43ad7..e49575b 100644
 --- a/src/vram/decode.rs
@@ -264,3 +867,149 @@ index aa43ad7..e49575b 100644
      unsafe extern "C" fn callback(texture: *mut c_void, obj: *const c_void) {
          let frames = &mut *(obj as *mut Vec<DecodeFrame>);
          let mut width = 0;
+diff --git a/src/vram/encode.rs b/src/vram/encode.rs
+index 928fbe0..822045e 100644
+--- a/src/vram/encode.rs
++++ b/src/vram/encode.rs
+@@ -84,6 +84,35 @@ impl Encoder {
+         }
+     }
+ 
++    /// Encodes the last input again, without a new texture (FFmpeg driver only). The frames
++    /// are returned like `encode`'s.
++    pub fn encode_last(&mut self, ms: i64) -> Result<&mut Vec<EncodeFrame>, i32> {
++        unsafe {
++            (&mut *self.frames).clear();
++            let result = (self.calls.encode_last)(
++                self.codec,
++                Some(Self::callback),
++                self.frames as *mut _ as *mut c_void,
++                ms,
++            );
++            if result != 0 {
++                Err(result)
++            } else {
++                Ok(&mut *self.frames)
++            }
++        }
++    }
++
++    /// The next `encode` or `encode_last` produces an IDR. Err: not supported by this driver.
++    pub fn request_keyframe(&mut self) -> Result<(), i32> {
++        unsafe {
++            match (self.calls.request_keyframe)(self.codec) {
++                0 => Ok(()),
++                err => Err(err),
++            }
++        }
++    }
++
+     pub fn set_bitrate(&mut self, kbs: i32) -> Result<(), i32> {
+         unsafe {
+             match (self.calls.set_bitrate)(self.codec, kbs) {
+diff --git a/src/vram/ffmpeg.rs b/src/vram/ffmpeg.rs
+index c4813cf..1a2fd23 100644
+--- a/src/vram/ffmpeg.rs
++++ b/src/vram/ffmpeg.rs
+@@ -17,6 +17,8 @@ pub fn encode_calls() -> EncodeCalls {
+         test: ffmpeg_vram_test_encode,
+         set_bitrate: ffmpeg_vram_set_bitrate,
+         set_framerate: ffmpeg_vram_set_framerate,
++        request_keyframe: ffmpeg_vram_request_keyframe,
++        encode_last: ffmpeg_vram_encode_last,
+     }
+ }
+ 
+diff --git a/src/vram/inner.rs b/src/vram/inner.rs
+index fbb8962..7e0ba15 100644
+--- a/src/vram/inner.rs
++++ b/src/vram/inner.rs
+@@ -64,6 +64,14 @@ pub type IVCall = unsafe extern "C" fn(v: *mut c_void) -> c_int;
+ 
+ pub type IVICall = unsafe extern "C" fn(v: *mut c_void, i: i32) -> c_int;
+ 
++/// Encodes the encoder's last input again (no new texture).
++pub type EncodeLastCall = unsafe extern "C" fn(
++    encoder: *mut c_void,
++    callback: EncodeCallback,
++    obj: *mut c_void,
++    ms: i64,
++) -> c_int;
++
+ pub struct EncodeCalls {
+     pub new: NewEncoderCall,
+     pub encode: EncodeCall,
+@@ -71,6 +79,24 @@ pub struct EncodeCalls {
+     pub test: TestEncodeCall,
+     pub set_bitrate: IVICall,
+     pub set_framerate: IVICall,
++    /// The next encode is an IDR. Nonzero: not supported.
++    pub request_keyframe: IVCall,
++    pub encode_last: EncodeLastCall,
++}
++
++/// For drivers without a forced keyframe.
++pub(crate) unsafe extern "C" fn request_keyframe_unsupported(_: *mut c_void) -> c_int {
++    -1
++}
++
++/// For drivers that do not keep their last input.
++pub(crate) unsafe extern "C" fn encode_last_unsupported(
++    _: *mut c_void,
++    _: EncodeCallback,
++    _: *mut c_void,
++    _: i64,
++) -> c_int {
++    -1
+ }
+ pub struct DecodeCalls {
+     pub new: NewDecoderCall,
+diff --git a/src/vram/mfx.rs b/src/vram/mfx.rs
+index 68753c1..89e4b40 100644
+--- a/src/vram/mfx.rs
++++ b/src/vram/mfx.rs
+@@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/mfx_ffi.rs"));
+ 
+ use crate::{
+     common::DataFormat::*,
+-    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
++    vram::inner::{
++        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
++        InnerDecodeContext, InnerEncodeContext,
++    },
+ };
+ 
+ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,8 @@ pub fn encode_calls() -> EncodeCalls {
+         test: mfx_test_encode,
+         set_bitrate: mfx_set_bitrate,
+         set_framerate: mfx_set_framerate,
++        request_keyframe: request_keyframe_unsupported,
++        encode_last: encode_last_unsupported,
+     }
+ }
+ 
+diff --git a/src/vram/nv.rs b/src/vram/nv.rs
+index a78b9df..cb1b59b 100644
+--- a/src/vram/nv.rs
++++ b/src/vram/nv.rs
+@@ -6,7 +6,9 @@ include!(concat!(env!("OUT_DIR"), "/nv_ffi.rs"));
+ 
+ use crate::{
+     common::DataFormat::*,
+-    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
++    vram::inner::{
++        encode_last_unsupported, DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext,
++    },
+ };
+ 
+ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +19,8 @@ pub fn encode_calls() -> EncodeCalls {
+         test: nv_test_encode,
+         set_bitrate: nv_set_bitrate,
+         set_framerate: nv_set_framerate,
++        request_keyframe: nv_request_keyframe,
++        encode_last: encode_last_unsupported,
+     }
+ }
+ 

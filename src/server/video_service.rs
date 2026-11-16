@@ -64,6 +64,13 @@ use std::{
 
 pub const OPTION_REFRESH: &'static str = "refresh";
 
+/// One encoded message as the capture loop saw it: any key frame in it, and its size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Encoded {
+    pub key: bool,
+    pub bytes: usize,
+}
+
 // `bail!("SWITCH")` that names its reason for the `LATENCY switch` line (latency_stats.rs).
 macro_rules! bail_switch {
     ($reason:expr) => {{
@@ -786,6 +793,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
     let mut latency_stats =
         super::latency_stats::LatencyStats::new(vs.source, display_idx, encoder.bitrate());
+    // M13: refreshes served by a forced key frame (enable-refresh-keyframe, read per refresh).
+    #[cfg(windows)]
+    let mut key_refresh = super::key_refresh::KeyRefresh::default();
+    // M14: re-encodes of the kept last image on a static screen.
+    #[cfg(windows)]
+    let mut static_refine = super::key_refresh::StaticRefine::new(static_refine_enabled());
+    #[cfg(windows)]
+    if static_refine.enabled() {
+        log::info!("static refine on");
+    }
     // Absolute frame deadlines instead of sleeping for the rest of each period (Windows only).
     #[cfg(windows)]
     let deadline_pacing =
@@ -815,11 +832,60 @@ fn run(vs: VideoService) -> ResultType<()> {
             latency_stats.on_quality(encoder.bitrate());
         }
         if sp.is_option_true(OPTION_REFRESH) {
-            if vs.source.is_monitor() {
-                let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
+            #[cfg(windows)]
+            let keyframe = refresh_keyframe_enabled();
+            #[cfg(not(windows))]
+            let keyframe = false;
+            if !keyframe {
+                if vs.source.is_monitor() {
+                    let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
+                }
+                log::info!("switch to refresh");
+                bail_switch!("refresh");
             }
-            log::info!("switch to refresh");
-            bail_switch!("refresh");
+            #[cfg(windows)]
+            {
+                // Cleared here: the encoder keeps running, so run() does not start over.
+                sp.set_option_bool(OPTION_REFRESH, false);
+                if vs.source.is_monitor() {
+                    // A real display change still restarts capture.
+                    try_broadcast_display_changed(&sp, display_idx, &c, true)?;
+                }
+                // A screenshot is taken from the next captured image, which a static screen
+                // only gives after a restart.
+                if SCREENSHOTS
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(vs.source, display_idx))
+                {
+                    log::info!("switch to refresh for a screenshot");
+                    bail_switch!("refresh_screenshot");
+                }
+                match key_refresh.on_refresh(Instant::now()) {
+                    super::key_refresh::RefreshAction::Request => {
+                        request_refresh_key(&mut encoder, &mut key_refresh)?
+                    }
+                    super::key_refresh::RefreshAction::Merged => latency_stats.on_refresh_merged(),
+                    super::key_refresh::RefreshAction::Switch(reason) => {
+                        log::info!("refresh escalated to SWITCH: {reason}");
+                        bail_switch!(reason);
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            let now = Instant::now();
+            if key_refresh.take_due(now) {
+                request_refresh_key(&mut encoder, &mut key_refresh)?;
+            }
+            if key_refresh.timed_out(now) {
+                log::warn!(
+                    "refresh: no key frame within {:?}, switch",
+                    super::key_refresh::KEY_TIMEOUT
+                );
+                bail_switch!("refresh_key_timeout");
+            }
         }
         if codec_format != Encoder::negotiated_codec() {
             log::info!(
@@ -943,7 +1009,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                    let send_conn_ids = handle_one_frame(
+                    let (send_conn_ids, _encoded) = handle_one_frame(
                         display_idx,
                         &sp,
                         frame,
@@ -956,6 +1022,20 @@ fn run(vs: VideoService) -> ResultType<()> {
                         capture_height,
                         &mut latency_stats,
                     )?;
+                    #[cfg(windows)]
+                    if let Some(encoded) = _encoded {
+                        static_refine.on_frame(encoded);
+                        match key_refresh.on_encoded(encoded, Instant::now()) {
+                            Ok(true) if !send_conn_ids.is_empty() => {
+                                latency_stats.on_refresh_key_sent(false)
+                            }
+                            Ok(_) => {}
+                            Err(reason) => {
+                                log::warn!("refresh: the forced key frame did not come, switch");
+                                bail_switch!(reason);
+                            }
+                        }
+                    }
                     // The frame no longer borrows the capturer; the age is of the frame just encoded.
                     #[cfg(windows)]
                     let age = c.last_present_age();
@@ -1025,11 +1105,75 @@ fn run(vs: VideoService) -> ResultType<()> {
                         }
                     }
                 }
+                // No new image: a requested key frame comes from the kept last image, or a key
+                // or large frame on a now static screen is refined.
+                #[cfg(windows)]
+                {
+                    let now = Instant::now();
+                    if key_refresh.kept_due(now, spf) {
+                        check_new_subscriber(&sp)?;
+                        let (send_conn_ids, encoded) = match encode_kept_frame(
+                            display_idx,
+                            &sp,
+                            &mut encoder,
+                            &yuv,
+                            ms,
+                            &recorder,
+                            capture_width,
+                            capture_height,
+                            &mut latency_stats,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::warn!("refresh: no key frame from the kept image ({e}), switch");
+                                bail_switch!("refresh_kept_failed");
+                            }
+                        };
+                        match key_refresh.on_encoded(encoded, now) {
+                            Ok(_) => {
+                                static_refine.on_kept_key();
+                                if !send_conn_ids.is_empty() {
+                                    latency_stats.on_refresh_key_sent(true);
+                                }
+                            }
+                            Err(reason) => {
+                                log::warn!("refresh: the kept image gave no key frame, switch");
+                                bail_switch!(reason);
+                            }
+                        }
+                        frame_controller.set_send(now, send_conn_ids);
+                        send_counter += 1;
+                    } else if !key_refresh.pending() && static_refine.on_idle(now) {
+                        check_new_subscriber(&sp)?;
+                        match encode_kept_frame(
+                            display_idx,
+                            &sp,
+                            &mut encoder,
+                            &yuv,
+                            ms,
+                            &recorder,
+                            capture_width,
+                            capture_height,
+                            &mut latency_stats,
+                        ) {
+                            Ok((send_conn_ids, encoded)) => {
+                                latency_stats.on_refine();
+                                let _ = key_refresh.on_encoded(encoded, now);
+                                frame_controller.set_send(now, send_conn_ids);
+                                send_counter += 1;
+                            }
+                            Err(e) => {
+                                log::warn!("static refine failed, off until the next restart: {e}");
+                                static_refine.disable();
+                            }
+                        }
+                    }
+                }
                 if !encoder.latency_free() && yuv.len() > 0 {
                     // yun.len() > 0 means the frame is not texture.
                     if repeat_encode_counter < repeat_encode_max {
                         repeat_encode_counter += 1;
-                        let send_conn_ids = handle_one_frame(
+                        let (send_conn_ids, _) = handle_one_frame(
                             display_idx,
                             &sp,
                             EncodeInput::YUV(&yuv),
@@ -1398,35 +1542,20 @@ fn handle_one_frame(
     width: usize,
     height: usize,
     latency_stats: &mut super::latency_stats::LatencyStats,
-) -> ResultType<HashSet<i32>> {
-    sp.snapshot(|sps| {
-        // so that new sub and old sub share the same encoder after switch
-        if sps.has_subscribes() {
-            log::info!("switch due to new subscriber");
-            bail_switch!("new_subscriber");
-        }
-        Ok(())
-    })?;
+) -> ResultType<(HashSet<i32>, Option<Encoded>)> {
+    check_new_subscriber(sp)?;
 
     let mut send_conn_ids: HashSet<i32> = Default::default();
+    let mut encoded = None;
     let first = *first_frame;
     *first_frame = false;
     match encoder.encode_to_message(frame, ms) {
-        Ok(mut vf) => {
+        Ok(vf) => {
             *encode_fail_counter = 0;
-            vf.display = display as _;
-            let mut msg = Message::new();
-            msg.set_video_frame(vf);
-            recorder
-                .lock()
-                .unwrap()
-                .as_mut()
-                .map(|r| r.write_message(&msg, width, height));
-            latency_stats.on_encoded(&msg);
-            send_conn_ids = sp.send_video_frame(msg);
-            if !send_conn_ids.is_empty() {
-                latency_stats.on_sent();
-            }
+            let (ids, info) =
+                send_encoded(display, sp, vf, &recorder, width, height, latency_stats);
+            send_conn_ids = ids;
+            encoded = Some(info);
         }
         Err(e) => {
             *encode_fail_counter += 1;
@@ -1459,7 +1588,111 @@ fn handle_one_frame(
             }
         }
     }
-    Ok(send_conn_ids)
+    Ok((send_conn_ids, encoded))
+}
+
+fn check_new_subscriber(sp: &GenericService) -> ResultType<()> {
+    sp.snapshot(|sps| {
+        // so that new sub and old sub share the same encoder after switch
+        if sps.has_subscribes() {
+            log::info!("switch due to new subscriber");
+            bail_switch!("new_subscriber");
+        }
+        Ok(())
+    })
+}
+
+// Records and sends one encoded frame to the display's connections.
+fn send_encoded(
+    display: usize,
+    sp: &GenericService,
+    mut vf: VideoFrame,
+    recorder: &Arc<Mutex<Option<Recorder>>>,
+    width: usize,
+    height: usize,
+    latency_stats: &mut super::latency_stats::LatencyStats,
+) -> (HashSet<i32>, Encoded) {
+    vf.display = display as _;
+    let mut msg = Message::new();
+    msg.set_video_frame(vf);
+    let mut encoded = Encoded::default();
+    for f in super::latency_stats::encoded_frames(&msg).unwrap_or_default() {
+        encoded.key |= f.key;
+        encoded.bytes += f.data.len();
+    }
+    recorder
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|r| r.write_message(&msg, width, height));
+    latency_stats.on_encoded(&msg);
+    let send_conn_ids = sp.send_video_frame(msg);
+    if !send_conn_ids.is_empty() {
+        latency_stats.on_sent();
+    }
+    (send_conn_ids, encoded)
+}
+
+/// Encodes the kept last image again without a new capture: VRAM re-encodes its NV12 surface,
+/// YUV encoders the kept YUV buffer; a pending forced key frame applies. Errors never count as
+/// encode failures and never disable the encoder: the caller restarts or stops refining.
+#[cfg(windows)]
+fn encode_kept_frame(
+    display: usize,
+    sp: &GenericService,
+    encoder: &mut Encoder,
+    yuv: &[u8],
+    ms: i64,
+    recorder: &Arc<Mutex<Option<Recorder>>>,
+    width: usize,
+    height: usize,
+    latency_stats: &mut super::latency_stats::LatencyStats,
+) -> ResultType<(HashSet<i32>, Encoded)> {
+    #[cfg(feature = "vram")]
+    let texture = encoder.input_texture();
+    #[cfg(not(feature = "vram"))]
+    let texture = false;
+    let vf = if texture {
+        encoder.encode_last(ms)?
+    } else if !yuv.is_empty() {
+        encoder.encode_to_message(EncodeInput::YUV(yuv), ms)?
+    } else {
+        bail!("no kept image");
+    };
+    Ok(send_encoded(
+        display,
+        sp,
+        vf,
+        recorder,
+        width,
+        height,
+        latency_stats,
+    ))
+}
+
+#[cfg(windows)]
+fn refresh_keyframe_enabled() -> bool {
+    Config::get_option(base::config::keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y"
+}
+
+// On exactly with a VBV smaller than FFmpeg's default: the two only go on together (roadmap
+// M14), and `enable-static-refine=N` turns both off (`nvenc_vbv_frames` is then 0).
+#[cfg(windows)]
+fn static_refine_enabled() -> bool {
+    scrap::codec::nvenc_vbv_frames() > 0
+}
+
+#[cfg(windows)]
+fn request_refresh_key(
+    encoder: &mut Encoder,
+    key_refresh: &mut super::key_refresh::KeyRefresh,
+) -> ResultType<()> {
+    if !encoder.request_keyframe() {
+        log::info!("refresh: this encoder has no forced key frame, switch");
+        bail_switch!("refresh_unsupported");
+    }
+    key_refresh.on_requested(Instant::now());
+    Ok(())
 }
 
 #[inline]

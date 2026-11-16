@@ -165,7 +165,7 @@ fn log_switch(source: VideoSource, display: usize, gap: &Gap, ms: u128) {
     *entry = (Some(now), 0);
 }
 
-fn encoded_frames(msg: &Message) -> Option<&[base::message_proto::EncodedVideoFrame]> {
+pub(super) fn encoded_frames(msg: &Message) -> Option<&[base::message_proto::EncodedVideoFrame]> {
     use video_frame::Union::*;
     match &msg.union {
         Some(message::Union::VideoFrame(vf)) => match vf.union.as_ref()? {
@@ -207,6 +207,14 @@ pub(super) struct LatencyStats {
     gap: Samples,
     // The restart this capture loop was started for, until its first frame is sent.
     gap_pending: Option<Gap>,
+    // enable-refresh-keyframe: refreshes served by a forced key frame, how many of those key
+    // frames were encoded from the kept last image (static screen), and refreshes merged into a
+    // pending key frame or deferred to the minimum key interval.
+    rkey: usize,
+    rkept: usize,
+    rmerge: usize,
+    // Static refine: re-encodes of the kept last image on a static screen.
+    refine: usize,
 }
 
 impl LatencyStats {
@@ -238,6 +246,10 @@ impl LatencyStats {
             qchg_pending: false,
             gap: Default::default(),
             gap_pending: take_gap(source, display),
+            rkey: 0,
+            rkept: 0,
+            rmerge: 0,
+            refine: 0,
         }
     }
 
@@ -303,6 +315,41 @@ impl LatencyStats {
         }
     }
 
+    /// A forced key frame for a refresh reached at least one connection (`kept`: encoded from the
+    /// kept last image). Ends the refresh's gap, logged like a restart with reason
+    /// `refresh_keyframe` and `restarts=0`.
+    pub(super) fn on_refresh_key_sent(&mut self, kept: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.rkey += 1;
+        if kept {
+            self.rkept += 1;
+        }
+        if let Some(mut gap) = take_gap(self.source, self.display) {
+            if gap.reason.is_empty() {
+                gap.reason = "refresh_keyframe".to_owned();
+            }
+            let d = gap.since.elapsed();
+            self.gap.push(d);
+            log_switch(self.source, self.display, &gap, d.as_millis());
+        }
+    }
+
+    /// A refresh merged into a pending key frame or deferred to the minimum key interval.
+    pub(super) fn on_refresh_merged(&mut self) {
+        if self.enabled {
+            self.rmerge += 1;
+        }
+    }
+
+    /// One static-refine re-encode of the kept last image.
+    pub(super) fn on_refine(&mut self) {
+        if self.enabled {
+            self.refine += 1;
+        }
+    }
+
     /// The encoder's bitrate was changed by `set_quality` (QoS ratio change).
     pub(super) fn on_quality(&mut self, kbps: u32) {
         self.set_kbps = kbps;
@@ -350,7 +397,7 @@ impl LatencyStats {
         if self.enabled && self.sent + self.skipped + self.idle > 0 {
             let secs = elapsed.as_secs_f64();
             log::info!(
-                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={}",
+                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={}",
                 self.display,
                 self.sent as f64 / secs,
                 spf.as_millis(),
@@ -374,6 +421,10 @@ impl LatencyStats {
                 format_summary(self.gap.summary()),
                 if deadline { "deadline" } else { "relative" },
                 self.reanchor,
+                self.rkey,
+                self.rkept,
+                self.rmerge,
+                self.refine,
             );
         }
         self.window_start = Instant::now();
@@ -393,6 +444,10 @@ impl LatencyStats {
         self.qchg = 0;
         self.qchg_key = 0;
         self.gap.clear();
+        self.rkey = 0;
+        self.rkept = 0;
+        self.rmerge = 0;
+        self.refine = 0;
         self.enabled = is_enabled();
         SEND_ENABLED.store(self.enabled, Ordering::Relaxed);
     }
@@ -623,6 +678,26 @@ mod tests {
         // Without a noted reason the error text is the reason, as one token.
         on_restart(key.0, key.1, &hbb_common::anyhow::anyhow!("Desktop changed"));
         assert_eq!(take_gap(key.0, key.1).unwrap().reason, "Desktop_changed");
+        SEND_ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn latency_refresh_key_ends_gap() {
+        SEND_ENABLED.store(true, Ordering::Relaxed);
+        let key = (VideoSource::Camera, 96);
+        let mut s = LatencyStats::new(key.0, key.1, 3000);
+        s.enabled = true;
+        on_refresh_request(key.0, key.1);
+        s.on_refresh_merged();
+        s.on_refresh_key_sent(true);
+        assert!(take_gap(key.0, key.1).is_none());
+        assert_eq!((s.rkey, s.rkept, s.rmerge), (1, 1, 1));
+        assert_eq!(s.gap.summary().map(|_| ()), Some(()));
+        // No refresh pending: counted, no gap sample.
+        s.gap.clear();
+        s.on_refresh_key_sent(false);
+        assert_eq!((s.rkey, s.rkept), (2, 1));
+        assert!(s.gap.summary().is_none());
         SEND_ENABLED.store(false, Ordering::Relaxed);
     }
 

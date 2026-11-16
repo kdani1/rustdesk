@@ -93,6 +93,7 @@ impl EncoderApi for HwRamEncoder {
                         )))
                     }
                 };
+                hwcodec::ffmpeg::set_nvenc_vbv_frames(crate::codec::nvenc_vbv_frames());
                 match Encoder::new(ctx.clone()) {
                     Ok(encoder) => Ok(HwRamEncoder {
                         encoder,
@@ -206,6 +207,10 @@ impl EncoderApi for HwRamEncoder {
 
     fn disable(&self) {
         HwCodecConfig::clear(false, true);
+    }
+
+    fn request_keyframe(&mut self) -> bool {
+        self.encoder.request_keyframe().is_ok()
     }
 }
 

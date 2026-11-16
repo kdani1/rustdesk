@@ -47,7 +47,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0
 ```
 
 | Field | Meaning |
@@ -72,13 +72,68 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `qchg_key` | how many of those were followed by a key frame as the next encoded frame. 0 with `qchg` > 0 confirms the FFmpeg patch 0009 (no IDR on a bitrate change) is in the binary. |
 | `pacing` | Windows host: `deadline` (`enable-capture-deadline-pacing`, on by default): each tick is due one `spf` after the previous deadline, so oversleep and loop overhead do not add up; when the loop is more than one `spf` past its deadline it starts a new schedule from now (no catch-up burst). Within one `spf` of lateness the next iteration starts at once. `relative` (option `N`, and on other platforms): the loop sleeps `spf` minus this iteration's time, so each iteration's oversleep adds up (measured 58.6 fps at a 60 fps target). Read when the capture loop starts. |
 | `reanchor` | `pacing=deadline`: how often the loop was more than one `spf` late and started a new schedule (long `wait`, a stall, a camera that delivers slower than the target). An iteration without a new image (`idle`; the DXGI timeout is `ceil(spf)` + 2 ms) that ends past its deadline also starts a new schedule from now, but is not counted. Always 0 with `relative`. |
-| `gap` | capture restarts completed in the window (see `LATENCY switch` below): from the refresh request or the restart until the restarted capture loop sent its first frame to a connection, p50/p95/max ms |
+| `gap` | capture restarts completed in the window (see `LATENCY switch` below): from the refresh request or the restart until the restarted capture loop sent its first frame to a connection, p50/p95/max ms. With `enable-refresh-keyframe` it also holds the refreshes served by a key frame: from the request until that key frame reached a connection. |
+| `rkey` | Windows host, `enable-refresh-keyframe=Y`: refreshes served by a forced key frame on the running encoder (no restart), counted when the key frame reached at least one connection. Their gaps are in `gap` and in `LATENCY switch` lines with `reason=refresh_keyframe restarts=0`. |
+| `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
+| `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
+| `refine` | static refine (on with `nvenc-vbv-frames` > 0): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`. |
 
-`age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key` and `reanchor` are only counted while
-logging is on, like the other fields; `set_kbps` is kept always.
+`age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
+`rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
+kept always.
 
 Not covered: the re-encode of the last image that non-latency-free encoders
 (mediacodec, videotoolbox) do on idle iterations.
+
+### Host: key frame refresh, VBV and static refine (roadmap M13/M14)
+
+Windows host, server options (`rustdesk.exe --option <key> <value>` on an installed host). All
+three are off by default in this build.
+
+- **`enable-refresh-keyframe`** (`Y` turns it on; read on every refresh). A viewer's
+  `RefreshVideo` (its fps control, decode errors, queue overflow, the session menu, `PeerInfo` at
+  login) then asks the running encoder for a key frame instead of restarting capturer and encoder
+  (`SWITCH`). Stock viewers recover on any key-flagged frame, so nothing changes on the wire.
+  Encoders: FFmpeg `hevc_nvenc`/`h264_nvenc` (VRAM and RAM): `pict_type I` with `forced-idr=1`;
+  direct NVENC SDK: `NV_ENC_PIC_FLAG_FORCEIDR | OUTPUT_SPSPPS`; VP8/VP9/AV1: `FORCE_KF`. AMF, QSV,
+  MFX keep the restart (`reason=refresh_unsupported`). Still a restart: a real display change
+  (`display_changed`), a pending screenshot (`refresh_screenshot`), and the escalations:
+  - `refresh_escalated`: a refresh after 3 refreshes were served by key frames within 3 s (log
+    line `refresh escalated to SWITCH`; should stay about 0),
+  - `refresh_no_key`: the encode after the request had no key frame,
+  - `refresh_kept_failed`: static screen, and the kept image could not be encoded (the driver
+    keeps none; before the run encoded its first frame the request waits for that frame, a key
+    frame anyway, up to the 1 s timeout),
+  - `refresh_key_timeout`: no key frame 1 s after the request.
+
+  Refreshes while a key frame is pending merge into it; one that comes less than 200 ms after a
+  key frame went out waits for the 200 ms (`rmerge`), once the encoder took a key frame request in
+  this run (before that the refresh asks at once, so an encoder without forced key frames restarts
+  without the wait). Forced key frame and kept-image encode
+  failures never count as encode failures and never turn the hardware encoder off.
+- **`nvenc-vbv-frames`** (number, empty or `0` = FFmpeg's default VBV; read when an encoder is
+  created). nvenc `rc_buffer_size` = N × bitrate / encoder frame rate, at open and after every
+  bitrate change (FFmpeg's nvenc reconfigure re-applies it; patch 0009 keeps that free of an
+  IDR). The encoder frame rate is the one NVENC was opened with: 30 on the VRAM and RAM paths
+  today, while the loop runs at up to 60, so N = 1 is one NVENC frame budget, about two real
+  frames at 60 fps (until the encoder is opened at the real frame rate). `ldkfs` is left at
+  NVENC's default (1 with `tune=ull`). Turns static refine on: the two only go on together
+  (roadmap M14).
+- **`enable-static-refine`** (`N` turns static refine and the VBV off together, so
+  `nvenc-vbv-frames` is then ignored; any other value changes nothing, refine is on exactly when
+  `nvenc-vbv-frames` > 0; read when the capture loop starts, the VBV part when an encoder is
+  created): see `refine` above.
+
+Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL]`, `[FFMPEG_VRAM_ENC]` or `[FFMPEG_RAM_ENC]`):
+
+| Line | Meaning |
+|---|---|
+| `[UTIL] hevc_nvenc open: bit_rate=… fps=… rc_buffer_size=… vbv_frames=… forced_idr=…` | once per nvenc encoder: what FFmpeg settled on after `avcodec_open2`. With `vbv_frames=0` `rc_buffer_size` is FFmpeg's own default VBV (expected 2 × `bit_rate`), with N > 0 the value set. `forced_idr=0` means FFmpeg refused `forced-idr`, or an earlier encoder of that name gave a forced IDR without the key flag in this process; the encoder then reports forced key frames as unsupported (refresh then restarts at once). |
+| `forced IDR verified: key frame of N bytes` | once per encoder: the first forced key frame came out key-flagged |
+| `forced IDR gave no key frame, forced keyframes off` | a forced key frame came out without the key flag (`refresh_no_key` follows): forced key frames are reported unsupported for encoders of that name until the host process restarts, so this line comes at most once per process and name, and later refreshes restart at once (`refresh_unsupported`) |
+| `[FFMPEG] avg bitrate change: a -> b` / `[FFMPEG] vbv buffer size change: a -> b` | with `nvenc-vbv-frames` > 0, FFmpeg's own nvenc reconfigure lines for the first 8 such messages in the process: the proof that a bitrate change re-applies the VBV |
+| `static refine on` | the capture loop starts with static refine |
+| `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |
 
 ### Host: capture restarts, connection loop, transport
 
@@ -92,8 +147,8 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 |---|---|
 | `LATENCY switch` | one line per completed capture restart (`gap`), with logging on, at most one per source and display per second. A capture restart is any error return of the capture loop (`run()` in `video_service.rs`), which the service restarts: a `SWITCH` (refresh, codec change, new subscriber, …) or an error. |
 | `source` / `display` | `monitor` or `camera`, and the display index. Gaps are kept per source and display. |
-| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), `codec`, `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
-| `restarts` | restarts within this gap (a restart that failed again before sending a frame adds one) |
+| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), the `enable-refresh-keyframe` reasons below, `codec`, `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
+| `restarts` | restarts within this gap (a restart that failed again before sending a frame adds one). `0` with `reason=refresh_keyframe`: the refresh was served by a key frame without a restart. |
 | `gap_ms` | the gap: from the viewer's refresh request (`RefreshVideo` for one display, recorded in `refresh_video_display`) or, without one, the restart, until the restarted loop handed its first frame to at least one connection. It includes the service's error back-off sleep and the capturer/encoder re-creation. A refresh request for all displays (login, `PeerInfo`) has no request time: its gap starts at the restart. Gaps older than 60 s when the loop starts are dropped (the session that caused it is most likely gone). |
 | `not_logged` | completed gaps of this source and display not logged since the previous line (rate limit); they are still in the `gap` field |
 | `LATENCY conn` | every 5 s per authorized connection, with logging on, when the connection wrote video frames or received MouseEvents in the window. It covers the connection's own `tokio::select!` loop in `Connection::start` (`connection.rs`). |
