@@ -925,10 +925,15 @@ pub fn allow_d3d_render() -> bool {
 
 /// Host option `nvenc-vbv-frames` (Windows): VBV size of nvenc encoders in frames, 0 (default,
 /// also for anything unparsable) keeps FFmpeg's default VBV. Read when an encoder is created.
+/// VBV and static refine only go on together (roadmap M14): `enable-static-refine=N` turns
+/// both off, and static refine is on exactly when this is > 0.
 pub fn nvenc_vbv_frames() -> i32 {
     #[cfg(windows)]
     {
-        use base::config::keys::OPTION_NVENC_VBV_FRAMES;
+        use base::config::keys::{OPTION_ENABLE_STATIC_REFINE, OPTION_NVENC_VBV_FRAMES};
+        if Config::get_option(OPTION_ENABLE_STATIC_REFINE) == "N" {
+            return 0;
+        }
         Config::get_option(OPTION_NVENC_VBV_FRAMES)
             .trim()
             .parse::<i32>()

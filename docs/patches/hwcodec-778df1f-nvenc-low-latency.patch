@@ -59,18 +59,22 @@ index fc72b30..3211ef1 100644
  
  #define LOG_ERROR(message)                                                     \
 diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
-index 45810b4..5437951 100644
+index 45810b4..ac0ded8 100644
 --- a/cpp/common/util.cpp
 +++ b/cpp/common/util.cpp
-@@ -3,6 +3,7 @@ extern "C" {
+@@ -3,8 +3,11 @@ extern "C" {
  }
  
  #include "util.h"
 +#include <atomic>
  #include <limits>
  #include <map>
++#include <mutex>
++#include <set>
  #include <string.h>
-@@ -70,6 +71,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
+ #include <vector>
+ 
+@@ -70,6 +73,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
        LOG_ERROR(std::string("nvenc set_lantency_free failed, ret = ") + av_err2str(ret));
        return false;
      }
@@ -91,13 +95,27 @@ index 45810b4..5437951 100644
    }
    if (name.find("amf") != std::string::npos) {
      if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
-@@ -304,6 +319,46 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
+@@ -304,6 +321,60 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
    return true;
  }
  
++static std::mutex g_forced_idr_broken_mutex;
++static std::set<std::string> g_forced_idr_broken;
++
++void set_forced_idr_broken(const std::string &name) {
++  std::lock_guard<std::mutex> lock(g_forced_idr_broken_mutex);
++  g_forced_idr_broken.insert(name);
++}
++
 +bool set_forced_idr(void *priv_data, const std::string &name) {
 +  if (name.find("nvenc") == std::string::npos) {
 +    return false;
++  }
++  {
++    std::lock_guard<std::mutex> lock(g_forced_idr_broken_mutex);
++    if (g_forced_idr_broken.count(name)) {
++      return false;
++    }
 +  }
 +  int ret = av_opt_set(priv_data, "forced-idr", "1", 0);
 +  if (ret < 0) {
@@ -138,7 +156,7 @@ index 45810b4..5437951 100644
  void vram_encode_test_callback(const uint8_t *data, int32_t len, int32_t key, const void *obj, int64_t pts) {
    (void)data;
    (void)len;
-@@ -328,6 +383,20 @@ bool has_flag_could_not_find_ref_with_poc() {
+@@ -328,6 +399,20 @@ bool has_flag_could_not_find_ref_with_poc() {
  
  } // namespace util_decode
  
@@ -161,18 +179,22 @@ index 45810b4..5437951 100644
  }
 \ No newline at end of file
 diff --git a/cpp/common/util.h b/cpp/common/util.h
-index 711fd2a..1984738 100644
+index 711fd2a..d31e2a2 100644
 --- a/cpp/common/util.h
 +++ b/cpp/common/util.h
-@@ -20,6 +20,21 @@ bool force_hw(void *priv_data, const std::string &name);
+@@ -20,6 +20,25 @@ bool force_hw(void *priv_data, const std::string &name);
  bool set_others(void *priv_data, const std::string &name);
  
  bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs);
 +
 +// nvenc only: forced-idr=1, so a frame sent with pict_type I is coded as an IDR and its packet
 +// carries AV_PKT_FLAG_KEY (without it nvenc codes a non-key intra frame). False when the encoder is
-+// not nvenc or the option was refused: forced keyframes are then unsupported.
++// not nvenc, the option was refused, or a forced IDR of an encoder with this name already came out
++// without the key flag in this process (set_forced_idr_broken): forced keyframes are then unsupported.
 +bool set_forced_idr(void *priv_data, const std::string &name);
++// A forced IDR came out without the key flag: forced keyframes stay off for encoders with this name
++// for the rest of the process, so later encoders do not repeat the useless forced frame.
++void set_forced_idr_broken(const std::string &name);
 +// VBV size in frames for nvenc encoders opened from now on (hwcodec_set_nvenc_vbv_frames); 0 keeps
 +// FFmpeg's default.
 +int nvenc_vbv_frames();
@@ -187,7 +209,7 @@ index 711fd2a..1984738 100644
  
  } // namespace util
 diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-index 0a8d1b1..de9b609 100644
+index 0a8d1b1..5b24cfd 100644
 --- a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
 +++ b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
 @@ -122,6 +122,14 @@ public:
@@ -269,7 +291,7 @@ index 0a8d1b1..de9b609 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-@@ -358,12 +394,27 @@ private:
+@@ -358,12 +394,28 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -287,6 +309,7 @@ index 0a8d1b1..de9b609 100644
 +      if (!forced_key) {
 +        LOG_WARN(std::string("forced IDR gave no key frame, forced keyframes off, ") + name_);
 +        forced_idr_ok_ = false;
++        util_encode::set_forced_idr_broken(name_);
 +      } else if (!forced_idr_logged_) {
 +        forced_idr_logged_ = true;
 +        LOG_INFO(std::string("forced IDR verified: key frame of ") +
@@ -298,7 +321,7 @@ index 0a8d1b1..de9b609 100644
    }
  
    int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
-@@ -463,4 +514,13 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
+@@ -463,4 +515,13 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
      LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
    }
    return -1;
@@ -328,7 +351,7 @@ index b1057b2..71b24bd 100644
  #endif // FFMPEG_RAM_FFI_H
 \ No newline at end of file
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-index 2b21b73..dcf1fbd 100644
+index 2b21b73..5f773b6 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 +++ b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 @@ -76,6 +76,15 @@ public:
@@ -385,7 +408,7 @@ index 2b21b73..dcf1fbd 100644
 +  }
 +
 +  // The next encode or encode_last is an IDR. -1: not supported (not nvenc, or forced-idr was
-+  // refused, or a forced IDR came out without the key flag).
++  // refused, or a forced IDR came out without the key flag, in this process).
 +  int request_keyframe() {
 +    if (!forced_idr_ok_)
 +      return -1;
@@ -442,7 +465,7 @@ index 2b21b73..dcf1fbd 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
-@@ -333,13 +381,31 @@ private:
+@@ -333,13 +381,33 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -460,10 +483,12 @@ index 2b21b73..dcf1fbd 100644
 +    if (forced && encoded) {
 +      if (!forced_key) {
 +        // pict_type I did not give a key-flagged packet (e.g. coded as a non-IDR intra
-+        // frame): say so once and report keyframes as unsupported from now on.
++        // frame): report keyframes as unsupported from now on, also for the encoders opened
++        // later in this process (the caller restarts the encoder after this frame).
 +        LOG_WARN(std::string("forced IDR gave no key frame, forced keyframes off, ") +
 +                 encoder_->name_);
 +        forced_idr_ok_ = false;
++        util_encode::set_forced_idr_broken(encoder_->name_);
 +      } else if (!forced_idr_logged_) {
 +        forced_idr_logged_ = true;
 +        LOG_INFO(std::string("forced IDR verified: key frame of ") +
@@ -475,7 +500,7 @@ index 2b21b73..dcf1fbd 100644
    }
  
    bool convert(void *texture) {
-@@ -486,13 +552,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
+@@ -486,13 +554,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
  
  int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
    try {

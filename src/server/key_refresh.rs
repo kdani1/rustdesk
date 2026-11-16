@@ -49,6 +49,11 @@ pub(super) struct KeyRefresh {
     // A refresh waits for `MIN_KEY_INTERVAL` after the last key frame.
     deferred: bool,
     last_key: Option<Instant>,
+    // The encoder took a key frame request in this run; until then a refresh is not deferred,
+    // so an encoder without forced key frames restarts at once instead of after the interval.
+    supported: bool,
+    // An encoded message came in this run, so a kept image exists for `kept_due`.
+    has_encoded: bool,
     // When the key frames that served refreshes were encoded, within `ESCALATE_WINDOW`.
     served: VecDeque<Instant>,
 }
@@ -69,7 +74,7 @@ impl KeyRefresh {
         if self.requested.is_some() || self.deferred {
             return RefreshAction::Merged;
         }
-        if let Some(last) = self.last_key {
+        if let Some(last) = self.last_key.filter(|_| self.supported) {
             if now.saturating_duration_since(last) < MIN_KEY_INTERVAL {
                 self.deferred = true;
                 return RefreshAction::Merged;
@@ -96,6 +101,7 @@ impl KeyRefresh {
     /// The encoder accepted a key frame request.
     pub(super) fn on_requested(&mut self, now: Instant) {
         self.requested = Some(now);
+        self.supported = true;
     }
 
     pub(super) fn pending(&self) -> bool {
@@ -105,6 +111,7 @@ impl KeyRefresh {
     /// An encoded message. While a key frame is requested it has to be one: Err with the
     /// `SWITCH` reason otherwise. Ok(true): this message is the requested key frame.
     pub(super) fn on_encoded(&mut self, encoded: Encoded, now: Instant) -> Result<bool, &'static str> {
+        self.has_encoded = true;
         if encoded.key {
             self.last_key = Some(now);
         }
@@ -119,8 +126,13 @@ impl KeyRefresh {
         Ok(true)
     }
 
-    /// The requested key frame should now be encoded from the kept last image.
+    /// The requested key frame should now be encoded from the kept last image. Not before this
+    /// run encoded a frame: there is no kept image yet, and the first frame of a new encoder is a
+    /// key frame anyway (`KEY_TIMEOUT` still applies).
     pub(super) fn kept_due(&self, now: Instant, spf: Duration) -> bool {
+        if !self.has_encoded {
+            return false;
+        }
         self.requested
             .map(|t| now.saturating_duration_since(t) >= (spf * 2).min(KEPT_KEY_AFTER_MAX))
             .unwrap_or(false)
@@ -235,6 +247,21 @@ mod tests {
     }
 
     #[test]
+    fn latency_refresh_not_deferred_before_support_is_known() {
+        let t = Instant::now();
+        let mut r = KeyRefresh::default();
+        // The first frame of a new encoder is a key frame; a refresh right after it asks the
+        // encoder at once, so one without forced key frames restarts without waiting.
+        assert_eq!(r.on_encoded(KEY, t), Ok(false));
+        assert_eq!(r.on_refresh(ms(t, 50)), RefreshAction::Request);
+        r.on_requested(ms(t, 50));
+        assert_eq!(r.on_encoded(KEY, ms(t, 66)), Ok(true));
+        // Supported now: the next one waits for the minimum key interval.
+        assert_eq!(r.on_refresh(ms(t, 100)), RefreshAction::Merged);
+        assert!(r.take_due(ms(t, 266)));
+    }
+
+    #[test]
     fn latency_refresh_escalates_after_served_keys() {
         let t = Instant::now();
         let mut r = KeyRefresh::default();
@@ -258,6 +285,11 @@ mod tests {
         let mut r = KeyRefresh::default();
         let spf = Duration::from_millis(16);
         assert!(!r.kept_due(t, spf) && !r.timed_out(t));
+        // Requested before the run encoded anything: no kept image, wait for the first frame.
+        r.on_requested(t);
+        assert!(!r.kept_due(ms(t, 100), spf));
+        assert!(r.timed_out(ms(t, 1_000)));
+        let mut r = KeyRefresh::default();
         // Without a request any frame is fine.
         assert_eq!(r.on_encoded(DELTA, t), Ok(false));
         r.on_requested(t);

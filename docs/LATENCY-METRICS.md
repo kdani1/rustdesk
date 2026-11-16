@@ -76,7 +76,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkey` | Windows host, `enable-refresh-keyframe=Y`: refreshes served by a forced key frame on the running encoder (no restart), counted when the key frame reached at least one connection. Their gaps are in `gap` and in `LATENCY switch` lines with `reason=refresh_keyframe restarts=0`. |
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
-| `refine` | static refine (`enable-static-refine`, or `nvenc-vbv-frames` > 0): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`. |
+| `refine` | static refine (on with `nvenc-vbv-frames` > 0): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`. |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
 `rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
@@ -101,12 +101,15 @@ three are off by default in this build.
   - `refresh_escalated`: a refresh after 3 refreshes were served by key frames within 3 s (log
     line `refresh escalated to SWITCH`; should stay about 0),
   - `refresh_no_key`: the encode after the request had no key frame,
-  - `refresh_kept_failed`: static screen, and the kept image could not be encoded (no image yet,
-    or the driver keeps none),
+  - `refresh_kept_failed`: static screen, and the kept image could not be encoded (the driver
+    keeps none; before the run encoded its first frame the request waits for that frame, a key
+    frame anyway, up to the 1 s timeout),
   - `refresh_key_timeout`: no key frame 1 s after the request.
 
   Refreshes while a key frame is pending merge into it; one that comes less than 200 ms after a
-  key frame went out waits for the 200 ms (`rmerge`). Forced key frame and kept-image encode
+  key frame went out waits for the 200 ms (`rmerge`), once the encoder took a key frame request in
+  this run (before that the refresh asks at once, so an encoder without forced key frames restarts
+  without the wait). Forced key frame and kept-image encode
   failures never count as encode failures and never turn the hardware encoder off.
 - **`nvenc-vbv-frames`** (number, empty or `0` = FFmpeg's default VBV; read when an encoder is
   created). nvenc `rc_buffer_size` = N × bitrate / encoder frame rate, at open and after every
@@ -114,17 +117,20 @@ three are off by default in this build.
   IDR). The encoder frame rate is the one NVENC was opened with: 30 on the VRAM and RAM paths
   today, while the loop runs at up to 60, so N = 1 is one NVENC frame budget, about two real
   frames at 60 fps (until the encoder is opened at the real frame rate). `ldkfs` is left at
-  NVENC's default (1 with `tune=ull`). Turns static refine on unless `enable-static-refine=N`.
-- **`enable-static-refine`** (`Y` on, `N` off, empty = on exactly when `nvenc-vbv-frames` > 0;
-  read when the capture loop starts): see `refine` above.
+  NVENC's default (1 with `tune=ull`). Turns static refine on: the two only go on together
+  (roadmap M14).
+- **`enable-static-refine`** (`N` turns static refine and the VBV off together, so
+  `nvenc-vbv-frames` is then ignored; any other value changes nothing, refine is on exactly when
+  `nvenc-vbv-frames` > 0; read when the capture loop starts, the VBV part when an encoder is
+  created): see `refine` above.
 
 Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL]`, `[FFMPEG_VRAM_ENC]` or `[FFMPEG_RAM_ENC]`):
 
 | Line | Meaning |
 |---|---|
-| `[UTIL] hevc_nvenc open: bit_rate=… fps=… rc_buffer_size=… vbv_frames=… forced_idr=…` | once per nvenc encoder: what FFmpeg settled on after `avcodec_open2`. With `vbv_frames=0` `rc_buffer_size` is FFmpeg's own default VBV (expected 2 × `bit_rate`), with N > 0 the value set. `forced_idr=0` means FFmpeg refused `forced-idr` and the encoder reports forced key frames as unsupported (refresh then restarts). |
+| `[UTIL] hevc_nvenc open: bit_rate=… fps=… rc_buffer_size=… vbv_frames=… forced_idr=…` | once per nvenc encoder: what FFmpeg settled on after `avcodec_open2`. With `vbv_frames=0` `rc_buffer_size` is FFmpeg's own default VBV (expected 2 × `bit_rate`), with N > 0 the value set. `forced_idr=0` means FFmpeg refused `forced-idr`, or an earlier encoder of that name gave a forced IDR without the key flag in this process; the encoder then reports forced key frames as unsupported (refresh then restarts at once). |
 | `forced IDR verified: key frame of N bytes` | once per encoder: the first forced key frame came out key-flagged |
-| `forced IDR gave no key frame, forced keyframes off` | a forced key frame came out without the key flag: forced key frames are reported unsupported from then on |
+| `forced IDR gave no key frame, forced keyframes off` | a forced key frame came out without the key flag (`refresh_no_key` follows): forced key frames are reported unsupported for encoders of that name until the host process restarts, so this line comes at most once per process and name, and later refreshes restart at once (`refresh_unsupported`) |
 | `[FFMPEG] avg bitrate change: a -> b` / `[FFMPEG] vbv buffer size change: a -> b` | with `nvenc-vbv-frames` > 0, FFmpeg's own nvenc reconfigure lines for the first 8 such messages in the process: the proof that a bitrate change re-applies the VBV |
 | `static refine on` | the capture loop starts with static refine |
 | `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |

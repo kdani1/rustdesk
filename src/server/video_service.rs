@@ -1675,14 +1675,11 @@ fn refresh_keyframe_enabled() -> bool {
     Config::get_option(base::config::keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y"
 }
 
-// "Y" on, "N" off, otherwise on exactly with a VBV smaller than FFmpeg's default.
+// On exactly with a VBV smaller than FFmpeg's default: the two only go on together (roadmap
+// M14), and `enable-static-refine=N` turns both off (`nvenc_vbv_frames` is then 0).
 #[cfg(windows)]
 fn static_refine_enabled() -> bool {
-    match Config::get_option(base::config::keys::OPTION_ENABLE_STATIC_REFINE).as_str() {
-        "Y" => true,
-        "N" => false,
-        _ => scrap::codec::nvenc_vbv_frames() > 0,
-    }
+    scrap::codec::nvenc_vbv_frames() > 0
 }
 
 #[cfg(windows)]

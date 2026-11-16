@@ -227,13 +227,14 @@ pub const OPTION_ENABLE_REFRESH_KEYFRAME: &str = "enable-refresh-keyframe";
 // rc_buffer_size = N * bitrate / encoder frame rate, kept on every bitrate change. Empty or "0"
 // (default) keeps FFmpeg's default VBV; "1" is Sunshine's one-frame VBV, clamped to 60. Smaller
 // key and scene-change frames, less sharp until static refine (below) improves them. Read when an
-// encoder is created. See docs/LATENCY-METRICS.md.
+// encoder is created. Only together with static refine: enable-static-refine=N turns the VBV off
+// too. See docs/LATENCY-METRICS.md.
 pub const OPTION_NVENC_VBV_FRAMES: &str = "nvenc-vbv-frames";
 // Windows host, server option (Config): static refine. After a key frame or a large frame, when
 // the screen then stays unchanged for 150 ms, the last image is encoded again up to 3 times so a
-// small VBV does not leave text blurry. "Y" turns it on, "N" keeps it off; empty (default) means on
-// exactly when nvenc-vbv-frames > 0. Read when the capture loop starts. See
-// docs/LATENCY-METRICS.md.
+// small VBV does not leave text blurry. On exactly when nvenc-vbv-frames > 0 (roadmap M14: the two
+// only go on together); "N" turns both off, other values change nothing. Read when the capture
+// loop starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_STATIC_REFINE: &str = "enable-static-refine";
 // Viewer, local option: present pacing, "always show the newest frame". Every frame is still
 // decoded, but a stale one is not handed to the UI while a newer one waits; the soft renderer
