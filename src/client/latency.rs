@@ -99,6 +99,12 @@ impl Samples {
         self.0.clear();
     }
 
+    /// Adds another window's samples, up to the same cap.
+    pub fn append(&mut self, other: &Samples) {
+        let room = MAX_SAMPLES.saturating_sub(self.0.len());
+        self.0.extend(other.0.iter().take(room));
+    }
+
     pub fn summary(&self) -> Option<Summary> {
         if self.0.is_empty() {
             return None;

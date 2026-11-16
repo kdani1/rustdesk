@@ -76,3 +76,6 @@ pub mod virtual_display_manager;
 mod kcp_stream;
 // UDP video lane (M19 first half): staged, not wired into sessions yet. docs/UDP-VIDEO.md
 mod udp_video;
+// The host's session stream, whole or split into a reader and a writer task (roadmap M12).
+#[cfg(not(target_os = "ios"))]
+mod session_io;

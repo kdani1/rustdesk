@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -453,12 +453,51 @@ impl LatencyStats {
     }
 }
 
+/// Video frame writes of a split connection's writer task (`session_io`), for its `ConnStats`.
+#[derive(Default)]
+pub(super) struct SplitSends {
+    enabled: AtomicBool,
+    window: Mutex<SendWindow>,
+}
+
+#[derive(Default)]
+struct SendWindow {
+    send: Samples,
+    max: Duration,
+    slow: usize,
+    frames: usize,
+}
+
+impl SplitSends {
+    /// One video frame write by the writer task. With logging off: one atomic load.
+    pub(super) fn push(&self, send: Duration) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut w) = self.window.lock() {
+            w.send.push(send);
+            w.max = w.max.max(send);
+            w.frames += 1;
+            if send > SLOW_SEND {
+                w.slow += 1;
+            }
+        }
+    }
+}
+
 /// One connection's select loop (`Connection::start`): how long each branch body kept the loop
 /// from polling the others, the arrival gaps of the viewer's MouseEvents at the reader, and this
-/// connection's own video frame writes. One `LATENCY conn` line per 5 s.
+/// connection's own video frame writes. One `LATENCY conn` line per 5 s; with a TCP meter on the
+/// session socket (Windows, enable-tcp-meter) also one `LATENCY tcp` line.
 pub(super) struct ConnStats {
     id: i32,
     via: &'static str,
+    // Split session stream (enable-split-session-io): video writes and writer queue counters
+    // come from the writer task.
+    split_sends: Option<Arc<SplitSends>>,
+    writer: Option<Arc<crate::session_io::Shared>>,
+    #[cfg(windows)]
+    tcp: Option<Arc<crate::platform::windows_qos::HostSocket>>,
     enabled: bool,
     window_start: Instant,
     // The branch running now and when it started; only set while measuring.
@@ -483,6 +522,10 @@ impl ConnStats {
         Self {
             id,
             via,
+            split_sends: None,
+            writer: None,
+            #[cfg(windows)]
+            tcp: None,
             enabled: is_enabled(),
             window_start: Instant::now(),
             branch: None,
@@ -500,6 +543,24 @@ impl ConnStats {
             send_slow: 0,
             frames: 0,
         }
+    }
+
+    /// The session stream was split: video writes are now counted by the writer task.
+    pub(super) fn set_split(
+        &mut self,
+        sends: Arc<SplitSends>,
+        writer: Arc<crate::session_io::Shared>,
+    ) {
+        sends.enabled.store(self.enabled, Ordering::Relaxed);
+        self.split_sends = Some(sends);
+        self.writer = Some(writer);
+    }
+
+    /// The TCP meter of this connection's session socket.
+    #[cfg(windows)]
+    pub(super) fn set_tcp(&mut self, socket: Arc<crate::platform::windows_qos::HostSocket>) {
+        socket.set_active(self.enabled);
+        self.tcp = Some(socket);
     }
 
     /// A branch of the select loop starts its body. With logging off: one `bool` check.
@@ -568,9 +629,27 @@ impl ConnStats {
         if elapsed < REPORT_INTERVAL {
             return;
         }
+        if let Some(sends) = self.split_sends.as_ref() {
+            let w = sends
+                .window
+                .lock()
+                .map(|mut w| std::mem::take(&mut *w))
+                .unwrap_or_default();
+            self.send.append(&w.send);
+            self.send_max = self.send_max.max(w.max);
+            self.send_slow += w.slow;
+            self.frames += w.frames;
+        }
+        let writer = self.writer.as_ref().map(|w| w.take_window());
+        #[cfg(windows)]
+        if let Some(w) = self.tcp.as_ref().and_then(|t| t.take_window()) {
+            if self.enabled && log_it && (w.samples > 0 || w.app_bytes > 0) {
+                log_tcp(self.id, self.via, &w);
+            }
+        }
         if self.enabled && log_it && (self.frames > 0 || self.inputs > 0) {
             log::info!(
-                "LATENCY conn id={} via={} busy={} busy_max_in={} busy_slow={} in_gap={} in_slow={} in_n={} send={} send_slow={} frames={}",
+                "LATENCY conn id={} via={} busy={} busy_max_in={} busy_slow={} in_gap={} in_slow={} in_n={} send={} send_slow={} frames={} io={} ctrlq={} qmax_kb={} adrop={} bulk_n={}",
                 self.id,
                 self.via,
                 format_summary(with_max(self.busy.summary(), self.busy_max)),
@@ -586,6 +665,15 @@ impl ConnStats {
                 format_summary(with_max(self.send.summary(), self.send_max)),
                 self.send_slow,
                 self.frames,
+                if writer.is_some() { "split" } else { "whole" },
+                format_summary(
+                    writer
+                        .as_ref()
+                        .and_then(|w| with_max(w.ctrlq.summary(), w.ctrlq_max))
+                ),
+                writer.as_ref().map(|w| w.queued_max / 1024).unwrap_or(0),
+                writer.as_ref().map(|w| w.audio_dropped).unwrap_or(0),
+                writer.as_ref().map(|w| w.bulk_writes).unwrap_or(0),
             );
         }
         self.window_start = Instant::now();
@@ -602,11 +690,61 @@ impl ConnStats {
         self.send_slow = 0;
         self.frames = 0;
         self.enabled = is_enabled();
+        if let Some(sends) = self.split_sends.as_ref() {
+            sends.enabled.store(self.enabled, Ordering::Relaxed);
+        }
+        #[cfg(windows)]
+        if let Some(t) = self.tcp.as_ref() {
+            t.set_active(self.enabled);
+        }
         if !self.enabled {
             self.branch = None;
             self.last_input = None;
         }
     }
+}
+
+#[cfg(windows)]
+fn kb(bytes: i64) -> String {
+    format!("{:.0}", bytes as f64 / 1024.0)
+}
+
+/// `LATENCY tcp`: one metered session socket over one report window.
+#[cfg(windows)]
+fn log_tcp(id: i32, via: &str, w: &crate::platform::windows_qos::TcpWindow) {
+    let mut rtt = Samples::default();
+    for us in &w.rtt_us {
+        rtt.push(Duration::from_micros(*us as u64));
+    }
+    let lim = |i: usize| {
+        w.snd_lim_ms
+            .map(|l| l[i].to_string())
+            .unwrap_or_else(|| "n/a".to_owned())
+    };
+    log::info!(
+        "LATENCY tcp conn={} via={} ver={} n={} pend={} app_kb={} out_kb={} rtt={} minrtt={:.1} unsent_max_kb={} unsent_last_kb={} inflight_max_kb={} cwnd_kb={} sndwnd_kb={} retrans_kb={} fastre={} rto={} dupack={} lim_rwin_ms={} lim_cwnd_ms={} lim_snd_ms={}",
+        id,
+        via,
+        w.version,
+        w.samples,
+        w.pending,
+        kb(w.app_bytes as i64),
+        kb(w.out_bytes as i64),
+        format_summary(rtt.summary()),
+        w.min_rtt_us as f64 / 1000.0,
+        kb(w.unsent_max),
+        kb(w.unsent_last),
+        kb(w.in_flight_max as i64),
+        kb(w.cwnd_last as i64),
+        kb(w.snd_wnd_last as i64),
+        kb(w.retrans_bytes as i64),
+        w.fast_retrans,
+        w.timeouts,
+        w.dup_acks,
+        lim(0),
+        lim(1),
+        lim(2),
+    );
 }
 
 // The samples keep the first `MAX_SAMPLES` of a window; the max is tracked over all of them.

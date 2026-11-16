@@ -356,7 +356,8 @@ impl TerminalUserToken {
 pub struct Connection {
     inner: ConnInner,
     display_idx: usize,
-    stream: super::Stream,
+    // Whole, or split into a reader here and a writer task (enable-split-session-io).
+    stream: crate::session_io::SessionIo,
     server: super::ServerPtrWeak,
     hash: Hash,
     read_jobs: Vec<fs::TransferJob>,
@@ -465,6 +466,83 @@ pub struct Connection {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     terminal_user_token: Option<TerminalUserToken>,
     terminal_generic_service: Option<Box<GenericService>>,
+    // The reason `on_close` was first called with (the split session's sticky fallback).
+    close_reason: String,
+}
+
+/// The connection's part of a split session's video writes, run by the writer task.
+struct SplitHooks {
+    id: i32,
+    video_ack_required: bool,
+    sends: Arc<super::latency_stats::SplitSends>,
+}
+
+impl crate::session_io::WriterHooks for SplitHooks {
+    fn video_dequeued(&mut self, msg: &Message, queued_at: Instant) {
+        // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames.
+        if !self.video_ack_required {
+            if let Some(message::Union::VideoFrame(vf)) = &msg.union {
+                video_service::notify_video_frame_fetched(
+                    vf.display as usize,
+                    self.id,
+                    Some(queued_at.into()),
+                );
+            }
+        }
+    }
+
+    fn video_sent(&mut self, msg: &Message, send: Duration) {
+        super::latency_stats::on_video_send(msg, send);
+        self.sends.push(send);
+    }
+
+    fn writer_exited(&mut self) {
+        // The capture loop waits for this connection's fetch of every frame; it must not wait
+        // for a writer that is gone.
+        video_service::notify_video_frame_fetched_by_conn_id(self.id, None);
+    }
+}
+
+async fn recv_video(
+    rx: &mut Option<crate::session_io::VideoRx>,
+) -> Option<crate::session_io::VideoItem> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_writer(
+    writer: &mut Option<crate::session_io::WriterHandle>,
+) -> Result<Result<(), String>, tokio::task::JoinError> {
+    match writer {
+        Some(w) => w.await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_room(shared: &Option<Arc<crate::session_io::Shared>>) {
+    match shared {
+        Some(s) => s.room().await,
+        None => std::future::pending().await,
+    }
+}
+
+// Closes that the user or the connection manager asked for: not held against split. Empty:
+// `on_message` ended the session without `on_close` (the viewer picked another Windows
+// session); transport and writer failures always set a reason.
+fn is_user_close(reason: &str) -> bool {
+    matches!(
+        reason,
+        ""
+            | "Peer close"
+            | "switch sides"
+            | "connection manager"
+            | "connection manager window closed"
+            | "web console"
+            | "auto disconnect"
+            | "stop service"
+    )
 }
 
 impl ConnInner {
@@ -554,7 +632,9 @@ impl Connection {
         let tx_from_cm = tx_from_cm_holder.clone();
         let (tx_to_cm, rx_to_cm) = mpsc::unbounded_channel::<ipc::Data>();
         let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
-        let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
+        let (tx_video, rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
+        // Moves into the writer task when the session stream is split.
+        let mut rx_video = Some(rx_video);
         let (tx_input, _rx_input) = std_mpsc::channel();
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
         let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
@@ -576,7 +656,7 @@ impl Connection {
             // Defer display enumeration until login succeeds. Monitor login replaces this
             // with the primary index returned with the refreshed display snapshot.
             display_idx: 0,
-            stream,
+            stream: crate::session_io::SessionIo::new(stream),
             server,
             hash,
             read_jobs: Vec::new(),
@@ -665,6 +745,7 @@ impl Connection {
             terminal_generic_service: None,
             conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
             conn_audit_two_factor: ConnAuditTwoFactor::None,
+            close_reason: String::new(),
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -716,6 +797,41 @@ impl Connection {
         std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
         let mut conn_stats = super::latency_stats::ConnStats::new(id, transport.label());
+        // The session socket handle (TCP meter, SO_SNDBUF), when an accepted path made one.
+        #[cfg(windows)]
+        let host_socket = {
+            let taken = crate::platform::windows_qos::take_host_socket(addr);
+            if crate::platform::windows_qos::socket_options_on() {
+                match &taken {
+                    Ok(s) => log::info!(
+                        "TCPMETER host conn={} meter={} ver={} lan={}",
+                        id,
+                        if s.is_metered() { "yes" } else { "no" },
+                        s.version()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "-".to_owned()),
+                        s.is_lan()
+                    ),
+                    Err(why) => log::info!(
+                        "TCPMETER host conn={} meter=no why={} via={}",
+                        id,
+                        why,
+                        transport.label()
+                    ),
+                }
+            }
+            taken.ok()
+        };
+        #[cfg(windows)]
+        if let Some(s) = host_socket.as_ref().filter(|s| s.is_metered()) {
+            conn_stats.set_tcp(s.clone());
+        }
+        // Split session stream: the writer task, what the loop shares with it, and whether it
+        // failed in a way that always counts against split (panic, hang).
+        let mut writer: Option<crate::session_io::WriterHandle> = None;
+        let mut writer_shared: Option<Arc<crate::session_io::Shared>> = None;
+        let mut split_failure = false;
+        let mut post_auth_done = false;
 
         #[cfg(feature = "unix-file-copy-paste")]
         let rx_clip_holder;
@@ -742,6 +858,44 @@ impl Connection {
         loop {
             // Ends the busy time of the branch that ran last (also after its `continue`).
             conn_stats.end();
+            // Once, when the connection has just been authorized: the per-session socket
+            // settings and the split, for remote control and camera view only.
+            if !post_auth_done && conn.authorized {
+                post_auth_done = true;
+                if conn.is_authed_remote_conn() || conn.is_authed_view_camera_conn() {
+                    #[cfg(windows)]
+                    Self::apply_video_sndbuf(id, host_socket.as_ref());
+                    if conn.port_forward_socket.is_none() && crate::session_io::split_allowed() {
+                        if let Some(video) = rx_video.take() {
+                            let sends = Arc::new(super::latency_stats::SplitSends::default());
+                            let hooks = Box::new(SplitHooks {
+                                id,
+                                video_ack_required: conn.video_ack_required,
+                                sends: sends.clone(),
+                            });
+                            match conn.stream.split(video, hooks) {
+                                Ok(handle) => {
+                                    writer = Some(handle);
+                                    writer_shared = conn.stream.shared();
+                                    if let Some(shared) = writer_shared.clone() {
+                                        conn_stats.set_split(sends, shared);
+                                    }
+                                    log::info!(
+                                        "SPLIT host conn={} via={} carried={}",
+                                        id,
+                                        transport.label(),
+                                        conn.stream.carried_frames()
+                                    );
+                                }
+                                Err((video, why)) => {
+                                    rx_video = Some(video);
+                                    log::info!("SPLIT host conn={} stays whole: {}", id, why);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
 
@@ -756,6 +910,26 @@ impl Connection {
                     conn.on_close("Timeout", true).await;
                     break;
                 }
+                // Split: the writer ended (write error, send timeout, panic). It never ends on
+                // its own otherwise, so the session ends with it.
+                res = wait_writer(&mut writer), if writer.is_some() => {
+                    conn_stats.begin("writer");
+                    writer = None;
+                    let why = match res {
+                        Ok(Ok(())) => "ended".to_owned(),
+                        Ok(Err(e)) => e,
+                        Err(e) => {
+                            split_failure |= e.is_panic();
+                            e.to_string()
+                        }
+                    };
+                    conn.on_close(&why, false).await;
+                    break;
+                }
+                // Split: reading or file reads are paused until the writer drains its queues.
+                _ = wait_room(&writer_shared), if conn.stream.is_split()
+                    && (!conn.stream.read_allowed()
+                        || (!conn.stream.bulk_has_room() && !conn.read_jobs.is_empty())) => {}
                 Some(data) = rx_from_cm.recv() => {
                     conn_stats.begin("cm");
                     match data {
@@ -921,6 +1095,7 @@ impl Connection {
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
+                            // Bulk when split.
                             allow_err!(conn.stream.send_raw(bytes).await);
                         }
                         #[cfg(target_os = "windows")]
@@ -946,7 +1121,7 @@ impl Connection {
                                     );
                                 }
                                 _ => {
-                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                    allow_err!(conn.stream.send_bulk(&clip_2_msg(clip)).await);
                                 }
                             }
                         }
@@ -1031,7 +1206,7 @@ impl Connection {
                         _ => {}
                     }
                 },
-                res = conn.stream.next() => {
+                res = conn.stream.next(), if conn.stream.read_allowed() => {
                     conn_stats.begin("read");
                     if let Some(res) = res {
                         match res {
@@ -1062,11 +1237,11 @@ impl Connection {
                         break;
                     }
                 },
-                _ = conn.file_timer.tick() => {
+                _ = conn.file_timer.tick(), if conn.stream.bulk_has_room() => {
                     conn_stats.begin("file");
                     if !conn.read_jobs.is_empty() {
                         conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));
-                        match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {
+                        match conn.handle_read_jobs().await {
                             Ok(log) => {
                                 if !log.is_empty() {
                                     conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), log)));
@@ -1089,7 +1264,7 @@ impl Connection {
                         break;
                     }
                 }
-                Some((instant, value)) = rx_video.recv() => {
+                Some((instant, value)) = recv_video(&mut rx_video) => {
                     conn_stats.begin("video");
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
@@ -1161,8 +1336,8 @@ impl Connection {
                         _ => {}
                     }
 
-                    let msg: &Message = &msg;
-                    if let Err(err) = conn.stream.send(msg).await {
+                    // Split: queued for the writer, which drops audio older than 1 s by `instant`.
+                    if let Err(err) = conn.stream.send_shared(instant, msg).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
@@ -1183,6 +1358,12 @@ impl Connection {
                 }
                 _ = second_timer.tick() => {
                     conn_stats.begin("second");
+                    if let Some(idle) = conn.stream.writer_stalled() {
+                        log::error!("SPLIT host conn={} writer made no progress for {:?}", id, idle);
+                        split_failure = true;
+                        conn.on_close("Session writer hung", false).await;
+                        break;
+                    }
                     conn_stats.tick(conn.authorized);
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
@@ -1240,6 +1421,27 @@ impl Connection {
                     }
                 },
             }
+        }
+
+        // Split: the writer writes what control holds (a close reason) and ends; then the
+        // sticky fallback learns how the split session went.
+        if let Some(end) = conn
+            .stream
+            .finish(writer.take(), crate::session_io::FINISH_TIMEOUT)
+            .await
+        {
+            let user_close = is_user_close(&conn.close_reason);
+            let failure = split_failure || end.panicked;
+            let counted = crate::session_io::on_split_end(end.lived, user_close, failure);
+            log::info!(
+                "SPLIT host conn={} ended lived={:.1}s reason={} failure={} aborted={} counted={}",
+                id,
+                end.lived.as_secs_f64(),
+                conn.close_reason,
+                failure,
+                end.aborted,
+                counted
+            );
         }
 
         #[cfg(feature = "unix-file-copy-paste")]
@@ -1829,7 +2031,10 @@ impl Connection {
             return true;
         };
         if pf.multiplex {
-            crate::port_forward_mux::cap_packet_size(&mut self.stream);
+            // A port-forward session is never split.
+            if let Some(stream) = self.stream.as_whole_mut() {
+                crate::port_forward_mux::cap_packet_size(stream);
+            }
             // `inner.tx` is set for the connection's whole life; `None` here is
             // unreachable, and refusing the login is the only honest answer.
             self.port_forward_mux = self.inner.tx.clone().map(|tx| {
@@ -5355,6 +5560,7 @@ impl Connection {
             return;
         }
         self.closed = true;
+        self.close_reason = reason.to_owned();
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -5400,6 +5606,10 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(msg_out).await;
+        // Split: on the wire before `on_close` (which may lock the screen), as it was inline:
+        // bounded by the send timeout, not cut short behind a slow frame write.
+        let flush_timeout = self.stream.close_flush_timeout();
+        self.stream.flush(flush_timeout).await;
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
     }
 
@@ -5685,7 +5895,116 @@ impl Connection {
 
     #[inline]
     async fn send(&mut self, msg: Message) {
-        allow_err!(self.stream.send(&msg).await);
+        allow_err!(self.stream.send_msg(msg).await);
+    }
+
+    /// File read jobs: `fs::handle_read_jobs` on the whole stream; split, the same steps with
+    /// every message queued as bulk (the read job's own order is kept).
+    async fn handle_read_jobs(&mut self) -> ResultType<String> {
+        if let Some(stream) = self.stream.as_whole_mut() {
+            return fs::handle_read_jobs(&mut self.read_jobs, stream).await;
+        }
+        // fs::init_jobs, with the digest queued instead of sent.
+        for job in self.read_jobs.iter_mut() {
+            if job.is_last_job {
+                continue;
+            }
+            match job.init_data_stream_for_cm().await {
+                Ok(Some((last_modified, file_size))) => {
+                    let mut resp = FileResponse::new();
+                    resp.set_digest(FileTransferDigest {
+                        id: job.id,
+                        file_num: job.file_num,
+                        last_modified,
+                        file_size,
+                        is_resume: job.is_resume,
+                        ..Default::default()
+                    });
+                    let mut msg = Message::new();
+                    msg.set_file_response(resp);
+                    log::info!(
+                        "id: {}, file_num: {}, digest message is queued. waiting for confirm.",
+                        job.id,
+                        job.file_num
+                    );
+                    self.stream.send_bulk(&msg).await?;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.stream
+                        .send_bulk(&fs::new_error(job.id(), err, job.file_num()))
+                        .await?;
+                }
+            }
+        }
+        // fs::handle_read_jobs, one block of the first unfinished job.
+        let mut job_log = Default::default();
+        let mut finished = Vec::new();
+        for job in self.read_jobs.iter_mut() {
+            if job.is_last_job {
+                continue;
+            }
+            match job.read().await {
+                Err(err) => {
+                    self.stream
+                        .send_bulk(&fs::new_error(job.id(), err, job.file_num()))
+                        .await?;
+                }
+                Ok(Some(block)) => {
+                    self.stream.send_bulk(&fs::new_block(block)).await?;
+                }
+                Ok(None) => {
+                    if job.job_completed() {
+                        job_log = fs::serialize_transfer_job(job, true, false, "");
+                        finished.push(job.id());
+                        match job.job_error() {
+                            Some(err) => {
+                                job_log = fs::serialize_transfer_job(job, false, false, &err);
+                                self.stream
+                                    .send_bulk(&fs::new_error(job.id(), err, job.file_num()))
+                                    .await?
+                            }
+                            None => {
+                                self.stream
+                                    .send_bulk(&fs::new_done(job.id(), job.file_num()))
+                                    .await?
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        for id in finished {
+            let _ = fs::remove_job(id, &mut self.read_jobs);
+        }
+        Ok(job_log)
+    }
+
+    /// video-sndbuf-kb: SO_SNDBUF of a LAN peer's remote-control or camera session, once it is
+    /// authorized. Nothing when the option is empty.
+    #[cfg(windows)]
+    fn apply_video_sndbuf(
+        id: i32,
+        socket: Option<&Arc<crate::platform::windows_qos::HostSocket>>,
+    ) {
+        let Some(bytes) = crate::platform::windows_qos::video_sndbuf_bytes() else {
+            return;
+        };
+        match socket {
+            Some(s) if s.is_lan() => match s.set_sndbuf(bytes) {
+                Ok((before, after)) => log::info!(
+                    "TCPMETER host conn={} sndbuf_kb={} was_kb={} now_kb={}",
+                    id,
+                    bytes / 1024,
+                    before / 1024,
+                    after / 1024
+                ),
+                Err(e) => log::warn!("TCPMETER host conn={} sndbuf failed: {}", id, e),
+            },
+            Some(_) => {}
+            None => log::info!("TCPMETER host conn={} sndbuf: no socket handle", id),
+        }
     }
 
     pub fn alive_conns() -> Vec<i32> {
@@ -6272,7 +6591,7 @@ impl Connection {
                 // Maybe we should end the connection, because copy&paste files causes everything to wait.
                 allow_err!(
                     self.stream
-                        .send(&crate::clipboard_file::clip_2_msg(clip))
+                        .send_bulk(&crate::clipboard_file::clip_2_msg(clip))
                         .await
                 );
             }

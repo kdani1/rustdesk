@@ -283,6 +283,29 @@ pub const OPTION_ENABLE_VIEWER_MMCSS: &str = "enable-viewer-mmcss";
 // Default adaptive on Windows; elsewhere empty means "0" (set a number to turn it on). Read when
 // the audio format of a session starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_AUDIO_TARGET_MS: &str = "audio-target-ms";
+// Windows host, server option, off by default: TCP meter on the host's session socket. "Y" for
+// LAN peers, "all" for every peer, on the paths that accept the session socket themselves
+// (intranet, direct access, accepted TCP punch; not relay, dialed punch, KCP or WebRTC). A
+// pass-through stream wrapper counts the bytes the session wrote and samples SIO_TCP_INFO;
+// with enable-latency-log=Y it logs one `LATENCY tcp` line per connection every 5 s. Any
+// error turns the sampling off, never the connection. Applies from the next connection. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_TCP_METER: &str = "enable-tcp-meter";
+// Windows host, server option, empty by default (the socket keeps Windows' dynamic send
+// buffering): a number of KB sets SO_SNDBUF of the session socket once a LAN peer has logged in
+// to remote control or camera view (never for file transfer, terminal or port forward).
+// Accepted paths only, as for enable-tcp-meter. An experiment (A/B 256 and 512); applies from
+// the next connection. See docs/LATENCY-METRICS.md.
+pub const OPTION_VIDEO_SNDBUF_KB: &str = "video-sndbuf-kb";
+// Windows host, server option, off by default: "Y" splits an authorized remote-control or
+// camera session over TCP or KCP into a read half that stays in the connection loop and one
+// writer task that writes control, video and bulk messages (src/session_io.rs), so input is read
+// while a video write waits on the socket. Wire bytes, encryption and per-source order are
+// unchanged. WebSocket and WebRTC sessions stay whole. Two split sessions ending early (under 60
+// s, not closed by the user or the CM) turn it off until the service restarts. Applies from the
+// next connection; `rustdesk --option enable-split-session-io N` from a terminal session (never
+// split) turns it off. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
