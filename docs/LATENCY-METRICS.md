@@ -12,7 +12,7 @@ Code:
 
 | Side | File | Hooks |
 |---|---|---|
-| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` |
+| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()`, `src/server/connection.rs` `rx_video` (video frame write) |
 | Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer), `src/client.rs` `start_video_thread`, `src/flutter.rs` (soft-render handoff and drop, `next_rgba`, quality status) |
 | Flutter | `flutter/lib/models/model.dart` (`ImageModel.onRgba`, `_PaintLatencyStats`, `QualityMonitorModel`) | `flutter/lib/common/widgets/overlay.dart` (`QualityMonitor`) |
 
@@ -32,7 +32,8 @@ The option is compared with `"Y"` directly: `option2bool()` would treat any
 
 When logging is off the hooks still run, but return after one atomic load
 (viewer: the number of measured streams, so the shared lock is not taken) or
-one `bool` check (host). The Flutter side checks the overlay flag and re-reads
+one `bool` check (host capture loop; the connection's video-write hook is two
+clock reads around the write plus one atomic load). The Flutter side checks the overlay flag and re-reads
 the option at most every 5 s.
 
 ## Report format
@@ -44,7 +45,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… sleep=… sent=149 skipped=0 idle=12
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0
 ```
 
 | Field | Meaning |
@@ -53,7 +54,9 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… sleep=�
 | `spf` | current frame period from QoS (1000 / target fps) |
 | `grab` | capturer call until it returned the image. **Includes the wait for the desktop to change**: DXGI `AcquireNextFrame` blocks up to `spf`. A large `grab` p50 on an active screen means the capture is waiting, not slow. The once-per-second display check, which runs after the frame's `pts` is taken and before the capturer call, is not in `grab` (it is in the viewer's `net+server(est)`). |
 | `encode` | after grab until the encoded frame was put on every connection's queue: BGRA→YUV conversion (RAM path), encode, protobuf, `send_video_frame` |
-| `wait` | after that until every connection had **taken the frame off its queue to start sending** ("fetched", `connection.rs` `rx_video`). It is the time the frame waits behind the previous frame's socket write. It is not the time until the peer received it: bytes can still sit in the kernel send buffer. |
+| `wait` | after that until every connection had **taken the frame off its queue to start sending** ("fetched", `connection.rs` `rx_video`). It is the time the frame waits behind the previous frame's socket write. It is not the time until the peer received it: bytes can still sit in the kernel send buffer. The previous frame's write overlaps this frame's sleep, grab and encode, so only the part of `send` that outlasts them (about one `spf`) shows up here; the rest of `wait` is the connection's select loop busy elsewhere (input, audio, file transfer), or, for a web client, the viewer's late ack. |
+| `send` | one connection's `stream.send` of one video frame. Over TCP: protobuf serialization, encryption and the write into the socket, including any wait for send-buffer space (backpressure). Over WebRTC it is the data-channel queueing, over a relay the write to hbbr. One sample per connection per frame, all connections of the display merged. Not the time until the peer received the frame. A capture-loop restart (`SWITCH`) drops that display's partial window. A camera and a monitor with the same index share one `send` store, so either line can hold the other's writes and only part of its window. |
+| `send_slow` | how many of those writes took more than a fixed 16 ms (counted even beyond the 1024-sample cap) |
 | `sleep` | the rest of the frame period the loop sleeps after `wait` (only iterations that slept) |
 | `sent` / `skipped` | captured frames that were / were not handed to a connection (encoder produced nothing, e.g. libvpx frame dropping, or no subscriber) |
 | `idle` | iterations where the capturer had no new image within `spf` (static screen) |
@@ -226,8 +229,10 @@ Things to look for:
 
 - `queue` p95 or `queue_len` growing: the decoder is slower than the frame rate
   (watch `decode`), or a burst arrived after a network stall.
-- `wait` on the host growing: the socket write is the bottleneck (bitrate vs
-  link, or TCP/KCP retransmits).
+- `wait` spikes on the host with `send` max above `spf` at the same time: the
+  socket write is the bottleneck (bitrate vs link, Wi-Fi or TCP/KCP
+  retransmits). `wait` spikes with `send` max well below `spf`: the connection
+  loop was busy with other work, or a web client's ack was late.
 - `ui_dropped` > 0: Flutter takes frames slower than the decoder delivers;
   `ui_take` and `paint` tell by how much. A large `ui_take − image` means the
   frame waited for a busy UI isolate before Dart even started on it.

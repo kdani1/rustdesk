@@ -2,9 +2,52 @@
 //! What each number means: docs/LATENCY-METRICS.md.
 
 use crate::client::latency::{format_summary, Samples, REPORT_INTERVAL};
-use base::config::keys;
+use base::{
+    config::keys,
+    message_proto::{message, Message},
+};
 use hbb_common::{config::Config, log};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
+
+// A video frame write longer than this is counted in `send_slow` (fixed, not the frame period).
+const SLOW_SEND: Duration = Duration::from_millis(16);
+
+// Video frame writes of the connections (connection.rs `rx_video`), per display, until that
+// display's capture loop reports. Mirrors `LatencyStats::enabled`, so with logging off the
+// per-frame cost is two clock reads (at the call site) plus one atomic load.
+static SEND_ENABLED: AtomicBool = AtomicBool::new(false);
+lazy_static::lazy_static! {
+    static ref SENDS: Mutex<HashMap<usize, Sends>> = Default::default();
+}
+
+#[derive(Default)]
+struct Sends {
+    samples: Samples,
+    slow: usize,
+}
+
+/// `stream.send` of one video frame on one connection. On TCP: protobuf serialization,
+/// encryption and the write into the socket, including the wait for send-buffer space.
+pub(super) fn on_video_send(msg: &Message, send: Duration) {
+    if !SEND_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(message::Union::VideoFrame(vf)) = &msg.union {
+        let mut sends = SENDS.lock().unwrap();
+        let s = sends.entry(vf.display as usize).or_default();
+        s.samples.push(send);
+        if send > SLOW_SEND {
+            s.slow += 1;
+        }
+    }
+}
 
 pub(super) struct LatencyStats {
     display: usize,
@@ -21,9 +64,12 @@ pub(super) struct LatencyStats {
 
 impl LatencyStats {
     pub(super) fn new(display: usize) -> Self {
+        let enabled = is_enabled();
+        SEND_ENABLED.store(enabled, Ordering::Relaxed);
+        SENDS.lock().unwrap().remove(&display);
         Self {
             display,
-            enabled: is_enabled(),
+            enabled,
             window_start: Instant::now(),
             sent: 0,
             skipped: 0,
@@ -75,19 +121,23 @@ impl LatencyStats {
         if elapsed < REPORT_INTERVAL {
             return;
         }
+        // Drained every window, whatever is logged, so the store stays bounded.
+        let sends = SENDS.lock().unwrap().remove(&self.display).unwrap_or_default();
         if self.enabled && self.sent + self.skipped + self.idle > 0 {
             log::info!(
-                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} sleep={} sent={} skipped={} idle={}",
+                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={}",
                 self.display,
                 self.sent as f64 / elapsed.as_secs_f64(),
                 spf.as_millis(),
                 format_summary(self.grab.summary()),
                 format_summary(self.encode.summary()),
                 format_summary(self.wait.summary()),
+                format_summary(sends.samples.summary()),
                 format_summary(self.sleep.summary()),
                 self.sent,
                 self.skipped,
                 self.idle,
+                sends.slow,
             );
         }
         self.window_start = Instant::now();
@@ -99,6 +149,7 @@ impl LatencyStats {
         self.wait.clear();
         self.sleep.clear();
         self.enabled = is_enabled();
+        SEND_ENABLED.store(self.enabled, Ordering::Relaxed);
     }
 }
 

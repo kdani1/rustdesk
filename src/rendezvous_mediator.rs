@@ -1388,10 +1388,15 @@ async fn direct_server(server: ServerPtr) {
                     .unwrap_or(Config::get_any_listen_addr(true));
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let Some(stream) =
+                        crate::common::host_session_stream(stream, local_addr, addr).await
+                    else {
+                        return;
+                    };
                     allow_err!(
                         crate::server::create_tcp_connection(
                             server,
-                            hbb_common::Stream::from(stream, local_addr),
+                            stream,
                             addr,
                             false,
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
@@ -1682,7 +1687,10 @@ async fn accept_punched_connection(
     stream.set_nodelay(true).ok();
     match stream.local_addr() {
         Ok(stream_addr) => {
-            let stream = Stream::from(stream, stream_addr);
+            let Some(stream) = crate::common::host_session_stream(stream, stream_addr, addr).await
+            else {
+                return;
+            };
             if let Err(err) = create_tcp_connection(server, stream, addr, true, meta).await {
                 log::warn!("Failed to serve the connection from {addr}: {err}");
             }

@@ -14,6 +14,12 @@ pub mod win_device;
 #[cfg(windows)]
 pub mod windows_raw_mouse;
 
+#[cfg(windows)]
+pub mod windows_wlan;
+
+#[cfg(windows)]
+pub mod windows_qos;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 

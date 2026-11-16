@@ -193,6 +193,15 @@ pub const OPTION_ENABLE_AUTO_GAME_MODE: &str = "enable-auto-game-mode";
 // priority (on by default: ABOVE_NORMAL process, MMCSS "Capture" for a hardware-encoder video
 // thread). A change applies from the next capture restart.
 pub const OPTION_ENABLE_HOST_PRIORITY_BOOST: &str = "enable-host-priority-boost";
+// Windows, on by default: "N" leaves the Wi-Fi driver out of media streaming mode (fewer background
+// scans and power-save stalls). Server option on the host (while video streams), local option on
+// the viewer (while a remote session is open).
+pub const OPTION_ENABLE_WLAN_STREAMING_MODE: &str = "enable-wlan-streaming-mode";
+// Windows host, server option, LAN peers only: "N" leaves the host's session TCP socket unmarked (on
+// by default: qWAVE AudioVideo, DSCP 40 / WMM video on Wi-Fi). The socket is marked at accept time,
+// before login, so file-transfer, port-forward and terminal connections from LAN peers are marked
+// too (known limit). Applies from the next connection.
+pub const OPTION_ENABLE_LAN_QOS: &str = "enable-lan-qos";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";

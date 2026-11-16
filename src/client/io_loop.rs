@@ -186,6 +186,10 @@ impl<T: InvokeUiSession> Remote<T> {
             }
         };
 
+        // Wi-Fi media streaming mode for this session round (released when io_loop returns).
+        #[cfg(target_os = "windows")]
+        let _wlan_hold = (self.handler.is_default() || self.handler.is_view_camera())
+            .then(|| crate::platform::windows_wlan::hold(crate::platform::windows_wlan::Side::Viewer));
         let mut received = false;
         let conn_type = if self.handler.is_file_transfer() {
             ConnType::FILE_TRANSFER

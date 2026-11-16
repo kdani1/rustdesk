@@ -197,14 +197,9 @@ async fn accept_connection_(
         drop(slot);
         stream.set_nodelay(true).ok();
         let stream_addr = stream.local_addr()?;
-        create_tcp_connection(
-            server,
-            Stream::from(stream, stream_addr),
-            addr,
-            secure,
-            meta,
-        )
-        .await?;
+        if let Some(stream) = crate::common::host_session_stream(stream, stream_addr, addr).await {
+            create_tcp_connection(server, stream, addr, secure, meta).await?;
+        }
     }
     Ok(())
 }

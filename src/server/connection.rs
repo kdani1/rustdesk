@@ -1086,10 +1086,12 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    let send_begin = Instant::now();
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
+                    super::latency_stats::on_video_send(&value, send_begin.elapsed());
                 },
                 Some((instant, value)) = rx.recv() => {
                     let latency = instant.elapsed().as_millis() as i64;
@@ -6953,6 +6955,8 @@ mod raii {
                     .lock()
                     .unwrap()
                     .on_connection_open(conn_id);
+                #[cfg(windows)]
+                crate::platform::windows_wlan::acquire(crate::platform::windows_wlan::Side::Host);
             }
             Self(conn_id, conn_type)
         }
@@ -7075,6 +7079,8 @@ mod raii {
                     .lock()
                     .unwrap()
                     .on_connection_close(self.0);
+                #[cfg(windows)]
+                crate::platform::windows_wlan::release(crate::platform::windows_wlan::Side::Host);
             }
             // Clear per-connection state to avoid stale behavior if conn ids are reused.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

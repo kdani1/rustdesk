@@ -2220,6 +2220,22 @@ pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
     secure_tcp_impl(conn, key, true).await
 }
 
+/// The host's TCP session stream for an accepted peer (on Windows qWAVE-marked for LAN peers,
+/// option enable-lan-qos). None only if the stream was lost while marking it.
+pub async fn host_session_stream(
+    stream: tokio::net::TcpStream,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> Option<Stream> {
+    #[cfg(windows)]
+    return crate::platform::windows_qos::host_stream(stream, local, peer).await;
+    #[cfg(not(windows))]
+    {
+        let _ = peer;
+        Some(Stream::from(stream, local))
+    }
+}
+
 async fn secure_tcp_silent(conn: &mut Stream, key: &str) -> ResultType<()> {
     secure_tcp_impl(conn, key, false).await
 }
