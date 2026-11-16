@@ -132,6 +132,13 @@ pub const OPTION_ENABLE_IPV6_PUNCH: &str = "enable-ipv6-punch";
 pub const OPTION_ENABLE_PORT_FORWARD_MUX: &str = "enable-port-forward-mux";
 pub const OPTION_ENABLE_WEBRTC: &str = "enable-webrtc";
 pub const OPTION_RELAY_FALLBACK_DELAY: &str = "relay-fallback-delay";
+/// Viewer (M8 2a): hold a relay result back for `relay-fallback-delay` while a direct attempt is
+/// still racing, also when no WebRTC offer is in the race. On by default; "N" restores the plain
+/// first-result-wins race.
+pub const OPTION_ENABLE_RELAY_HOLD: &str = "enable-relay-hold";
+/// Viewer (M8 2b): "udp" or "tcp" holds a direct result of the other kind for 300 ms while the
+/// preferred kind is still racing. Empty (default) keeps the first-direct-wins race.
+pub const OPTION_DIRECT_TRANSPORT_PREFERENCE: &str = "direct-transport-preference";
 pub const OPTION_ALLOW_KCP_CC: &str = "allow-kcp-congestion-control";
 pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
 pub const OPTION_HIDE_HELP_CARDS: &str = "hide-help-cards";
@@ -333,6 +340,8 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_PORT_FORWARD_MUX,
     OPTION_ENABLE_WEBRTC,
     OPTION_RELAY_FALLBACK_DELAY,
+    OPTION_ENABLE_RELAY_HOLD,
+    OPTION_DIRECT_TRANSPORT_PREFERENCE,
     OPTION_TOUCH_MODE,
     OPTION_SHOW_VIRTUAL_MOUSE,
     OPTION_SHOW_VIRTUAL_JOYSTICK,
