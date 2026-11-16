@@ -27,6 +27,7 @@ Fork-only API that RustDesk uses:
 | API | Used in |
 |---|---|
 | `hwcodec::ffmpeg::set_nvenc_vbv_frames(frames: i32)` | `libs/scrap/src/common/hwcodec.rs`, `vram.rs` (M14 VBV) |
+| `hwcodec::ffmpeg::set_encode_gpu_thread_priority(priority: i32)` (C: `hwcodec_set_encode_gpu_thread_priority`) | `libs/scrap/src/common/hwcodec.rs` `set_encode_gpu_thread_priority`, called from `src/platform/windows_gpu_priority.rs` (M17 GPU priority: `SetGPUThreadPriority` on D3D11 devices encoders create themselves) |
 | `hwcodec::ffmpeg_ram::encode::Encoder::request_keyframe(&mut self) -> Result<(), ()>` | `libs/scrap/src/common/hwcodec.rs` (M13) |
 | `hwcodec::ffmpeg_ram::encode::Encoder::set_framerate(&mut self, framerate: i32) -> Result<(), ()>` (C: `ffmpeg_ram_set_framerate`) | `libs/scrap/src/common/hwcodec.rs` (M7 virtual framerate) |
 | `hwcodec::vram::encode::Encoder::request_keyframe(&mut self) -> Result<(), i32>` | `libs/scrap/src/common/vram.rs` (M13) |

@@ -799,3 +799,11 @@ pub fn start_check_process() {
         std::thread::spawn(f);
     });
 }
+
+/// GPU thread priority (-7..7; 0 leaves it) for the D3D11 devices hwcodec encoders opened from
+/// now on create themselves (FFmpeg's D3D11VA upload device of a RAM nvenc encoder); the
+/// capturer's device that VRAM encoders share is set by the capture side (roadmap M17). Fork-only
+/// hwcodec API. Windows only in effect.
+pub fn set_encode_gpu_thread_priority(priority: i32) {
+    hwcodec::ffmpeg::set_encode_gpu_thread_priority(priority);
+}

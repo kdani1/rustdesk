@@ -1,14 +1,19 @@
 diff --git a/cpp/common/ffmpeg_ffi.h b/cpp/common/ffmpeg_ffi.h
-index 505c6fa..c9ee74c 100644
+index 505c6fa..c25a598 100644
 --- a/cpp/common/ffmpeg_ffi.h
 +++ b/cpp/common/ffmpeg_ffi.h
-@@ -20,5 +20,8 @@ int av_log_get_level(void);
+@@ -20,5 +20,13 @@ int av_log_get_level(void);
  void av_log_set_level(int level);
  void hwcodec_set_av_log_callback();
  void hwcodec_set_flag_could_not_find_ref_with_poc();
 +// VBV size in frames for nvenc encoders opened from now on: rc_buffer_size = frames * bitrate /
 +// framerate, kept on every bitrate change. 0 (default) keeps FFmpeg's default VBV.
 +void hwcodec_set_nvenc_vbv_frames(int frames);
++// GPU thread priority (-7..7, clamped; 0 = leave, the default) that encoders apply with
++// IDXGIDevice::SetGPUThreadPriority to D3D11 devices they open themselves from now on: FFmpeg's
++// own D3D11VA device of a RAM nvenc encoder, a NativeDevice created from the LUID. A capturer's
++// device passed in is not touched. Windows only; a stored no-op elsewhere.
++void hwcodec_set_encode_gpu_thread_priority(int priority);
  
  #endif
 \ No newline at end of file
@@ -59,10 +64,46 @@ index fc72b30..3211ef1 100644
  
  #define LOG_ERROR(message)                                                     \
 diff --git a/cpp/common/platform/win/win.cpp b/cpp/common/platform/win/win.cpp
-index 2004166..f1477e7 100644
+index 2004166..9895503 100644
 --- a/cpp/common/platform/win/win.cpp
 +++ b/cpp/common/platform/win/win.cpp
-@@ -379,9 +379,19 @@ void NativeDevice::BeginQuery() { context_->Begin(query_.Get()); }
+@@ -23,6 +23,27 @@ typedef struct _VERTEX {
+   DirectX::XMFLOAT2 TexCoord;
+ } VERTEX;
+ 
++void ApplyGpuThreadPriority(ID3D11Device *device, int priority, const char *who) {
++  if (!device || priority == 0) {
++    return;
++  }
++  ComPtr<IDXGIDevice> dxgiDevice = nullptr;
++  HRESULT hr = device->QueryInterface(IID_PPV_ARGS(dxgiDevice.ReleaseAndGetAddressOf()));
++  if (SUCCEEDED(hr)) {
++    hr = dxgiDevice->SetGPUThreadPriority(priority);
++  }
++  char buf[160];
++  snprintf(buf, sizeof(buf), "gpu_priority encoder=%s thread=%d hr=0x%08lx",
++           who ? who : "?", priority, (unsigned long)hr);
++  LOG_INFO(std::string(buf));
++}
++
++void NativeDevice::ApplyEncodeGpuPriority(int priority, const char *who) {
++  if (owns_device_) {
++    ApplyGpuThreadPriority(device_.Get(), priority, who);
++  }
++}
++
+ bool NativeDevice::Init(int64_t luid, ID3D11Device *device, int pool_size) {
+   if (device) {
+     if (!InitFromDevice(device))
+@@ -86,6 +107,7 @@ bool NativeDevice::InitFromLuid(int64_t luid) {
+     LOG_ERROR(std::string("Direct3D Feature Level 11 unsupported."));
+     return false;
+   }
++  owns_device_ = true;
+   return true;
+ }
+ 
+@@ -379,9 +401,19 @@ void NativeDevice::BeginQuery() { context_->Begin(query_.Get()); }
  
  void NativeDevice::EndQuery() { context_->End(query_.Get()); }
  
@@ -83,7 +124,7 @@ index 2004166..f1477e7 100644
    while (!bResult) {
      HRESULT hr = context_->GetData(query_.Get(), &bResult, sizeof(BOOL), 0);
      if (SUCCEEDED(hr)) {
-@@ -389,11 +399,17 @@ bool NativeDevice::Query() {
+@@ -389,11 +421,17 @@ bool NativeDevice::Query() {
          break;
        }
      }
@@ -105,8 +146,42 @@ index 2004166..f1477e7 100644
    }
    return bResult == TRUE;
  }
+diff --git a/cpp/common/platform/win/win.h b/cpp/common/platform/win/win.h
+index 937bc95..851b3c4 100644
+--- a/cpp/common/platform/win/win.h
++++ b/cpp/common/platform/win/win.h
+@@ -25,6 +25,10 @@ using namespace DirectX;
+ #define LUID(desc)                                                             \
+   (((int64_t)desc.AdapterLuid.HighPart << 32) | desc.AdapterLuid.LowPart)
+ 
++// IDXGIDevice::SetGPUThreadPriority(priority) on `device` (fork, roadmap M17), logged once per
++// call with the HRESULT and `who`. No-op for priority 0 or a null device.
++void ApplyGpuThreadPriority(ID3D11Device *device, int priority, const char *who);
++
+ class NativeDevice {
+ public:
+   bool Init(int64_t luid, ID3D11Device *device, int pool_size = 1);
+@@ -47,6 +51,9 @@ public:
+                   ID3D11Texture2D *bgraTexture, int nv12ArrayIndex);
+   AdapterVendor GetVendor();
+   bool support_decode(DataFormat format);
++  // Encoders only: SetGPUThreadPriority(priority) on the device when this object created it
++  // (InitFromLuid). A device passed in (the capturer's) is the caller's to set. No-op for 0.
++  void ApplyEncodeGpuPriority(int priority, const char *who);
+ 
+ private:
+   bool InitFromLuid(int64_t luid);
+@@ -92,6 +99,8 @@ public:
+ 
+   int count_;
+   int index_ = 0;
++  // Created here (InitFromLuid), not passed in.
++  bool owns_device_ = false;
+ 
+   int last_nv12_to_bgra_width_ = 0;
+   int last_nv12_to_bgra_height_ = 0;
 diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
-index 45810b4..ab969d8 100644
+index 45810b4..8c09024 100644
 --- a/cpp/common/util.cpp
 +++ b/cpp/common/util.cpp
 @@ -3,8 +3,11 @@ extern "C" {
@@ -142,7 +217,7 @@ index 45810b4..ab969d8 100644
    }
    if (name.find("amf") != std::string::npos) {
      if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
-@@ -304,6 +321,86 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
+@@ -304,6 +321,90 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
    return true;
  }
  
@@ -176,6 +251,10 @@ index 45810b4..ab969d8 100644
 +static std::atomic<int> g_nvenc_vbv_frames{0};
 +
 +int nvenc_vbv_frames() { return g_nvenc_vbv_frames.load(); }
++
++static std::atomic<int> g_encode_gpu_thread_priority{0};
++
++int encode_gpu_thread_priority() { return g_encode_gpu_thread_priority.load(); }
 +
 +void set_vbv(AVCodecContext *c, const std::string &name, int kbs, int fps, int frames) {
 +  if (frames <= 0 || kbs <= 0 || fps <= 0 || name.find("nvenc") == std::string::npos) {
@@ -229,10 +308,19 @@ index 45810b4..ab969d8 100644
  void vram_encode_test_callback(const uint8_t *data, int32_t len, int32_t key, const void *obj, int64_t pts) {
    (void)data;
    (void)len;
-@@ -328,6 +425,20 @@ bool has_flag_could_not_find_ref_with_poc() {
+@@ -328,6 +429,29 @@ bool has_flag_could_not_find_ref_with_poc() {
  
  } // namespace util_decode
  
++extern "C" void hwcodec_set_encode_gpu_thread_priority(int priority) {
++  if (priority < -7) {
++    priority = -7;
++  } else if (priority > 7) {
++    priority = 7;
++  }
++  util_encode::g_encode_gpu_thread_priority.store(priority);
++}
++
 +extern "C" void hwcodec_set_nvenc_vbv_frames(int frames) {
 +  if (frames < 0) {
 +    frames = 0;
@@ -252,10 +340,10 @@ index 45810b4..ab969d8 100644
  }
 \ No newline at end of file
 diff --git a/cpp/common/util.h b/cpp/common/util.h
-index 711fd2a..4a32e16 100644
+index 711fd2a..b2782b1 100644
 --- a/cpp/common/util.h
 +++ b/cpp/common/util.h
-@@ -20,6 +20,33 @@ bool force_hw(void *priv_data, const std::string &name);
+@@ -20,6 +20,36 @@ bool force_hw(void *priv_data, const std::string &name);
  bool set_others(void *priv_data, const std::string &name);
  
  bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs);
@@ -271,6 +359,9 @@ index 711fd2a..4a32e16 100644
 +// VBV size in frames for nvenc encoders opened from now on (hwcodec_set_nvenc_vbv_frames); 0 keeps
 +// FFmpeg's default.
 +int nvenc_vbv_frames();
++// GPU thread priority (-7..7, 0 = leave) for D3D11 devices that encoders open themselves from now
++// on (hwcodec_set_encode_gpu_thread_priority, fork, roadmap M17). Windows only; elsewhere unused.
++int encode_gpu_thread_priority();
 +// nvenc only, frames > 0: rc_buffer_size = frames * kbs * 1000 / fps bits. Before avcodec_open2 it
 +// sets the VBV; on an open encoder FFmpeg's reconfig_encoder applies it with the next frame.
 +void set_vbv(AVCodecContext *c, const std::string &name, int kbs, int fps, int frames);
@@ -290,10 +381,26 @@ index 711fd2a..4a32e16 100644
  
  } // namespace util
 diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-index 0a8d1b1..1a354f7 100644
+index 0a8d1b1..5a20f6a 100644
 --- a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
 +++ b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-@@ -109,6 +109,8 @@ public:
+@@ -5,8 +5,15 @@ extern "C" {
+ #include <libavutil/imgutils.h>
+ #include <libavutil/log.h>
+ #include <libavutil/opt.h>
++#ifdef _WIN32
++#include <libavutil/hwcontext.h>
++#endif
+ }
+ 
++#ifdef _WIN32
++#include <libavutil/hwcontext_d3d11va.h>
++#endif
++
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -109,6 +116,8 @@ public:
    int rc_ = 0;
    int quality_ = 0;
    int kbs_ = 0;
@@ -302,7 +409,7 @@ index 0a8d1b1..1a354f7 100644
    int q_ = 0;
    int fps_ = 30;
    int gop_ = 0xFFFF;
-@@ -122,6 +124,19 @@ public:
+@@ -122,6 +131,19 @@ public:
    AVBufferRef *hw_device_ctx_ = NULL;
    AVFrame *hw_frame_ = NULL;
  
@@ -322,7 +429,7 @@ index 0a8d1b1..1a354f7 100644
    FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
                     int pixfmt, int align, int fps, int gop, int rc, int quality,
                     int kbs, int q, int thread_count, int gpu,
-@@ -137,6 +152,7 @@ public:
+@@ -137,6 +159,7 @@ public:
      rc_ = rc;
      quality_ = quality;
      kbs_ = kbs;
@@ -330,7 +437,23 @@ index 0a8d1b1..1a354f7 100644
      q_ = q;
      thread_count_ = thread_count;
      gpu_ = gpu;
-@@ -240,6 +256,11 @@ public:
+@@ -187,6 +210,15 @@ public:
+         LOG_ERROR(std::string("av_hwdevice_ctx_create failed"));
+         return false;
+       }
++#ifdef _WIN32
++      if (hw_device_type_ == AV_HWDEVICE_TYPE_D3D11VA) {
++        // FFmpeg's own D3D11 device for the upload: not the capturer's, so set it here (M17).
++        AVHWDeviceContext *device_ctx = (AVHWDeviceContext *)hw_device_ctx_->data;
++        AVD3D11VADeviceContext *d3d11_ctx = (AVD3D11VADeviceContext *)device_ctx->hwctx;
++        ApplyGpuThreadPriority(d3d11_ctx->device, util_encode::encode_gpu_thread_priority(),
++                               name_.c_str());
++      }
++#endif
+       if (set_hwframe_ctx() != 0) {
+         LOG_ERROR(std::string("set_hwframe_ctx failed"));
+         return false;
+@@ -240,6 +272,11 @@ public:
      util_encode::set_gpu(c_->priv_data, name_, gpu_);
      util_encode::force_hw(c_->priv_data, name_);
      util_encode::set_others(c_->priv_data, name_);
@@ -342,7 +465,7 @@ index 0a8d1b1..1a354f7 100644
      if (name_.find("mediacodec") != std::string::npos) {
        if (mc_name_.length() > 0) {
          LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);
-@@ -255,6 +276,7 @@ public:
+@@ -255,6 +292,7 @@ public:
                  ", name: " + name_);
        return false;
      }
@@ -350,7 +473,7 @@ index 0a8d1b1..1a354f7 100644
  
      if (ffmpeg_ram_get_linesize_offset_length(pixfmt_, width_, height_, align_,
                                                NULL, offset_, length) != 0)
-@@ -304,7 +326,43 @@ public:
+@@ -304,7 +342,43 @@ public:
    }
  
    int set_bitrate(int kbs) {
@@ -395,7 +518,7 @@ index 0a8d1b1..1a354f7 100644
    }
  
  private:
-@@ -339,11 +397,19 @@ private:
+@@ -339,11 +413,19 @@ private:
    int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
      int ret;
      bool encoded = false;
@@ -416,7 +539,7 @@ index 0a8d1b1..1a354f7 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-@@ -358,12 +424,28 @@ private:
+@@ -358,12 +440,28 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -446,7 +569,7 @@ index 0a8d1b1..1a354f7 100644
    }
  
    int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
-@@ -463,4 +545,22 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
+@@ -463,4 +561,22 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
      LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
    }
    return -1;
@@ -575,7 +698,7 @@ index f8a0f92..6dfb0cf 100644
                                         int32_t maxDescNum, int32_t *outDescNum,
                                         DataFormat dataFormat,
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-index 2b21b73..6e49d30 100644
+index 2b21b73..6c39083 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 +++ b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 @@ -74,8 +74,24 @@ public:
@@ -611,7 +734,15 @@ index 2b21b73..6e49d30 100644
      framerate_ = framerate;
      gop_ = gop;
    }
-@@ -136,6 +153,11 @@ public:
+@@ -104,6 +121,7 @@ public:
+       LOG_ERROR(std::string("NativeDevice init failed"));
+       return false;
+     }
++    native_->ApplyEncodeGpuPriority(util_encode::encode_gpu_thread_priority(), "ffmpeg_vram");
+     d3d11Device_ = native_->device_.Get();
+     d3d11Device_->AddRef();
+     d3d11DeviceContext_ = native_->context_.Get();
+@@ -136,6 +154,11 @@ public:
      // util_encode::set_quality(c_->priv_data, encoder_->name_, Quality_Default);
      util_encode::set_rate_control(c_, encoder_->name_, RC_CBR, -1);
      util_encode::set_others(c_->priv_data, encoder_->name_);
@@ -623,7 +754,7 @@ index 2b21b73..6e49d30 100644
  
      hw_device_ctx_ = av_hwdevice_ctx_alloc(encoder_->device_type_);
      if (!hw_device_ctx_) {
-@@ -184,6 +206,7 @@ public:
+@@ -184,6 +207,7 @@ public:
                  ", name: " + encoder_->name_);
        return false;
      }
@@ -631,7 +762,7 @@ index 2b21b73..6e49d30 100644
  
      if (!(frame_ = av_frame_alloc())) {
        LOG_ERROR(std::string("Could not allocate video frame"));
-@@ -227,10 +250,28 @@ public:
+@@ -227,10 +251,28 @@ public:
  
      if (!convert(texture))
        return -1;
@@ -660,7 +791,7 @@ index 2b21b73..6e49d30 100644
    void destroy() {
      if (pkt_)
        av_packet_free(&pkt_);
-@@ -252,13 +293,39 @@ public:
+@@ -252,13 +294,39 @@ public:
    }
  
    int set_bitrate(int kbs) {
@@ -704,7 +835,7 @@ index 2b21b73..6e49d30 100644
    }
  
  private:
-@@ -314,11 +381,19 @@ private:
+@@ -314,11 +382,19 @@ private:
    int do_encode(EncodeCallback callback, const void *obj, int64_t ms) {
      int ret;
      bool encoded = false;
@@ -725,7 +856,7 @@ index 2b21b73..6e49d30 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
-@@ -333,13 +408,33 @@ private:
+@@ -333,13 +409,33 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -760,7 +891,7 @@ index 2b21b73..6e49d30 100644
    }
  
    bool convert(void *texture) {
-@@ -486,13 +581,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
+@@ -486,13 +582,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
  
  int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
    try {
@@ -821,8 +952,20 @@ index 7a7f5f8..b8613b1 100644
  
  #endif // FFMPEG_VRAM_FFI_H
 \ No newline at end of file
+diff --git a/cpp/mfx/mfx_encode.cpp b/cpp/mfx/mfx_encode.cpp
+index 5b8f40a..8024bfb 100644
+--- a/cpp/mfx/mfx_encode.cpp
++++ b/cpp/mfx/mfx_encode.cpp
+@@ -111,6 +111,7 @@ public:
+         LOG_ERROR(std::string("failed to init native device"));
+         return MFX_ERR_DEVICE_FAILED;
+       }
++      native_->ApplyEncodeGpuPriority(util_encode::encode_gpu_thread_priority(), "mfx");
+     }
+     sts = resetMFX();
+     CHECK_STATUS(sts, "resetMFX");
 diff --git a/cpp/nv/nv_encode.cpp b/cpp/nv/nv_encode.cpp
-index 0887d0b..ae031b8 100644
+index 0887d0b..a3ebeff 100644
 --- a/cpp/nv/nv_encode.cpp
 +++ b/cpp/nv/nv_encode.cpp
 @@ -75,6 +75,8 @@ public:
@@ -834,7 +977,15 @@ index 0887d0b..ae031b8 100644
  
    NvencEncoder(void *handle, int64_t luid, DataFormat dataFormat,
                 int32_t width, int32_t height, int32_t kbs, int32_t framerate,
-@@ -187,7 +189,12 @@ public:
+@@ -122,6 +124,7 @@ public:
+       return false;
+     }
+ #endif
++    native_->ApplyEncodeGpuPriority(util_encode::encode_gpu_thread_priority(), "nv");
+ 
+     CUdevice cuDevice = 0;
+     if (!succ(cuda_dl_->cuD3D11GetDevice(&cuDevice, native_->adapter_.Get()))) {
+@@ -187,7 +190,12 @@ public:
  
      NV_ENC_PIC_PARAMS picParams = {0};
      picParams.inputTimeStamp = ms;
@@ -848,7 +999,7 @@ index 0887d0b..ae031b8 100644
      for (NvPacket &packet : vPacket) {
        int32_t key = (packet.pictureType == NV_ENC_PIC_TYPE_IDR ||
                       packet.pictureType == NV_ENC_PIC_TYPE_I)
-@@ -450,6 +457,17 @@ int nv_set_bitrate(void *e, int32_t kbs) {
+@@ -450,6 +458,17 @@ int nv_set_bitrate(void *e, int32_t kbs) {
    return -1;
  }
  
@@ -880,10 +1031,10 @@ index 06a82fc..900290d 100644
  #endif // NV_FFI_H
 \ No newline at end of file
 diff --git a/src/ffmpeg.rs b/src/ffmpeg.rs
-index bb57dd7..8f19e4c 100644
+index bb57dd7..7aa7df9 100644
 --- a/src/ffmpeg.rs
 +++ b/src/ffmpeg.rs
-@@ -50,6 +50,12 @@ pub extern "C" fn hwcodec_av_log_callback(level: i32, message: *const std::os::r
+@@ -50,6 +50,20 @@ pub extern "C" fn hwcodec_av_log_callback(level: i32, message: *const std::os::r
      }
  }
  
@@ -891,6 +1042,14 @@ index bb57dd7..8f19e4c 100644
 +/// frames * bitrate / framerate, kept on every bitrate change. 0 keeps FFmpeg's default VBV.
 +pub fn set_nvenc_vbv_frames(frames: i32) {
 +    unsafe { hwcodec_set_nvenc_vbv_frames(frames) }
++}
++
++/// GPU thread priority (-7..7, clamped; 0 = leave, the default) for D3D11 devices that encoders
++/// opened from now on create themselves (FFmpeg's D3D11VA device of a RAM nvenc encoder, a
++/// NativeDevice created from the LUID), set with `IDXGIDevice::SetGPUThreadPriority`. A device
++/// passed in (the capturer's) is the caller's to set. Windows only; stored and unused elsewhere.
++pub fn set_encode_gpu_thread_priority(priority: i32) {
++    unsafe { hwcodec_set_encode_gpu_thread_priority(priority) }
 +}
 +
  pub(crate) fn init_av_log() {

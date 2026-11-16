@@ -200,6 +200,18 @@ pub const OPTION_ENABLE_AUTO_GAME_MODE: &str = "enable-auto-game-mode";
 // priority (on by default: ABOVE_NORMAL process, MMCSS "Capture" for a hardware-encoder video
 // thread). A change applies from the next capture restart.
 pub const OPTION_ENABLE_HOST_PRIORITY_BOOST: &str = "enable-host-priority-boost";
+// Windows host, server option (Config): GPU scheduling priority for capture and encode (roadmap
+// M17). "Y" turns it on; anything else (default) leaves the GPU scheduler alone. While a capture
+// runs: SeIncreaseBasePriorityPrivilege, D3DKMTSetProcessSchedulingPriorityClass(HIGH, never
+// REALTIME; ABOVE_NORMAL when HIGH is refused) for the server process, restored when the last
+// capture ends, and SetGPUThreadPriority(7) on the capture device and on D3D11 devices hwcodec
+// encoders open themselves. Independent of enable-host-priority-boost. Applies from the next
+// capture restart. See docs/LATENCY-METRICS.md ("gpu_priority").
+pub const OPTION_ENABLE_HOST_GPU_PRIORITY: &str = "enable-host-gpu-priority";
+// Windows host, server option (Config): DwmEnableMMCSS(TRUE) while a capture runs (roadmap M17),
+// so DWM composes on MMCSS time. "Y" turns it on; anything else (default) leaves it. Kept apart
+// from enable-host-gpu-priority to A/B it: the roadmap keeps it only if it measurably helps.
+pub const OPTION_ENABLE_HOST_DWM_MMCSS: &str = "enable-host-dwm-mmcss";
 // Windows, on by default: "N" leaves the Wi-Fi driver out of media streaming mode (fewer background
 // scans and power-save stalls). Server option on the host (while video streams), local option on
 // the viewer (while a remote session is open).

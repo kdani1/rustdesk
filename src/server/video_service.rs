@@ -692,6 +692,13 @@ fn run(vs: VideoService) -> ResultType<()> {
         log::info!("disable dxgi with option, fall back to gdi");
         c.set_gdi();
     }
+    // GPU scheduling priority for capture and encode (enable-host-gpu-priority, roadmap M17).
+    // Before the encoder is opened: hwcodec reads the priority for devices it creates itself.
+    #[cfg(windows)]
+    let gpu_priority = crate::platform::windows_gpu_priority::HostGpuPriority::acquire(
+        display_idx,
+        |priority| c.set_gpu_thread_priority(priority),
+    );
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
     let mut quality = video_qos.ratio();
@@ -797,6 +804,8 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
     let mut latency_stats =
         super::latency_stats::LatencyStats::new(vs.source, display_idx, encoder.bitrate());
+    #[cfg(windows)]
+    latency_stats.set_gpu_priority(gpu_priority.label());
     // M13: refreshes served by a forced key frame (enable-refresh-keyframe, read per refresh).
     #[cfg(windows)]
     let mut key_refresh = super::key_refresh::KeyRefresh::default();

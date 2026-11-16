@@ -219,6 +219,9 @@ pub(super) struct LatencyStats {
     // (0: off), kept always like `set_kbps`, and how often it changed in the window.
     vfps: u32,
     vfchg: usize,
+    // GPU scheduling priority of this capture loop (enable-host-gpu-priority /
+    // enable-host-dwm-mmcss, Windows): "on" or "off", set once at capture start.
+    gpuprio: &'static str,
 }
 
 impl LatencyStats {
@@ -256,7 +259,14 @@ impl LatencyStats {
             refine: 0,
             vfps: 0,
             vfchg: 0,
+            gpuprio: "off",
         }
+    }
+
+    /// `gpuprio=` of the line: the capture loop's GPU priority guard (Windows, roadmap M17).
+    #[cfg(windows)]
+    pub(super) fn set_gpu_priority(&mut self, label: &'static str) {
+        self.gpuprio = label;
     }
 
     /// `grab`: capturer call until it returned the frame.
@@ -411,7 +421,7 @@ impl LatencyStats {
         if self.enabled && self.sent + self.skipped + self.idle > 0 {
             let secs = elapsed.as_secs_f64();
             log::info!(
-                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={} vfps={} vfchg={}",
+                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={} vfps={} vfchg={} gpuprio={}",
                 self.display,
                 self.sent as f64 / secs,
                 spf.as_millis(),
@@ -441,6 +451,7 @@ impl LatencyStats {
                 self.refine,
                 self.vfps,
                 self.vfchg,
+                self.gpuprio,
             );
         }
         self.window_start = Instant::now();
