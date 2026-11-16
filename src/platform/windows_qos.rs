@@ -152,6 +152,19 @@ impl Drop for QosFlow {
     }
 }
 
+/// qWAVE AudioVideo marking of the UDP video lane's connected socket (roadmap M20; the lane
+/// exists on the LAN only), unless `enable-lan-qos` is "N". Drop it before the socket closes.
+pub struct UdpQos(#[allow(dead_code)] QosFlow);
+
+/// None when `enable-lan-qos` is "N"; otherwise the flow or why it could not be added. A
+/// synchronous RPC to the qWAVE service: call it off the async runtime.
+pub fn mark_udp(socket: &std::net::UdpSocket) -> Option<io::Result<UdpQos>> {
+    if Config::get_option(OPTION_ENABLE_LAN_QOS) == "N" {
+        return None;
+    }
+    Some(QosFlow::add(socket.as_raw_socket()).map(UdpQos))
+}
+
 // Field order matters: the flow is dropped, and its handle closed, before the socket.
 struct QosTcpStream {
     _flow: QosFlow,

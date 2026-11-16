@@ -6,9 +6,10 @@
 //! `max(1.5 x video bitrate, frame_bytes / (0.5 x frame interval))`, so a frame is always out
 //! within half a frame interval, an IDR included (the udp-video design, step 4).
 //!
-//! The pacer only computes when to send; the sender thread waits with `wait_until`. A Windows
-//! high-resolution waitable timer would make the wait cheaper than the spin used for the last
-//! millisecond here; that belongs to the live sender (M20).
+//! The pacer only computes when to send; the live sender thread (M20) waits with a [`Waiter`]:
+//! a high-resolution waitable timer on Windows (1803+) for all but the last half millisecond,
+//! then a spin, so the wait between bursts costs little CPU and is not rounded up to the 1 ms
+//! (or 15.6 ms) scheduler tick.
 
 use std::time::{Duration, Instant};
 
@@ -107,6 +108,129 @@ pub fn wait_until(deadline: Instant) {
     }
 }
 
+/// Waits for a deadline with sub-millisecond accuracy. Windows: a high-resolution waitable
+/// timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) for all but the last `SPIN`, then a spin;
+/// without that timer (before Windows 10 1803) and on other platforms, `wait_until`.
+pub struct Waiter {
+    #[cfg(windows)]
+    timer: Option<win::Timer>,
+}
+
+/// The tail of a wait that is spun rather than slept.
+const SPIN_TAIL: Duration = Duration::from_micros(500);
+
+impl Waiter {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            timer: win::Timer::new(),
+        }
+    }
+
+    /// Whether the high-resolution timer is in use (logged once by the sender).
+    pub fn high_resolution(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.timer.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub fn wait_until(&mut self, deadline: Instant) {
+        #[cfg(windows)]
+        if let Some(t) = &self.timer {
+            let now = Instant::now();
+            if deadline > now + SPIN_TAIL {
+                t.sleep(deadline - now - SPIN_TAIL);
+            }
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            return;
+        }
+        wait_until(deadline);
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::{ffi::c_void, time::Duration};
+
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateWaitableTimerExW(
+            attrs: *mut c_void,
+            name: *const u16,
+            flags: u32,
+            access: u32,
+        ) -> *mut c_void;
+        fn SetWaitableTimer(
+            timer: *mut c_void,
+            due: *const i64,
+            period: i32,
+            routine: *mut c_void,
+            arg: *mut c_void,
+            resume: i32,
+        ) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub struct Timer(*mut c_void);
+
+    // The handle is used by the one thread that owns the Waiter; moving it is fine.
+    unsafe impl Send for Timer {}
+
+    impl Timer {
+        pub fn new() -> Option<Self> {
+            let h = unsafe {
+                CreateWaitableTimerExW(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS,
+                )
+            };
+            (!h.is_null()).then_some(Self(h))
+        }
+
+        pub fn sleep(&self, d: Duration) {
+            // Relative due time in 100 ns units, negative.
+            let due = -((d.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+            unsafe {
+                if SetWaitableTimer(
+                    self.0,
+                    &due,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                ) != 0
+                {
+                    WaitForSingleObject(self.0, INFINITE);
+                } else {
+                    std::thread::sleep(d);
+                }
+            }
+        }
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod latency_tests {
     use super::*;
@@ -171,5 +295,13 @@ mod latency_tests {
         wait_until(deadline);
         assert!(Instant::now() >= deadline);
         wait_until(Instant::now() - Duration::from_millis(1));
+        let mut w = Waiter::new();
+        for us in [200u64, 1_500, 4_000] {
+            let deadline = Instant::now() + Duration::from_micros(us);
+            w.wait_until(deadline);
+            assert!(Instant::now() >= deadline);
+        }
+        #[cfg(windows)]
+        assert!(w.high_resolution());
     }
 }

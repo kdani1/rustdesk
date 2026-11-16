@@ -1,23 +1,34 @@
-//! Host end of the UDP video lane in shadow mode (M19 second half).
+//! Host end of the UDP video lane: shadow probe (M19) and live video (M20).
 //!
 //! The connection offers a lane after a remote-control login when every gate passes
 //! ([`offer_gate`]). [`UdpVideoHost`] owns the socket and two threads:
 //!
 //! - receive thread: answers the viewer's HELLO (only from the session's peer IP, only if it
 //!   opens with the lane keys) with HELLO_ACK and then `connect()`s the socket to the viewer's
-//!   address; answers PING with PONG. Blocking `recv` with a 100 ms timeout.
-//! - sender thread: takes shadow jobs from a bounded queue, serializes the frame once, seals
-//!   and sends its datagrams back to back (no pacing in shadow mode), and logs a
-//!   `UDPVIDEO host` line every 5 s.
+//!   address; answers PING with PONG; live mode: takes the viewer's ACKs (send window, round
+//!   trip for the QoS signal) and notes when the viewer was last heard. Blocking `recv` with a
+//!   100 ms timeout.
+//! - sender thread: takes jobs from a bounded queue, serializes the frame once, seals and sends
+//!   its datagrams (shadow: back to back; live: in bursts paced by a token bucket and a
+//!   high-resolution timer), and logs a `UDPVIDEO host` line every 5 s.
 //!
 //! Both threads seal with one `LaneSender` and send each datagram while still holding its lock
 //! ([`seal_send`]), one datagram at a time: the wire order is then the seq order, so a PONG sent
 //! in the middle of a frame does not overtake the rest of the frame (which the viewer would count
 //! as reorder, and, past the 1024-seq replay window, as replayed and lost fragments).
 //!
-//! The connection's video path calls [`ShadowTap::offer`] with every video item before its TCP
-//! send. While no lane is active that is one relaxed atomic load. The tap never blocks: a full
-//! queue drops the copy (`qdrop`).
+//! The connection's video path asks [`VideoTap::route`] about every video item before its TCP
+//! send. While no lane is active and no marker is pending that is one relaxed atomic load and
+//! the item goes to TCP. Shadow: the item goes to TCP and every Nth frame is also copied to
+//! UDP. Live: video frames go to UDP only, everything else (SwitchDisplay) to TCP; the ACTIVE
+//! and STOP markers are written to TCP in the order of the video stream, so the viewer knows
+//! exactly which frames came which way. The tap never blocks: a full queue drops the frame
+//! (`qdrop`; in live mode the viewer sees the gap as a loss and asks for a key frame).
+//!
+//! Live mode keeps the capture loop's "newest frame wins" back-pressure: the connection no
+//! longer reports a UDP frame as fetched when it takes it off the video channel; the sender
+//! does, once the frame is out and at most [`WINDOW_FRAMES`] frames of that display are not yet
+//! settled by the viewer's ACKs (or after [`WINDOW_WAIT_MAX`]).
 //!
 //! Dropping `UdpVideoHost` stops both threads (they exit within 100 ms; nothing joins them on
 //! the async runtime) and closes the socket when the last thread lets go of it.
@@ -27,35 +38,88 @@ use super::{
     fragment::{fragment, FrameMeta},
     lane::{LaneReceiver, LaneSender, Received},
     net::{self, LaneClock},
-    packet::{Inner, PathClass, FLAG_KEY, FLAG_SHADOW},
+    pacing::{self, Pacer, Waiter},
+    packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, FLAG_SHADOW},
     shadow::Samples,
 };
 use base::message_proto::{
-    message, misc, udp_video_offer, video_frame, Message, UdpVideoOffer, VideoFrame,
+    message, misc, udp_video_control, udp_video_offer, video_frame, Message, Misc, UdpVideoControl,
+    UdpVideoFeedback, UdpVideoLastFrame, UdpVideoOffer, VideoFrame,
 };
 use hbb_common::{log, protobuf::Message as _};
 use std::{
+    collections::VecDeque,
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
-/// Lane version this build speaks.
+/// Lane (wire and offer) version this build speaks.
 pub const LANE_VERSION: u32 = 1;
+/// `LoginRequest.udp_video_version` of a viewer that takes live offers (1: shadow only).
+pub const VIEWER_LIVE_VERSION: u32 = 2;
 /// From the offer to the viewer's READY.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default of `udp-video-shadow-every`: half the frames, so the extra Wi-Fi load stays at half
 /// the video bitrate.
 pub const DEFAULT_SHADOW_EVERY: u32 = 2;
+/// Default of `udp-video-timeout-ms`.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Range of `udp-video-timeout-ms`.
+pub const TIMEOUT_RANGE_MS: (u64, u64) = (200, 10_000);
+/// Default of `udp-video-burst`.
+pub const DEFAULT_BURST: usize = pacing::DEFAULT_BURST_PACKETS;
+/// Frames of a display sent but not settled by the viewer, at most, before the sender stops
+/// reporting new ones as fetched (roadmap: 2-3 unacknowledged frames).
+pub const WINDOW_FRAMES: u32 = 3;
+/// A frame held back by the window counts as fetched after this anyway (lost ACKs must not
+/// stall the capture loop; silence ends the lane after `timeout`).
+pub const WINDOW_WAIT_MAX: Duration = Duration::from_millis(100);
+/// This many key frame requests (losses) within `KF_WINDOW` end a live lane: sustained loss.
+pub const KF_MAX: usize = 4;
+pub const KF_WINDOW: Duration = Duration::from_secs(5);
+/// Added to the QoS delay sample when the viewer lost frames since the last sample.
+pub const LOSS_PENALTY_MS: u32 = 150;
+/// After a live lane fell back to TCP, the next offers come this long after each fallback;
+/// then the session stays on TCP.
+pub const RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(30), Duration::from_secs(120)];
+/// Datagram send errors in a row that end a live lane.
+const SEND_ERRORS_MAX: u32 = 5;
 const QUEUE: usize = 4;
-/// Shadow mode is offered on LAN paths only.
+/// Only reached when the capture loop's fetched wait timed out; a drop is a loss.
+const LIVE_QUEUE: usize = 8;
+/// Lanes are offered on LAN paths only.
 const PATH: PathClass = PathClass::Lan;
 const LOG_EVERY: Duration = Duration::from_secs(5);
+/// The QoS baseline (minimum ACK round trip) is the lower of this window's and the last one's.
+const BASE_WINDOW: Duration = Duration::from_secs(10);
+
+static LIVE_LANES: AtomicUsize = AtomicUsize::new(0);
+
+/// Live lanes that are active now, all connections: the `LATENCY server` line's `qos_sig`.
+pub fn live_lanes() -> usize {
+    LIVE_LANES.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Shadow,
+    Live,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Shadow => "shadow",
+            Mode::Live => "live",
+        }
+    }
+}
 
 /// What the connection knows about its transport when it starts, for the offer gate.
 #[derive(Clone, Copy, Debug)]
@@ -86,18 +150,266 @@ pub fn offer_gate(g: &Gate) -> Result<(IpAddr, IpAddr), String> {
     Ok((local, peer))
 }
 
+/// The lane mode the host option asks for: "Y" live, "shadow" shadow, anything else none.
+pub fn mode_from_option(v: &str) -> Option<Mode> {
+    match v {
+        "Y" => Some(Mode::Live),
+        "shadow" => Some(Mode::Shadow),
+        _ => None,
+    }
+}
+
+/// Settings read from the host options at each offer.
+#[derive(Clone, Copy, Debug)]
+pub struct Params {
+    pub mode: Mode,
+    pub every: u32,
+    /// Datagrams per burst, 0 = unpaced.
+    pub burst: usize,
+    pub timeout: Duration,
+}
+
+impl Params {
+    /// From the option strings, each falling back to its default when empty or invalid.
+    pub fn from_options(mode: Mode, every: &str, burst: &str, timeout_ms: &str) -> Self {
+        Self {
+            mode,
+            every: every
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=60).contains(n))
+                .unwrap_or(DEFAULT_SHADOW_EVERY),
+            burst: burst
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n <= 64)
+                .unwrap_or(DEFAULT_BURST),
+            timeout: timeout_ms
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (TIMEOUT_RANGE_MS.0..=TIMEOUT_RANGE_MS.1).contains(n))
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_TIMEOUT),
+        }
+    }
+}
+
+/// Calls back into the server for frames that go over UDP in live mode.
+pub struct LiveHooks {
+    /// `notify_video_frame_fetched(display, conn, queued)`: the capture loop may go on.
+    pub fetched: Box<dyn Fn(usize, Instant) + Send + Sync>,
+    /// `latency_stats::on_video_send`: the `send` field of the `LATENCY server` line.
+    pub sent: Box<dyn Fn(&Message, Duration) + Send + Sync>,
+}
+
+/// Reports a live frame as fetched when dropped, whichever way: sent and inside the window,
+/// held past `WINDOW_WAIT_MAX`, dropped from a full queue, or left behind by a lane that ended.
+/// So the capture loop never waits for a frame the lane lost track of.
+struct Fetched {
+    hooks: Arc<LiveHooks>,
+    display: usize,
+    queued: Instant,
+}
+
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        (self.hooks.fetched)(self.display, self.queued);
+    }
+}
+
+/// Where the connection writes a video channel item, and the markers to write before it.
+#[derive(Debug, Default)]
+pub struct Route {
+    /// Lane control markers (ACTIVE, STOP) to write to TCP first, in this order.
+    pub before: Vec<Message>,
+    /// Write the item to TCP. False: it went to the UDP lane.
+    pub tcp: bool,
+}
+
+impl Route {
+    pub const TCP: Route = Route {
+        before: Vec::new(),
+        tcp: true,
+    };
+}
+
+#[derive(Default)]
+struct DispWin {
+    display: u8,
+    last_sent: Option<u32>,
+    settled: Option<u32>,
+    lost_total: Option<u32>,
+    pending: Option<(Fetched, Instant)>,
+}
+
+impl DispWin {
+    /// Frames sent and not settled. Frame ids start at 0 on a live lane.
+    fn inflight(&self) -> u32 {
+        match (self.last_sent, self.settled) {
+            (None, _) => 0,
+            (Some(s), None) => s.wrapping_add(1),
+            (Some(s), Some(t)) => (s.wrapping_sub(t) as i32).max(0) as u32,
+        }
+    }
+}
+
+/// Live mode: the send window and the round trip of the ACKs.
+#[derive(Default)]
+struct Live {
+    displays: Vec<DispWin>,
+    /// Frames that waited for the window, and how long.
+    win_wait: Samples,
+    win_timeouts: u64,
+    inflight_max: u32,
+    /// ACK round trip minus the viewer's hold time, microseconds, this log window.
+    rtt: Samples,
+    base_cur: Option<u32>,
+    base_prev: Option<u32>,
+    base_since: Option<Instant>,
+    /// Largest excess over the baseline and frames the viewer lost since the last QoS sample.
+    excess_max: u32,
+    lost: u64,
+    /// Frames the viewer reported lost, this log window.
+    lost_win: u64,
+}
+
+impl Live {
+    fn disp(&mut self, display: u8) -> &mut DispWin {
+        let i = match self.displays.iter().position(|d| d.display == display) {
+            Some(i) => i,
+            None => {
+                self.displays.push(DispWin {
+                    display,
+                    ..Default::default()
+                });
+                self.displays.len() - 1
+            }
+        };
+        &mut self.displays[i]
+    }
+
+    fn baseline(&self) -> Option<u32> {
+        match (self.base_cur, self.base_prev) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn on_rtt(&mut self, rtt_us: u32, now: Instant) {
+        self.rtt.push(rtt_us as i64);
+        let since = *self.base_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= BASE_WINDOW {
+            self.base_prev = self.base_cur.take();
+            self.base_since = Some(now);
+        }
+        self.base_cur = Some(self.base_cur.map_or(rtt_us, |b| b.min(rtt_us)));
+        if let Some(base) = self.baseline() {
+            self.excess_max = self.excess_max.max(rtt_us.saturating_sub(base));
+        }
+    }
+}
+
+/// `a` comes after `b` in wrapping frame id order.
+fn id_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
 /// Counters the tap and both threads share; the sender thread logs and resets the windowed
 /// ones.
-#[derive(Default)]
 struct Shared {
     stop: AtomicBool,
+    clock: LaneClock,
     peer: Mutex<Option<SocketAddr>>,
     hellos: AtomicU64,
     pings: AtomicU64,
+    acks: AtomicU64,
     /// Datagrams refused before or by the crypto (foreign source, bad tag, replay).
     refused: AtomicU64,
     skipped: AtomicU64,
     qdrop: AtomicU64,
+    kf_req: AtomicU64,
+    /// Lane clock, ms + 1, of the last datagram from the viewer that opened (0: none yet).
+    last_rx_ms: AtomicU64,
+    /// Set by the sender when the socket keeps failing: the lane must end.
+    fatal: Mutex<Option<String>>,
+    live: Mutex<Live>,
+}
+
+impl Shared {
+    fn new(clock: LaneClock) -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            clock,
+            peer: Mutex::new(None),
+            hellos: AtomicU64::new(0),
+            pings: AtomicU64::new(0),
+            acks: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            qdrop: AtomicU64::new(0),
+            kf_req: AtomicU64::new(0),
+            last_rx_ms: AtomicU64::new(0),
+            fatal: Mutex::new(None),
+            live: Mutex::new(Live::default()),
+        }
+    }
+
+    fn heard(&self) {
+        let ms = self.clock.elapsed().as_millis() as u64 + 1;
+        self.last_rx_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// How long since the viewer was last heard, if ever.
+    fn silent_for(&self) -> Option<Duration> {
+        match self.last_rx_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(
+                self.clock
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(ms - 1)),
+            ),
+        }
+    }
+
+    /// The viewer's ACK: settle frames, release a frame held by the window, take a round trip.
+    fn on_ack(&self, a: &Ack, now_us: u32, now: Instant) {
+        self.acks.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut live) = self.live.lock() else {
+            return;
+        };
+        let d = live.disp(a.display);
+        if a.has_settled && d.settled.map_or(true, |s| id_after(a.settled, s)) {
+            // Never past what was sent: a forged-free but confused ACK cannot open the window.
+            let settled = match d.last_sent {
+                Some(s) if id_after(a.settled, s) => s,
+                _ => a.settled,
+            };
+            d.settled = Some(settled);
+        }
+        let lost = match d.lost_total {
+            Some(prev) => a.lost_total.wrapping_sub(prev) as u64,
+            None => a.lost_total as u64,
+        };
+        d.lost_total = Some(a.lost_total);
+        let released = if d.inflight() <= WINDOW_FRAMES {
+            d.pending.take()
+        } else {
+            None
+        };
+        live.lost += lost;
+        live.lost_win += lost;
+        if let Some((fetched, since)) = released {
+            live.win_wait
+                .push_duration(now.saturating_duration_since(since));
+            drop(fetched);
+        }
+        if a.hold_us != ACK_NO_FRAME {
+            let rtt = net::us_diff(now_us, a.echo_send_us) - a.hold_us as i64;
+            if (0..=u32::MAX as i64).contains(&rtt) {
+                live.on_rtt(rtt as u32, now);
+            }
+        }
+    }
 }
 
 struct Job {
@@ -106,26 +418,70 @@ struct Job {
     epoch: u8,
     flags: u8,
     queued: Instant,
+    /// Live: the lane frame id the tap gave it. Shadow: None, the sender numbers what it sends.
+    frame_id: Option<u32>,
+    /// Live: reported as fetched when the window allows (or when dropped).
+    fetched: Option<Fetched>,
 }
 
-#[derive(Default)]
+enum TapMode {
+    Off,
+    Shadow {
+        tx: SyncSender<Job>,
+        shared: Arc<Shared>,
+        every: u32,
+        /// Video items seen per display while active, for the every-Nth choice.
+        seen: Vec<(i32, u32)>,
+    },
+    Live {
+        tx: SyncSender<Job>,
+        shared: Arc<Shared>,
+        hooks: Arc<LiveHooks>,
+        lane_id: u64,
+        /// Next lane frame id per display, from 0.
+        ids: Vec<(u8, u32)>,
+        /// The ACTIVE marker went out (with the first UDP frame).
+        announced: bool,
+    },
+}
+
 struct TapInner {
-    tx: Option<SyncSender<Job>>,
-    shared: Option<Arc<Shared>>,
-    every: u32,
-    /// Video items seen per display while active, for the every-Nth choice.
-    seen: Vec<(i32, u32)>,
+    mode: TapMode,
     epoch: u8,
+    /// Markers to write before the next video item.
+    pending: Vec<Message>,
+}
+
+impl Default for TapInner {
+    fn default() -> Self {
+        Self {
+            mode: TapMode::Off,
+            epoch: 0,
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// What ending a lane left to do: displays that had UDP frames (their TCP stream restarts with
+/// a key frame), and whether the STOP marker waits in the tap for the next video item.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StopInfo {
+    pub displays: Vec<i32>,
+    pub in_band: bool,
+    /// The lane was live and active (worth a retry later).
+    pub was_live: bool,
 }
 
 /// The connection's hook in front of every TCP video send (whole or split session).
 #[derive(Default)]
-pub struct ShadowTap {
-    active: AtomicBool,
+pub struct VideoTap {
+    /// A mode is on or a marker is pending: `route` takes the lock.
+    busy: AtomicBool,
     inner: Mutex<TapInner>,
 }
 
-fn has_key_frame(vf: &VideoFrame) -> bool {
+/// Any key frame in it (the lane's KEY flag; the viewer's TCP restart after a live lane).
+pub(crate) fn has_key_frame(vf: &VideoFrame) -> bool {
     use video_frame::Union::*;
     match vf.union.as_ref() {
         Some(Vp8s(f)) | Some(Vp9s(f)) | Some(Av1s(f)) | Some(H264s(f)) | Some(H265s(f)) => {
@@ -135,80 +491,211 @@ fn has_key_frame(vf: &VideoFrame) -> bool {
     }
 }
 
-impl ShadowTap {
+fn control_msg(c: UdpVideoControl) -> Message {
+    let mut misc = Misc::new();
+    misc.set_udp_video_control(c);
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    msg
+}
+
+impl VideoTap {
     /// A video channel item (VideoFrame or SwitchDisplay), before its TCP send.
     #[inline]
-    pub fn offer(&self, msg: &Arc<Message>) {
-        if self.active.load(Ordering::Relaxed) {
-            self.offer_active(msg);
+    pub fn route(&self, msg: &Arc<Message>, queued: Instant) -> Route {
+        if self.busy.load(Ordering::Relaxed) {
+            self.route_busy(msg, queued)
+        } else {
+            Route::TCP
         }
     }
 
-    fn offer_active(&self, msg: &Arc<Message>) {
-        let Ok(mut t) = self.inner.lock() else {
-            return;
+    fn route_busy(&self, msg: &Arc<Message>, queued: Instant) -> Route {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Route::TCP;
+        };
+        let t = &mut *guard;
+        let mut route = Route {
+            before: std::mem::take(&mut t.pending),
+            tcp: true,
         };
         match &msg.union {
-            Some(message::Union::VideoFrame(vf)) => {
-                let every = t.every.max(1);
-                let i = match t.seen.iter().position(|(d, _)| *d == vf.display) {
-                    Some(i) => i,
-                    None => {
-                        t.seen.push((vf.display, 0));
-                        t.seen.len() - 1
+            Some(message::Union::VideoFrame(vf)) => match &mut t.mode {
+                TapMode::Off => {}
+                TapMode::Shadow {
+                    tx,
+                    shared,
+                    every,
+                    seen,
+                } => {
+                    let every = (*every).max(1);
+                    let i = match seen.iter().position(|(d, _)| *d == vf.display) {
+                        Some(i) => i,
+                        None => {
+                            seen.push((vf.display, 0));
+                            seen.len() - 1
+                        }
+                    };
+                    let n = seen[i].1;
+                    seen[i].1 = n.wrapping_add(1);
+                    if n % every != 0 {
+                        shared.skipped.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let job = Job {
+                            msg: msg.clone(),
+                            display: vf.display.clamp(0, u8::MAX as i32) as u8,
+                            epoch: t.epoch,
+                            flags: FLAG_SHADOW | if has_key_frame(vf) { FLAG_KEY } else { 0 },
+                            queued,
+                            frame_id: None,
+                            fetched: None,
+                        };
+                        if let Err(TrySendError::Full(_)) = tx.try_send(job) {
+                            shared.qdrop.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                };
-                let n = t.seen[i].1;
-                t.seen[i].1 = n.wrapping_add(1);
-                let pick = n % every == 0;
-                let Some(shared) = t.shared.clone() else {
-                    return;
-                };
-                if !pick {
-                    shared.skipped.fetch_add(1, Ordering::Relaxed);
-                    return;
                 }
-                let job = Job {
-                    msg: msg.clone(),
-                    display: vf.display.clamp(0, u8::MAX as i32) as u8,
-                    epoch: t.epoch,
-                    flags: FLAG_SHADOW | if has_key_frame(vf) { FLAG_KEY } else { 0 },
-                    queued: Instant::now(),
-                };
-                if let Some(tx) = &t.tx {
-                    if let Err(TrySendError::Full(_)) = tx.try_send(job) {
+                TapMode::Live {
+                    tx,
+                    shared,
+                    hooks,
+                    lane_id,
+                    ids,
+                    announced,
+                } => {
+                    if !*announced {
+                        *announced = true;
+                        route.before.push(control_msg(UdpVideoControl {
+                            kind: udp_video_control::Kind::KindActive.into(),
+                            lane_id: *lane_id,
+                            epoch: t.epoch as u32,
+                            ..Default::default()
+                        }));
+                    }
+                    let display = vf.display.clamp(0, u8::MAX as i32) as u8;
+                    let frame_id = match ids.iter_mut().find(|(d, _)| *d == display) {
+                        Some((_, next)) => {
+                            let id = *next;
+                            *next = next.wrapping_add(1);
+                            id
+                        }
+                        None => {
+                            ids.push((display, 1));
+                            0
+                        }
+                    };
+                    let job = Job {
+                        msg: msg.clone(),
+                        display,
+                        epoch: t.epoch,
+                        flags: if has_key_frame(vf) { FLAG_KEY } else { 0 },
+                        queued,
+                        frame_id: Some(frame_id),
+                        fetched: Some(Fetched {
+                            hooks: hooks.clone(),
+                            display: vf.display.max(0) as usize,
+                            queued,
+                        }),
+                    };
+                    // A refused job drops its `Fetched`, which reports the frame as fetched;
+                    // its id is never sent, so the viewer sees a loss.
+                    if tx.try_send(job).is_err() {
                         shared.qdrop.fetch_add(1, Ordering::Relaxed);
                     }
+                    route.tcp = false;
                 }
-            }
+            },
             Some(message::Union::Misc(m))
                 if matches!(m.union, Some(misc::Union::SwitchDisplay(_))) =>
             {
-                // The viewer will hold frames of a newer epoch until it read the SwitchDisplay
-                // (M20); in shadow mode it only travels along.
+                // Live: the viewer holds UDP frames of the new epoch until it read this
+                // SwitchDisplay on TCP. Shadow: it only travels along.
                 t.epoch = t.epoch.wrapping_add(1);
             }
             _ => {}
         }
+        self.update_busy(t);
+        route
     }
 
-    fn activate(&self, tx: SyncSender<Job>, shared: Arc<Shared>, every: u32) {
+    fn update_busy(&self, t: &TapInner) {
+        let busy = !matches!(t.mode, TapMode::Off) || !t.pending.is_empty();
+        self.busy.store(busy, Ordering::Relaxed);
+    }
+
+    fn activate_shadow(&self, tx: SyncSender<Job>, shared: Arc<Shared>, every: u32) {
         if let Ok(mut t) = self.inner.lock() {
-            *t = TapInner {
-                tx: Some(tx),
-                shared: Some(shared),
+            t.mode = TapMode::Shadow {
+                tx,
+                shared,
                 every,
-                ..Default::default()
+                seen: Vec::new(),
             };
-            self.active.store(true, Ordering::Relaxed);
+            t.epoch = 0;
+            self.update_busy(&t);
         }
     }
 
-    fn deactivate(&self) {
-        self.active.store(false, Ordering::Relaxed);
+    fn activate_live(
+        &self,
+        tx: SyncSender<Job>,
+        shared: Arc<Shared>,
+        hooks: Arc<LiveHooks>,
+        lane_id: u64,
+    ) {
         if let Ok(mut t) = self.inner.lock() {
-            *t = TapInner::default();
+            t.mode = TapMode::Live {
+                tx,
+                shared,
+                hooks,
+                lane_id,
+                ids: Vec::new(),
+                announced: false,
+            };
+            self.update_busy(&t);
         }
+    }
+
+    /// Ends the mode. A live lane that announced itself leaves a STOP marker for the next video
+    /// item, with the id of the last frame given to UDP per display.
+    fn stop(&self, reason: &str) -> StopInfo {
+        let Ok(mut t) = self.inner.lock() else {
+            return StopInfo::default();
+        };
+        let mut info = StopInfo::default();
+        if let TapMode::Live {
+            lane_id,
+            ids,
+            announced,
+            ..
+        } = &t.mode
+        {
+            info.was_live = *announced;
+            if *announced {
+                let last_frames = ids
+                    .iter()
+                    .map(|(d, next)| UdpVideoLastFrame {
+                        display: *d as i32,
+                        frame_id: next.wrapping_sub(1),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                info.displays = ids.iter().map(|(d, _)| *d as i32).collect();
+                info.in_band = true;
+                let marker = control_msg(UdpVideoControl {
+                    kind: udp_video_control::Kind::KindStop.into(),
+                    lane_id: *lane_id,
+                    reason: reason.to_owned(),
+                    last_frames,
+                    in_band: true,
+                    ..Default::default()
+                });
+                t.pending.push(marker);
+            }
+        }
+        t.mode = TapMode::Off;
+        self.update_busy(&t);
+        info
     }
 }
 
@@ -216,31 +703,40 @@ impl ShadowTap {
 enum State {
     Offered,
     Active,
+    Stopped,
 }
 
 /// One connection's lane: socket, threads, and the tap it feeds while active.
 pub struct UdpVideoHost {
     conn_id: i32,
     lane_id: u64,
-    every: u32,
+    params: Params,
     state: State,
     offered_at: Instant,
-    tap: Arc<ShadowTap>,
+    tap: Arc<VideoTap>,
     shared: Arc<Shared>,
     job_tx: Option<SyncSender<Job>>,
+    hooks: Option<Arc<LiveHooks>>,
+    kf_reqs: VecDeque<Instant>,
+    live_counted: bool,
 }
 
 impl UdpVideoHost {
     /// Binds the lane socket on `local`, starts the threads, and returns the offer to send.
+    /// Live mode needs `hooks`.
     pub fn start(
         conn_id: i32,
-        tap: Arc<ShadowTap>,
+        tap: Arc<VideoTap>,
         local: IpAddr,
         viewer: IpAddr,
-        every: u32,
+        params: Params,
+        hooks: Option<Arc<LiveHooks>>,
     ) -> Result<(Self, UdpVideoOffer), String> {
-        let (socket, notes) = net::bind(local, 0, net::HOST_SNDBUF)
-            .map_err(|e| format!("bind {local}: {e}"))?;
+        if params.mode == Mode::Live && hooks.is_none() {
+            return Err("live mode without hooks".to_owned());
+        }
+        let (socket, notes) =
+            net::bind(local, 0, net::HOST_SNDBUF).map_err(|e| format!("bind {local}: {e}"))?;
         for n in notes {
             log::warn!("UDPVIDEO host conn={conn_id} socket option failed: {n}");
         }
@@ -248,67 +744,92 @@ impl UdpVideoHost {
             .local_addr()
             .map_err(|e| format!("local_addr: {e}"))?
             .port();
-        let secret: [u8; SECRET_LEN] =
-            hbb_common::sodiumoxide::crypto::secretbox::gen_key().0;
+        let secret: [u8; SECRET_LEN] = hbb_common::sodiumoxide::crypto::secretbox::gen_key().0;
         let lane_id: u64 = hbb_common::rand::random();
         let socket = Arc::new(socket);
-        let shared = Arc::new(Shared::default());
+        let clock = LaneClock::new();
+        let shared = Arc::new(Shared::new(clock));
         let sender = Arc::new(Mutex::new(LaneSender::new(
             &secret,
             lane_id,
             Role::Host,
             PATH,
         )));
-        let clock = LaneClock::new();
-        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(QUEUE);
+        let queue = match params.mode {
+            Mode::Shadow => QUEUE,
+            Mode::Live => LIVE_QUEUE,
+        };
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(queue);
         {
             let (socket, sender, shared) = (socket.clone(), sender.clone(), shared.clone());
             std::thread::Builder::new()
                 .name("udp-video-host-rx".to_owned())
                 .spawn(move || {
                     recv_loop(
-                        &socket, &sender, &shared, &secret, lane_id, viewer, conn_id, clock,
+                        &socket,
+                        &sender,
+                        &shared,
+                        &secret,
+                        lane_id,
+                        viewer,
+                        conn_id,
+                        params.mode,
                     )
                 })
                 .map_err(|e| format!("spawn: {e}"))?;
         }
         let tx_shared = shared.clone();
+        let tx_hooks = hooks.clone();
         let spawned = std::thread::Builder::new()
             .name("udp-video-host-tx".to_owned())
             .spawn(move || {
-                send_loop(&socket, &sender, &tx_shared, job_rx, conn_id, lane_id, clock)
+                send_loop(
+                    &socket, &sender, &tx_shared, job_rx, conn_id, lane_id, params, tx_hooks,
+                )
             });
         if let Err(e) = spawned {
             // The receive thread is already running: stop it.
             shared.stop.store(true, Ordering::Relaxed);
             return Err(format!("spawn: {e}"));
         }
+        let mode = match params.mode {
+            Mode::Shadow => udp_video_offer::Mode::ModeShadow,
+            Mode::Live => udp_video_offer::Mode::ModeLive,
+        };
         let offer = UdpVideoOffer {
             version: LANE_VERSION,
-            mode: udp_video_offer::Mode::ModeShadow.into(),
+            mode: mode.into(),
             lane_id,
             secret: secret.to_vec().into(),
             ip: net::ip_to_bytes(local).into(),
             port: port as u32,
             max_datagram: PATH.max_datagram() as u32,
-            shadow_every: every,
+            shadow_every: params.every,
+            timeout_ms: params.timeout.as_millis() as u32,
             ..Default::default()
         };
         log::info!(
-            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode=shadow addr={} every={every} viewer={viewer} installed={}",
+            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} viewer={viewer} installed={}",
+            params.mode.label(),
             SocketAddr::new(local, port),
+            params.every,
+            params.burst,
+            params.timeout.as_millis(),
             installed()
         );
         Ok((
             Self {
                 conn_id,
                 lane_id,
-                every,
+                params,
                 state: State::Offered,
                 offered_at: Instant::now(),
                 tap,
                 shared,
                 job_tx: Some(job_tx),
+                hooks,
+                kf_reqs: VecDeque::new(),
+                live_counted: false,
             },
             offer,
         ))
@@ -318,7 +839,22 @@ impl UdpVideoHost {
         self.lane_id
     }
 
-    /// The viewer's READY: start copying frames. Err when it does not fit this lane.
+    #[cfg(test)]
+    pub(crate) fn acks_seen(&self) -> u64 {
+        self.shared.acks.load(Ordering::Relaxed)
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.params.mode
+    }
+
+    /// Live and carrying video now.
+    pub fn is_live_active(&self) -> bool {
+        self.params.mode == Mode::Live && self.state == State::Active
+    }
+
+    /// The viewer's READY: start copying (shadow) or carrying (live) frames. Err when it does
+    /// not fit this lane.
     pub fn on_ready(&mut self, lane_id: u64) -> Result<(), String> {
         if lane_id != self.lane_id {
             return Err(format!("READY for another lane {lane_id:016x}"));
@@ -333,23 +869,52 @@ impl UdpVideoHost {
         let Some(tx) = self.job_tx.take() else {
             return Err("lane already used".to_owned());
         };
-        self.tap.activate(tx, self.shared.clone(), self.every);
+        match (self.params.mode, &self.hooks) {
+            (Mode::Live, Some(hooks)) => {
+                self.tap
+                    .activate_live(tx, self.shared.clone(), hooks.clone(), self.lane_id);
+                LIVE_LANES.fetch_add(1, Ordering::Relaxed);
+                self.live_counted = true;
+                // The viewer is heard from now on (pings, ACKs); silence counts from here.
+                self.shared.heard();
+            }
+            _ => self
+                .tap
+                .activate_shadow(tx, self.shared.clone(), self.params.every),
+        }
         self.state = State::Active;
         log::info!(
-            "UDPVIDEO host conn={} active lane={:016x} mode=shadow peer={} every={} after_ms={}",
+            "UDPVIDEO host conn={} active lane={:016x} mode={} peer={} every={} after_ms={}",
             self.conn_id,
             self.lane_id,
+            self.params.mode.label(),
             peer,
-            self.every,
+            self.params.every,
             self.offered_at.elapsed().as_millis()
         );
         Ok(())
     }
 
-    /// Called every second: Err(reason) when the handshake timed out.
+    /// Called every second: Err(reason) when the lane must end (handshake timeout; live: the
+    /// viewer silent for `timeout`, the socket failing).
     pub fn check(&self) -> Result<(), String> {
-        if self.state != State::Offered || self.offered_at.elapsed() < HANDSHAKE_TIMEOUT {
-            return Ok(());
+        match self.state {
+            State::Offered if self.offered_at.elapsed() >= HANDSHAKE_TIMEOUT => {}
+            State::Active if self.params.mode == Mode::Live => {
+                if let Some(e) = self.shared.fatal.lock().ok().and_then(|f| f.clone()) {
+                    return Err(e);
+                }
+                if let Some(silent) = self.shared.silent_for() {
+                    if silent >= self.params.timeout {
+                        return Err(format!(
+                            "no datagram from the viewer in {} ms",
+                            silent.as_millis()
+                        ));
+                    }
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
         let hellos = self.shared.hellos.load(Ordering::Relaxed);
         if hellos == 0 {
@@ -371,18 +936,85 @@ impl UdpVideoHost {
             ))
         }
     }
+
+    /// The viewer's loss report. Ok(Some(display)): ask the capture loop of that display for a
+    /// key frame. Err: sustained loss, the lane must end.
+    pub fn on_feedback(&mut self, f: &UdpVideoFeedback) -> Result<Option<usize>, String> {
+        if f.lane_id != self.lane_id || !self.is_live_active() || !f.request_keyframe {
+            return Ok(None);
+        }
+        self.shared.kf_req.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        self.kf_reqs.push_back(now);
+        while let Some(t) = self.kf_reqs.front() {
+            if now.saturating_duration_since(*t) > KF_WINDOW {
+                self.kf_reqs.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.kf_reqs.len() >= KF_MAX {
+            return Err(format!(
+                "sustained loss: {} key frame requests in {} s (last: display {} frames {}..={})",
+                self.kf_reqs.len(),
+                KF_WINDOW.as_secs(),
+                f.display,
+                f.lost_from,
+                f.lost_to
+            ));
+        }
+        Ok(Some(f.display.max(0) as usize))
+    }
+
+    /// The delay sample for `video_qos` while the lane is live: the TCP probe's own delay plus
+    /// the largest queueing excess the ACK round trips showed since the last sample, plus
+    /// `LOSS_PENALTY_MS` if the viewer lost frames since. None when not live (TCP decides).
+    pub fn qos_delay(&self, tcp_ms: u32) -> Option<u32> {
+        if !self.is_live_active() {
+            return None;
+        }
+        let mut live = self.shared.live.lock().ok()?;
+        let excess_ms = std::mem::take(&mut live.excess_max) / 1000;
+        let lost = std::mem::take(&mut live.lost);
+        Some(
+            tcp_ms
+                .saturating_add(excess_ms)
+                .saturating_add(if lost > 0 { LOSS_PENALTY_MS } else { 0 }),
+        )
+    }
+
+    /// Ends the lane (the threads stop when it is dropped). Idempotent.
+    pub fn shutdown(&mut self, why: &str) -> StopInfo {
+        if self.state == State::Stopped {
+            return StopInfo::default();
+        }
+        let active = self.state == State::Active;
+        self.state = State::Stopped;
+        let info = if active {
+            self.tap.stop(why)
+        } else {
+            StopInfo::default()
+        };
+        if self.live_counted {
+            self.live_counted = false;
+            LIVE_LANES.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.job_tx = None;
+        info
+    }
 }
 
 impl Drop for UdpVideoHost {
     fn drop(&mut self) {
-        self.tap.deactivate();
-        self.shared.stop.store(true, Ordering::Relaxed);
-        // `job_tx`, if still here, goes with self; the sender thread sees the channel close.
+        let state = self.state;
+        self.shutdown("lane dropped");
         log::info!(
-            "UDPVIDEO host conn={} closed lane={:016x} state={:?}",
+            "UDPVIDEO host conn={} closed lane={:016x} mode={} state={:?}",
             self.conn_id,
             self.lane_id,
-            self.state
+            self.params.mode.label(),
+            state
         );
     }
 }
@@ -407,8 +1039,15 @@ fn recv_loop(
     lane_id: u64,
     viewer: IpAddr,
     conn_id: i32,
-    clock: LaneClock,
+    mode: Mode,
 ) {
+    // Live: qWAVE AudioVideo marking (DSCP 40, WMM video) once the socket is connected; dropped
+    // at the end of this function, while the socket is still open.
+    #[cfg(windows)]
+    let mut _qos: Option<crate::platform::windows_qos::UdpQos> = None;
+    #[cfg(not(windows))]
+    let _ = mode;
+    let clock = shared.clock;
     let mut rx = LaneReceiver::new(secret, lane_id, Role::Host, Default::default());
     let _ = socket.set_read_timeout(Some(net::RECV_TIMEOUT_IDLE));
     let mut buf = [0u8; 2048];
@@ -431,7 +1070,12 @@ fn recv_loop(
             shared.refused.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let reply = match rx.on_datagram(&mut buf[..n], Instant::now()) {
+        let now = Instant::now();
+        let received = rx.on_datagram(&mut buf[..n], now);
+        if received.is_ok() && connected {
+            shared.heard();
+        }
+        let reply = match received {
             Ok(Received::Hello { lane_id: l }) if l == lane_id => {
                 shared.hellos.fetch_add(1, Ordering::Relaxed);
                 if !connected {
@@ -442,6 +1086,21 @@ fn recv_loop(
                     connected = true;
                     if let Ok(mut p) = shared.peer.lock() {
                         *p = Some(src);
+                    }
+                    #[cfg(windows)]
+                    if mode == Mode::Live {
+                        match crate::platform::windows_qos::mark_udp(socket) {
+                            Some(Ok(q)) => {
+                                _qos = Some(q);
+                                log::info!(
+                                    "UDPVIDEO host conn={conn_id} qWAVE AudioVideo flow added"
+                                );
+                            }
+                            Some(Err(e)) => {
+                                log::warn!("UDPVIDEO host conn={conn_id} qWAVE marking failed: {e}")
+                            }
+                            None => {}
+                        }
                     }
                     log::info!(
                         "UDPVIDEO host conn={conn_id} HELLO from {src} lane={lane_id:016x} at_us={}",
@@ -456,6 +1115,10 @@ fn recv_loop(
                     id,
                     echo_us: send_us,
                 }
+            }
+            Ok(Received::Ack(a)) => {
+                shared.on_ack(&a, clock.us(now), now);
+                continue;
             }
             Ok(_) => continue,
             Err(_) => {
@@ -476,7 +1139,9 @@ fn seal_send(
     inner: &Inner,
     send: impl FnOnce(&[u8]) -> io::Result<usize>,
 ) -> Result<usize, String> {
-    let mut s = sender.lock().map_err(|_| "lane sender lock poisoned".to_owned())?;
+    let mut s = sender
+        .lock()
+        .map_err(|_| "lane sender lock poisoned".to_owned())?;
     let d = s.seal(inner).map_err(|e| format!("seal: {e:?}"))?;
     send(&d).map_err(|e| e.to_string())
 }
@@ -491,8 +1156,67 @@ struct Window {
     first_error: Option<String>,
     send: Samples,
     lag: Samples,
+    /// Live: time spent waiting for the pacer per frame.
+    paced: Samples,
 }
 
+/// Live pacing state of the sender thread.
+struct Pacing {
+    burst: usize,
+    pacer: Pacer,
+    waiter: Waiter,
+    /// Frame interval estimate from the jobs' queue times (EWMA).
+    interval: Duration,
+    last_queued: Option<Instant>,
+    /// Bytes sent since `rate_since`, for the bitrate term.
+    rate_bytes: u64,
+    rate_since: Instant,
+    rate_bps: u64,
+    /// Datagram send errors in a row.
+    errors_in_row: u32,
+}
+
+impl Pacing {
+    fn new(burst: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            burst,
+            pacer: Pacer::new(0.0, burst.max(1) * PATH.max_datagram(), now),
+            waiter: Waiter::new(),
+            interval: Duration::from_micros(16_667),
+            last_queued: None,
+            rate_bytes: 0,
+            rate_since: now,
+            rate_bps: 0,
+            errors_in_row: 0,
+        }
+    }
+
+    /// Updates the rate for a frame of `bytes` queued at `queued`.
+    fn on_frame(&mut self, bytes: usize, queued: Instant, now: Instant) {
+        if let Some(last) = self.last_queued {
+            let dt = queued.saturating_duration_since(last);
+            if dt > Duration::ZERO {
+                let dt = dt.clamp(Duration::from_millis(4), Duration::from_millis(100));
+                self.interval = (self.interval * 7 + dt) / 8;
+            }
+        }
+        self.last_queued = Some(queued);
+        let span = now.saturating_duration_since(self.rate_since);
+        if span >= Duration::from_secs(1) {
+            self.rate_bps = (self.rate_bytes as f64 * 8.0 / span.as_secs_f64()) as u64;
+            self.rate_bytes = 0;
+            self.rate_since = now;
+        }
+        self.rate_bytes += bytes as u64;
+        if self.burst > 0 {
+            let rate = pacing::target_rate(self.rate_bps, bytes, self.interval);
+            self.pacer.set_rate(rate, now);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_loop(
     socket: &UdpSocket,
     sender: &Mutex<LaneSender>,
@@ -500,30 +1224,221 @@ fn send_loop(
     jobs: Receiver<Job>,
     conn_id: i32,
     lane_id: u64,
-    clock: LaneClock,
+    params: Params,
+    hooks: Option<Arc<LiveHooks>>,
 ) {
-    // Next lane frame id per display: consecutive over the frames actually sent, so a copy the
-    // tap dropped is not counted as loss by the viewer.
+    let clock = shared.clock;
+    // Shadow: next lane frame id per display, consecutive over the frames actually sent, so a
+    // copy the tap dropped is not counted as loss by the viewer. Live ids come from the tap.
     let mut ids: Vec<(u8, u32)> = Vec::new();
     let mut w = Window::default();
+    let mut pacing = (params.mode == Mode::Live).then(|| Pacing::new(params.burst));
+    if let Some(p) = &pacing {
+        log::info!(
+            "UDPVIDEO host conn={conn_id} lane={lane_id:016x} pacing burst={} hires_timer={}",
+            p.burst,
+            p.waiter.high_resolution()
+        );
+    }
     let mut last_log = Instant::now();
     loop {
-        match jobs.recv_timeout(Duration::from_secs(1)) {
-            Ok(job) => send_job(sender, &mut ids, &mut w, job, clock, |d| socket.send(d)),
+        // A frame held by the window is checked every 5 ms for WINDOW_WAIT_MAX.
+        let wait = if pacing.is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        match jobs.recv_timeout(wait) {
+            Ok(mut job) => match (&mut pacing, job.frame_id) {
+                (Some(p), Some(frame_id)) => {
+                    let fetched = job.fetched.take();
+                    // Before the first datagram: an ACK for this frame may come back while its
+                    // last bursts are still being paced, and must not be clamped below it.
+                    if let Ok(mut live) = shared.live.lock() {
+                        live.disp(job.display).last_sent = Some(frame_id);
+                    }
+                    let sent =
+                        send_live(sender, p, &mut w, &job, frame_id, clock, |d| socket.send(d));
+                    if let (true, Some(hooks)) = (sent.is_some(), &hooks) {
+                        (hooks.sent)(&job.msg, sent.unwrap_or_default());
+                    }
+                    if p.errors_in_row >= SEND_ERRORS_MAX {
+                        if let Ok(mut f) = shared.fatal.lock() {
+                            f.get_or_insert_with(|| {
+                                format!(
+                                    "{} datagram sends failed in a row: {}",
+                                    p.errors_in_row,
+                                    w.first_error.clone().unwrap_or_default()
+                                )
+                            });
+                        }
+                    }
+                    on_live_sent(shared, job.display, frame_id, fetched);
+                }
+                _ => send_job(sender, &mut ids, &mut w, job, clock, |d| socket.send(d)),
+            },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
+        if pacing.is_some() {
+            expire_window(shared);
+        }
         if last_log.elapsed() >= LOG_EVERY {
-            log_window(conn_id, lane_id, shared, &mut w, last_log.elapsed());
+            log_window(
+                conn_id,
+                lane_id,
+                params.mode,
+                shared,
+                &mut w,
+                last_log.elapsed(),
+            );
             last_log = Instant::now();
         }
     }
     if w.frames > 0 {
-        log_window(conn_id, lane_id, shared, &mut w, last_log.elapsed());
+        log_window(
+            conn_id,
+            lane_id,
+            params.mode,
+            shared,
+            &mut w,
+            last_log.elapsed(),
+        );
     }
+    // A frame still held by the window is reported fetched as the lane state goes.
+    if let Ok(mut live) = shared.live.lock() {
+        for d in live.displays.iter_mut() {
+            d.pending = None;
+        }
+    }
+}
+
+/// A live frame is out: report it fetched now if the window allows, else hold it.
+fn on_live_sent(shared: &Shared, display: u8, frame_id: u32, fetched: Option<Fetched>) {
+    let Ok(mut live) = shared.live.lock() else {
+        return;
+    };
+    let d = live.disp(display);
+    d.last_sent = Some(frame_id);
+    let inflight = d.inflight();
+    // An older held frame goes now: only the newest waits.
+    let older = d.pending.take();
+    if inflight > WINDOW_FRAMES {
+        d.pending = fetched.map(|f| (f, Instant::now()));
+    } else {
+        drop(fetched);
+    }
+    live.inflight_max = live.inflight_max.max(inflight);
+    if let Some((f, since)) = older {
+        live.win_wait.push_duration(since.elapsed());
+        drop(f);
+    }
+}
+
+/// Releases frames the window held longer than `WINDOW_WAIT_MAX`.
+fn expire_window(shared: &Shared) {
+    let Ok(mut live) = shared.live.lock() else {
+        return;
+    };
+    let mut expired = Vec::new();
+    for d in live.displays.iter_mut() {
+        if d.pending
+            .as_ref()
+            .map_or(false, |(_, since)| since.elapsed() >= WINDOW_WAIT_MAX)
+        {
+            expired.extend(d.pending.take());
+        }
+    }
+    for (f, since) in expired {
+        live.win_timeouts += 1;
+        live.win_wait.push_duration(since.elapsed());
+        drop(f);
+    }
+}
+
+/// Seals and sends one live frame in paced bursts. Returns the send time (first datagram to
+/// last, pacing included) if the frame got to the socket.
+fn send_live(
+    sender: &Mutex<LaneSender>,
+    p: &mut Pacing,
+    w: &mut Window,
+    job: &Job,
+    frame_id: u32,
+    clock: LaneClock,
+    mut send: impl FnMut(&[u8]) -> io::Result<usize>,
+) -> Option<Duration> {
+    let begin = Instant::now();
+    w.lag
+        .push_duration(begin.saturating_duration_since(job.queued));
+    let bytes = match job.msg.write_to_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            w.errors += 1;
+            w.first_error
+                .get_or_insert_with(|| format!("serialize: {e}"));
+            return None;
+        }
+    };
+    p.on_frame(bytes.len(), job.queued, begin);
+    let meta = FrameMeta {
+        frame_id,
+        display: job.display,
+        epoch: job.epoch,
+        flags: job.flags,
+        send_us: clock.now_us(),
+    };
+    let parts = match fragment(&bytes, meta, PATH.max_fragment_payload()) {
+        Ok(p) => p,
+        Err(e) => {
+            w.errors += 1;
+            w.first_error
+                .get_or_insert_with(|| format!("fragment: {e:?}"));
+            return None;
+        }
+    };
+    let burst = if p.burst == 0 { parts.len() } else { p.burst };
+    let mut paced = Duration::ZERO;
+    let mut any_sent = false;
+    for chunk in parts.chunks(burst.max(1)) {
+        if p.burst > 0 {
+            let chunk_bytes = chunk
+                .iter()
+                .map(|(_, payload)| payload.len() + super::packet::VIDEO_OVERHEAD)
+                .sum();
+            let now = Instant::now();
+            let delay = p.pacer.schedule(chunk_bytes, now);
+            if delay > Duration::ZERO {
+                p.waiter.wait_until(now + delay);
+                paced += delay;
+            }
+        }
+        for (h, payload) in chunk {
+            match seal_send(sender, &Inner::Video(*h, payload), &mut send) {
+                Ok(n) => {
+                    w.dgrams += 1;
+                    w.bytes += n as u64;
+                    p.errors_in_row = 0;
+                    any_sent = true;
+                }
+                Err(e) => {
+                    w.errors += 1;
+                    p.errors_in_row += 1;
+                    w.first_error.get_or_insert(e);
+                }
+            }
+        }
+    }
+    w.frames += 1;
+    if job.flags & FLAG_KEY != 0 {
+        w.keys += 1;
+    }
+    let took = begin.elapsed();
+    w.send.push_duration(took);
+    w.paced.push_duration(paced);
+    any_sent.then_some(took)
 }
 
 fn send_job(
@@ -535,12 +1450,14 @@ fn send_job(
     mut send: impl FnMut(&[u8]) -> io::Result<usize>,
 ) {
     let begin = Instant::now();
-    w.lag.push_duration(begin.saturating_duration_since(job.queued));
+    w.lag
+        .push_duration(begin.saturating_duration_since(job.queued));
     let bytes = match job.msg.write_to_bytes() {
         Ok(b) => b,
         Err(e) => {
             w.errors += 1;
-            w.first_error.get_or_insert_with(|| format!("serialize: {e}"));
+            w.first_error
+                .get_or_insert_with(|| format!("serialize: {e}"));
             return;
         }
     };
@@ -568,7 +1485,8 @@ fn send_job(
         Ok(p) => p,
         Err(e) => {
             w.errors += 1;
-            w.first_error.get_or_insert_with(|| format!("fragment: {e:?}"));
+            w.first_error
+                .get_or_insert_with(|| format!("fragment: {e:?}"));
             return;
         }
     };
@@ -591,12 +1509,49 @@ fn send_job(
     w.send.push_duration(begin.elapsed());
 }
 
-fn log_window(conn_id: i32, lane_id: u64, shared: &Shared, w: &mut Window, span: Duration) {
+fn log_window(
+    conn_id: i32,
+    lane_id: u64,
+    mode: Mode,
+    shared: &Shared,
+    w: &mut Window,
+    span: Duration,
+) {
     let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+    let live = if mode == Mode::Live {
+        match shared.live.lock() {
+            Ok(mut guard) => {
+                let l = &mut *guard;
+                let base = l.baseline();
+                let s = format!(
+                    " paced_ms={} win_wait_ms={} win_to={} inflight_max={} acks={} ack_rtt_ms={} base_ms={} vlost={} kf_req={}",
+                    w.paced.ms3(),
+                    l.win_wait.ms3(),
+                    l.win_timeouts,
+                    l.inflight_max,
+                    take(&shared.acks),
+                    l.rtt.ms3(),
+                    base.map_or("-".to_owned(), |b| format!("{:.1}", b as f64 / 1000.0)),
+                    l.lost_win,
+                    take(&shared.kf_req),
+                );
+                l.win_wait = Samples::default();
+                l.rtt = Samples::default();
+                l.win_timeouts = 0;
+                l.inflight_max = 0;
+                l.lost_win = 0;
+                s
+            }
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
     log::info!(
-        "UDPVIDEO host conn={} lane={:016x} win_s={:.1} frames={} keys={} skipped={} qdrop={} dgrams={} kB={} send_ms={} lag_ms={} err={} pings={} refused={}{}",
+        "UDPVIDEO host conn={} lane={:016x} mode={} win_s={:.1} frames={} keys={} skipped={} qdrop={} dgrams={} kB={} send_ms={} lag_ms={} err={} pings={} refused={}{}{}",
         conn_id,
         lane_id,
+        mode.label(),
         span.as_secs_f64(),
         w.frames,
         w.keys,
@@ -609,6 +1564,7 @@ fn log_window(conn_id: i32, lane_id: u64, shared: &Shared, w: &mut Window, span:
         w.errors,
         take(&shared.pings),
         take(&shared.refused),
+        live,
         w.first_error
             .as_ref()
             .map(|e| format!(" first_err=\"{e}\""))
@@ -620,7 +1576,7 @@ fn log_window(conn_id: i32, lane_id: u64, shared: &Shared, w: &mut Window, span:
 #[cfg(test)]
 pub(crate) mod latency_tests {
     use super::*;
-    use base::message_proto::{EncodedVideoFrame, EncodedVideoFrames, Misc, SwitchDisplay};
+    use base::message_proto::{EncodedVideoFrame, EncodedVideoFrames, SwitchDisplay};
 
     pub(crate) fn video(display: i32, pts: i64, key: bool) -> Arc<Message> {
         let mut frames = EncodedVideoFrames::new();
@@ -638,6 +1594,35 @@ pub(crate) mod latency_tests {
         Arc::new(msg)
     }
 
+    pub(crate) fn switch_display() -> Arc<Message> {
+        let mut sd = Misc::new();
+        sd.set_switch_display(SwitchDisplay::new());
+        let mut m = Message::new();
+        m.set_misc(sd);
+        Arc::new(m)
+    }
+
+    /// Live hooks that count fetched reports per display.
+    pub(crate) fn counting_hooks() -> (Arc<LiveHooks>, Arc<Mutex<Vec<usize>>>) {
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let f2 = fetched.clone();
+        let hooks = Arc::new(LiveHooks {
+            fetched: Box::new(move |d, _| f2.lock().unwrap().push(d)),
+            sent: Box::new(|_, _| {}),
+        });
+        (hooks, fetched)
+    }
+
+    fn control_of(m: &Message) -> &UdpVideoControl {
+        match &m.union {
+            Some(message::Union::Misc(misc)) => match &misc.union {
+                Some(misc::Union::UdpVideoControl(c)) => c,
+                _ => panic!("not a lane control"),
+            },
+            _ => panic!("not a misc"),
+        }
+    }
+
     fn gate(local: &str, peer: &str) -> Gate {
         Gate {
             direct_tcp: true,
@@ -652,7 +1637,10 @@ pub(crate) mod latency_tests {
         let ok = gate("192.168.1.5:21118", "192.168.1.9:50000");
         assert_eq!(
             offer_gate(&ok),
-            Ok(("192.168.1.5".parse().unwrap(), "192.168.1.9".parse().unwrap()))
+            Ok((
+                "192.168.1.5".parse().unwrap(),
+                "192.168.1.9".parse().unwrap()
+            ))
         );
         let mapped = gate("[::ffff:10.0.0.2]:21118", "10.0.0.3:1");
         assert_eq!(
@@ -676,23 +1664,43 @@ pub(crate) mod latency_tests {
     }
 
     #[test]
+    fn latency_params_and_mode_options() {
+        assert_eq!(mode_from_option("Y"), Some(Mode::Live));
+        assert_eq!(mode_from_option("shadow"), Some(Mode::Shadow));
+        assert_eq!(mode_from_option(""), None);
+        assert_eq!(mode_from_option("N"), None);
+        let p = Params::from_options(Mode::Live, "", "", "");
+        assert_eq!(
+            (p.every, p.burst, p.timeout),
+            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT)
+        );
+        let p = Params::from_options(Mode::Live, "5", "0", "300");
+        assert_eq!(
+            (p.every, p.burst, p.timeout),
+            (5, 0, Duration::from_millis(300))
+        );
+        let p = Params::from_options(Mode::Live, "61", "65", "100");
+        assert_eq!(
+            (p.every, p.burst, p.timeout),
+            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT)
+        );
+    }
+
+    #[test]
     fn tap_every_nth_per_display_and_epoch() {
-        let tap = ShadowTap::default();
+        let tap = VideoTap::default();
         let (tx, rx) = mpsc::sync_channel(64);
-        let shared = Arc::new(Shared::default());
-        // Inactive: nothing is taken.
-        tap.offer(&video(0, 1, true));
-        tap.activate(tx, shared.clone(), 2);
+        let shared = Arc::new(Shared::new(LaneClock::new()));
+        let now = Instant::now();
+        // Inactive: nothing is taken, everything goes to TCP.
+        assert!(tap.route(&video(0, 1, true), now).tcp);
+        tap.activate_shadow(tx, shared.clone(), 2);
         for pts in 0..6 {
-            tap.offer(&video(0, pts, pts == 0));
-            tap.offer(&video(1, pts, false));
+            assert!(tap.route(&video(0, pts, pts == 0), now).tcp);
+            assert!(tap.route(&video(1, pts, false), now).tcp);
         }
-        let mut sd = Misc::new();
-        sd.set_switch_display(SwitchDisplay::new());
-        let mut m = Message::new();
-        m.set_misc(sd);
-        tap.offer(&Arc::new(m));
-        tap.offer(&video(0, 6, false));
+        assert!(tap.route(&switch_display(), now).tcp);
+        tap.route(&video(0, 6, false), now);
         let jobs: Vec<Job> = rx.try_iter().collect();
         let got: Vec<(u8, i64, u8, u8)> = jobs
             .iter()
@@ -717,9 +1725,154 @@ pub(crate) mod latency_tests {
             ]
         );
         assert_eq!(shared.skipped.load(Ordering::Relaxed), 6);
-        tap.deactivate();
-        tap.offer(&video(0, 8, false));
+        // A shadow lane leaves no marker behind.
+        assert_eq!(tap.stop("test"), StopInfo::default());
+        let r = tap.route(&video(0, 8, false), now);
+        assert!(r.tcp && r.before.is_empty());
         assert!(rx.try_recv().is_err());
+        assert!(!tap.busy.load(Ordering::Relaxed));
+    }
+
+    /// Live: the first UDP frame brings the ACTIVE marker (in the video order, on TCP), frames
+    /// go to UDP only with ids from 0 per display, SwitchDisplay stays on TCP and bumps the
+    /// epoch, and stopping leaves an in-band STOP with the last ids for the next item, which
+    /// goes to TCP again.
+    #[test]
+    fn latency_live_tap_routes_and_markers() {
+        let tap = VideoTap::default();
+        let (tx, rx) = mpsc::sync_channel(64);
+        let shared = Arc::new(Shared::new(LaneClock::new()));
+        let (hooks, fetched) = counting_hooks();
+        let now = Instant::now();
+        tap.activate_live(tx, shared, hooks, 77);
+        let r = tap.route(&video(0, 0, true), now);
+        assert!(!r.tcp);
+        assert_eq!(r.before.len(), 1);
+        let c = control_of(&r.before[0]);
+        assert_eq!(
+            (c.kind.enum_value(), c.lane_id, c.epoch),
+            (Ok(udp_video_control::Kind::KindActive), 77, 0)
+        );
+        let r = tap.route(&video(0, 1, false), now);
+        assert!(!r.tcp && r.before.is_empty());
+        let r = tap.route(&switch_display(), now);
+        assert!(r.tcp && r.before.is_empty());
+        assert!(!tap.route(&video(1, 2, true), now).tcp);
+        assert!(!tap.route(&video(0, 3, false), now).tcp);
+        let jobs: Vec<(u8, Option<u32>, u8, u8)> = rx
+            .try_iter()
+            .map(|j| (j.display, j.frame_id, j.epoch, j.flags))
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![
+                (0, Some(0), 0, FLAG_KEY),
+                (0, Some(1), 0, 0),
+                (1, Some(0), 1, FLAG_KEY),
+                (0, Some(2), 1, 0),
+            ]
+        );
+        // The jobs (and their fetched guards) were dropped with the iterator: all reported.
+        assert_eq!(fetched.lock().unwrap().len(), 4);
+        let info = tap.stop("test stop");
+        assert!(info.in_band && info.was_live);
+        assert_eq!(info.displays, vec![0, 1]);
+        assert!(tap.busy.load(Ordering::Relaxed));
+        let r = tap.route(&video(0, 4, true), now);
+        assert!(r.tcp);
+        assert_eq!(r.before.len(), 1);
+        let c = control_of(&r.before[0]);
+        assert_eq!(c.kind.enum_value(), Ok(udp_video_control::Kind::KindStop));
+        assert!(c.in_band);
+        let last: Vec<(i32, u32)> = c
+            .last_frames
+            .iter()
+            .map(|l| (l.display, l.frame_id))
+            .collect();
+        assert_eq!(last, vec![(0, 2), (1, 0)]);
+        assert!(!tap.busy.load(Ordering::Relaxed));
+    }
+
+    /// Live: a full queue drops the frame, reports it fetched at once and leaves its id unused.
+    #[test]
+    fn latency_live_full_queue_drops_and_reports_fetched() {
+        let tap = VideoTap::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared::new(LaneClock::new()));
+        let (hooks, fetched) = counting_hooks();
+        tap.activate_live(tx, shared.clone(), hooks, 1);
+        for pts in 0..3 {
+            assert!(!tap.route(&video(2, pts, false), Instant::now()).tcp);
+        }
+        assert_eq!(shared.qdrop.load(Ordering::Relaxed), 2);
+        assert_eq!(*fetched.lock().unwrap(), vec![2, 2]);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.frame_id, Some(0));
+        drop(job);
+        assert_eq!(fetched.lock().unwrap().len(), 3);
+    }
+
+    /// The send window: past WINDOW_FRAMES unsettled frames the newest is held (not fetched)
+    /// until an ACK settles enough, or until WINDOW_WAIT_MAX.
+    #[test]
+    fn latency_live_window_holds_until_ack() {
+        let shared = Shared::new(LaneClock::new());
+        let (hooks, fetched) = counting_hooks();
+        let guard = |d: usize| {
+            Some(Fetched {
+                hooks: hooks.clone(),
+                display: d,
+                queued: Instant::now(),
+            })
+        };
+        for id in 0..WINDOW_FRAMES {
+            on_live_sent(&shared, 0, id, guard(0));
+        }
+        assert_eq!(fetched.lock().unwrap().len(), 3);
+        // The fourth unsettled frame waits.
+        on_live_sent(&shared, 0, 3, guard(0));
+        assert_eq!(fetched.lock().unwrap().len(), 3);
+        let ack = |settled: u32, lost_total: u32| Ack {
+            display: 0,
+            settled,
+            has_settled: true,
+            echo_send_us: 0,
+            hold_us: ACK_NO_FRAME,
+            lost_total,
+        };
+        // Settling frame 0 leaves 3 in flight: released.
+        shared.on_ack(&ack(0, 1), 0, Instant::now());
+        assert_eq!(fetched.lock().unwrap().len(), 4);
+        // An ACK can never settle past what was sent.
+        shared.on_ack(&ack(100, 1), 0, Instant::now());
+        assert_eq!(shared.live.lock().unwrap().displays[0].settled, Some(3));
+        // Held again, then released by the timeout.
+        for id in 4..8 {
+            on_live_sent(&shared, 0, id, guard(0));
+        }
+        assert_eq!(fetched.lock().unwrap().len(), 7);
+        std::thread::sleep(WINDOW_WAIT_MAX + Duration::from_millis(5));
+        expire_window(&shared);
+        assert_eq!(fetched.lock().unwrap().len(), 8);
+        let l = shared.live.lock().unwrap();
+        assert_eq!((l.win_timeouts, l.lost, l.inflight_max), (1, 1, 4));
+    }
+
+    /// The QoS signal: excess over the baseline round trip and a loss penalty, once per sample.
+    #[test]
+    fn latency_live_qos_excess() {
+        let mut l = Live::default();
+        let t0 = Instant::now();
+        l.on_rtt(2_000, t0);
+        l.on_rtt(30_000, t0);
+        l.on_rtt(5_000, t0);
+        assert_eq!(l.baseline(), Some(2_000));
+        assert_eq!(l.excess_max, 28_000);
+        // The baseline window rotates: the old minimum is kept one more window.
+        l.on_rtt(9_000, t0 + BASE_WINDOW);
+        assert_eq!(l.baseline(), Some(2_000));
+        l.on_rtt(9_000, t0 + BASE_WINDOW * 2);
+        assert_eq!(l.baseline(), Some(9_000));
     }
 
     /// A PONG sealed by the receive thread while the sender thread is in the middle of a frame
@@ -754,6 +1907,8 @@ pub(crate) mod latency_tests {
             epoch: 0,
             flags: FLAG_SHADOW | FLAG_KEY,
             queued: Instant::now(),
+            frame_id: None,
+            fetched: None,
         };
         let (mut ids, mut w) = (Vec::new(), Window::default());
         let mut n = 0usize;
@@ -795,14 +1950,64 @@ pub(crate) mod latency_tests {
         assert_eq!(loss.datagrams_received, wire.len() as u64);
     }
 
+    /// Live sending in paced bursts: every datagram of a frame goes out in order, the bursts
+    /// are spaced by the pacer, and the frame is whole on the other end.
+    #[test]
+    fn latency_live_paced_bursts() {
+        use crate::udp_video::{fragment::Event, lane::LaneReceiver};
+        let secret = [4u8; SECRET_LEN];
+        let sender = Mutex::new(LaneSender::new(&secret, 12, Role::Host, PATH));
+        let msg = video(0, 60_000, true);
+        let bytes = msg.write_to_bytes().unwrap();
+        let job = Job {
+            msg,
+            display: 0,
+            epoch: 0,
+            flags: FLAG_KEY,
+            queued: Instant::now(),
+            frame_id: Some(0),
+            fetched: None,
+        };
+        let mut p = Pacing::new(4);
+        let mut w = Window::default();
+        let mut wire: Vec<(Instant, Vec<u8>)> = Vec::new();
+        let took = send_live(&sender, &mut p, &mut w, &job, 0, LaneClock::new(), |d| {
+            wire.push((Instant::now(), d.to_vec()));
+            Ok(d.len())
+        });
+        assert!(took.is_some());
+        let n = bytes.len().div_ceil(PATH.max_fragment_payload());
+        assert_eq!(wire.len(), n);
+        // 63 KB at the frame term (whole frame within ~8.3 ms): bursts of 4 datagrams are
+        // spaced, so the frame took a few milliseconds, not microseconds.
+        let span = wire.last().unwrap().0 - wire[0].0;
+        assert!(span >= Duration::from_millis(3), "{span:?}");
+        assert!(span <= Duration::from_millis(100), "{span:?}");
+        let mut rx = LaneReceiver::new(&secret, 12, Role::Viewer, Default::default());
+        let now = Instant::now();
+        for (_, mut d) in wire {
+            rx.on_datagram(&mut d, now).unwrap();
+        }
+        let frames: Vec<_> = rx
+            .poll(now)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Frame(f) => Some(f.data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![bytes]);
+        assert_eq!(w.errors, 0);
+    }
+
     #[test]
     fn tap_full_queue_drops() {
-        let tap = ShadowTap::default();
+        let tap = VideoTap::default();
         let (tx, _rx) = mpsc::sync_channel(1);
-        let shared = Arc::new(Shared::default());
-        tap.activate(tx, shared.clone(), 1);
+        let shared = Arc::new(Shared::new(LaneClock::new()));
+        tap.activate_shadow(tx, shared.clone(), 1);
         for pts in 0..3 {
-            tap.offer(&video(0, pts, false));
+            tap.route(&video(0, pts, false), Instant::now());
         }
         assert_eq!(shared.qdrop.load(Ordering::Relaxed), 2);
     }

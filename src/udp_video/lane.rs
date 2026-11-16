@@ -7,7 +7,7 @@ use super::{
     fragment::{
         fragment, Event, FragmentError, FrameMeta, LossStats, Reassembler, ReassemblyConfig,
     },
-    packet::{decode_inner, encode_inner, Inner, PathClass},
+    packet::{decode_inner, encode_inner, Ack, Inner, PathClass},
 };
 use std::time::Instant;
 
@@ -72,6 +72,7 @@ pub enum Received {
     HelloAck { lane_id: u64 },
     Ping { id: u32, send_us: u32 },
     Pong { id: u32, echo_us: u32 },
+    Ack(Ack),
 }
 
 /// Datagrams dropped before reassembly, by reason.
@@ -144,6 +145,7 @@ impl LaneReceiver {
             Inner::HelloAck { lane_id } => Received::HelloAck { lane_id },
             Inner::Ping { id, send_us } => Received::Ping { id, send_us },
             Inner::Pong { id, echo_us } => Received::Pong { id, echo_us },
+            Inner::Ack(a) => Received::Ack(a),
         })
     }
 

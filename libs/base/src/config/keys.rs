@@ -306,17 +306,30 @@ pub const OPTION_VIDEO_SNDBUF_KB: &str = "video-sndbuf-kb";
 // next connection; `rustdesk --option enable-split-session-io N` from a terminal session (never
 // split) turns it off. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
-// UDP video lane, shadow probe (roadmap M19, docs/UDP-VIDEO.md). The same key on both sides:
-// - Windows host, server option (Config), off by default: "Y" offers a UDP lane to a fork viewer
-//   that advertised one, after a remote-control login over direct, encrypted TCP with both
-//   addresses on the LAN. Video stays on TCP; a copy of every Nth frame also goes over UDP to be
-//   measured. Read at each login; `rustdesk --option enable-udp-video N` turns it off.
+// UDP video lane (roadmap M19 shadow probe, M20 live, docs/UDP-VIDEO.md). The same key on both
+// sides:
+// - Windows host, server option (Config), off by default. Offered to a fork viewer that
+//   advertised a lane, after a remote-control login over direct, encrypted TCP with both
+//   addresses on the LAN:
+//   "Y": live (M20): video frames go over UDP, everything else stays on TCP; falls back to TCP
+//        video in the same session on loss, socket errors or silence. Needs a viewer of lane v2;
+//        an older fork viewer gets no offer.
+//   "shadow": video stays on TCP; a copy of every Nth frame also goes over UDP to be measured.
+//   Read at each login; `rustdesk --option enable-udp-video N` turns it off.
 // - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising the lane
 //   (and refuses an offer), so a reconnect gives a plain TCP session without touching the host.
 pub const OPTION_ENABLE_UDP_VIDEO: &str = "enable-udp-video";
 // Windows host, server option: shadow mode copies one frame in this many to UDP (1..=60). Empty
 // or invalid: 2. Read at each offer.
 pub const OPTION_UDP_VIDEO_SHADOW_EVERY: &str = "udp-video-shadow-every";
+// Windows host, server option, live mode: datagrams the sender puts on the wire back to back
+// before it waits for the pacer (1..=64, "0" = unpaced, every frame at once). Empty or invalid:
+// 8 (about 11 KB). Read at each offer.
+pub const OPTION_UDP_VIDEO_BURST: &str = "udp-video-burst";
+// Windows host, server option, live mode: no authenticated datagram from the other end for this
+// many milliseconds ends the lane and video goes back to TCP (200..=10000). Empty or invalid:
+// 1000. Sent to the viewer in the offer, which uses it the same way. Read at each offer.
+pub const OPTION_UDP_VIDEO_TIMEOUT_MS: &str = "udp-video-timeout-ms";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";

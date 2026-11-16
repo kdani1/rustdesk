@@ -148,6 +148,11 @@ impl LaneClock {
     pub fn now_us(&self) -> u32 {
         self.us(Instant::now())
     }
+
+    /// Time since the lane started.
+    pub fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
 }
 
 /// `a - b` for two lane-clock values, as a signed number (valid within +-35 minutes).

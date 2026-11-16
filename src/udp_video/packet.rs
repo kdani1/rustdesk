@@ -72,6 +72,9 @@ pub enum PacketType {
     Fec = 4,
     Ping = 5,
     Pong = 6,
+    /// Viewer -> host, live mode (M20): how far a display's frames are settled, and the
+    /// timing of its last complete frame.
+    Ack = 7,
 }
 
 impl PacketType {
@@ -83,6 +86,7 @@ impl PacketType {
             4 => Self::Fec,
             5 => Self::Ping,
             6 => Self::Pong,
+            7 => Self::Ack,
             _ => return None,
         })
     }
@@ -112,6 +116,26 @@ pub struct VideoHeader {
     pub send_us: u32,
 }
 
+/// Viewer -> host, live mode: the state of one display's reassembly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Ack {
+    pub display: u8,
+    /// Every frame up to this id (wrapping) was delivered, dropped behind a loss, or declared
+    /// lost. Only valid with `has_settled`.
+    pub settled: u32,
+    pub has_settled: bool,
+    /// `send_us` of the last complete frame (0 with `hold_us` u32::MAX: none yet).
+    pub echo_send_us: u32,
+    /// Viewer time from that frame's first fragment to this ack, so the host can take it out of
+    /// its round trip.
+    pub hold_us: u32,
+    /// Frames of this display declared lost since the lane started (wrapping).
+    pub lost_total: u32,
+}
+
+/// `Ack::hold_us` when no frame completed yet.
+pub const ACK_NO_FRAME: u32 = u32::MAX;
+
 /// The decrypted inner part of a datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inner<'a> {
@@ -120,6 +144,7 @@ pub enum Inner<'a> {
     Video(VideoHeader, &'a [u8]),
     Ping { id: u32, send_us: u32 },
     Pong { id: u32, echo_us: u32 },
+    Ack(Ack),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +224,15 @@ pub fn encode_inner(inner: &Inner, out: &mut Vec<u8>) {
             out.push(PacketType::Pong as u8);
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&echo_us.to_le_bytes());
+        }
+        Inner::Ack(a) => {
+            out.push(PacketType::Ack as u8);
+            out.push(a.display);
+            out.push(a.has_settled as u8);
+            out.extend_from_slice(&a.settled.to_le_bytes());
+            out.extend_from_slice(&a.echo_send_us.to_le_bytes());
+            out.extend_from_slice(&a.hold_us.to_le_bytes());
+            out.extend_from_slice(&a.lost_total.to_le_bytes());
         }
     }
 }
@@ -282,6 +316,24 @@ pub fn decode_inner(bytes: &[u8]) -> Result<Inner<'_>, PacketError> {
                 Inner::Pong { id, echo_us: us }
             }
         }
+        PacketType::Ack => {
+            let display = r.u8()?;
+            let has_settled = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(PacketError::BadHeader),
+            };
+            let a = Ack {
+                display,
+                has_settled,
+                settled: r.u32()?,
+                echo_send_us: r.u32()?,
+                hold_us: r.u32()?,
+                lost_total: r.u32()?,
+            };
+            r.end()?;
+            Inner::Ack(a)
+        }
         PacketType::Fec => return Err(PacketError::Unsupported(PacketType::Fec)),
     };
     Ok(inner)
@@ -319,6 +371,14 @@ mod latency_tests {
             Inner::HelloAck { lane_id: u64::MAX },
             Inner::Ping { id: 1, send_us: 2 },
             Inner::Pong { id: 3, echo_us: 4 },
+            Inner::Ack(Ack {
+                display: 1,
+                settled: 0xFFFF_FFFE,
+                has_settled: true,
+                echo_send_us: 5,
+                hold_us: ACK_NO_FRAME,
+                lost_total: 6,
+            }),
         ] {
             let mut out = Vec::new();
             encode_inner(&inner, &mut out);

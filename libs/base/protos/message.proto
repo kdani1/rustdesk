@@ -85,7 +85,8 @@ message LoginRequest {
   bytes hwid = 14;
   string avatar = 17;
   // Fork-only (docs/UDP-VIDEO.md): the highest UDP video lane version this viewer supports,
-  // 0 or absent = none. Stock hosts ignore it, so they never offer a lane.
+  // 0 or absent = none, 1 = shadow mode only, 2 = live mode too. Stock hosts ignore it, so
+  // they never offer a lane.
   uint32 udp_video_version = 1001;
 }
 
@@ -885,10 +886,10 @@ message Misc {
     bool pointer_captured = 1001;
     // Fork-only UDP video lane (docs/UDP-VIDEO.md). Sent only to a peer that advertised
     // LoginRequest.udp_video_version; a stock peer parses an unknown tag as no union and ignores
-    // it. Fork tag plan: 1001 pointer_captured, 1002-1004 the UDP lane (1004 reserved for its
-    // per-frame feedback, M20), next free 1005.
+    // it. Fork tag plan: 1001 pointer_captured, 1002-1004 the UDP lane, next free 1005.
     UdpVideoOffer udp_video_offer = 1002;
     UdpVideoControl udp_video_control = 1003;
+    UdpVideoFeedback udp_video_feedback = 1004;
   }
 }
 
@@ -900,7 +901,8 @@ message UdpVideoOffer {
     // Video stays on the session stream; a copy of every Nth frame also goes over UDP, to be
     // measured and dropped by the viewer (M19).
     ModeShadow = 1;
-    // Reserved (M20): video over UDP.
+    // Video frames go over UDP only (M20); everything else stays on the session stream.
+    // Offered only to a viewer that advertised udp_video_version >= 2.
     ModeLive = 2;
   }
   uint32 version = 1;
@@ -914,6 +916,9 @@ message UdpVideoOffer {
   uint32 max_datagram = 7;
   // Shadow mode: one frame in this many is copied to UDP.
   uint32 shadow_every = 8;
+  // Live mode: no authenticated datagram from the other end for this long ends the lane
+  // (0 = the viewer's default).
+  uint32 timeout_ms = 9;
 }
 
 // Fork-only lane control, both directions over the session stream.
@@ -922,9 +927,12 @@ message UdpVideoControl {
     KindUnknown = 0;
     // Viewer -> host: HELLO_ACK arrived, the lane works; the host starts sending.
     KindReady = 1;
-    // Reserved (M20): host -> viewer, UDP video starts at the given frames.
+    // Live mode, host -> viewer, in the order of the video stream: every video frame after
+    // this marker comes over UDP, frame ids from 0 per display, with `epoch`.
     KindActive = 2;
-    // Host -> viewer: the host closed the lane.
+    // Host -> viewer: the host closed the lane. For a live lane that went active it comes in
+    // the order of the video stream, right before the first video frame on TCP again, with
+    // `last_frames`.
     KindStop = 3;
     // Viewer -> host: please close the lane (handshake failed, offer refused, viewer closing).
     KindRequestStop = 4;
@@ -932,6 +940,28 @@ message UdpVideoControl {
   Kind kind = 1;
   uint64 lane_id = 2;
   string reason = 3;
+  // KindActive: the epoch byte of the UDP frames that follow; bumped once per SwitchDisplay
+  // the viewer reads after this marker.
+  uint32 epoch = 4;
+  // KindStop of a live lane: the id of the last frame given to UDP, per display that had any.
+  repeated UdpVideoLastFrame last_frames = 5;
+  // KindStop of a live lane: comes in the order of the video stream (see KindStop).
+  bool in_band = 6;
+}
+
+message UdpVideoLastFrame {
+  int32 display = 1;
+  uint32 frame_id = 2;
+}
+
+// Fork-only, viewer -> host over the session stream, live mode: frames of a display were lost
+// on the lane; the viewer shows nothing of that display until a key frame.
+message UdpVideoFeedback {
+  uint64 lane_id = 1;
+  int32 display = 2;
+  bool request_keyframe = 3;
+  uint32 lost_from = 4;
+  uint32 lost_to = 5;
 }
 
 message VoiceCallRequest {

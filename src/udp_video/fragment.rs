@@ -90,6 +90,10 @@ pub struct ReassemblyConfig {
     pub max_ahead: u32,
     pub max_frame_len: usize,
     pub gate_after_loss: bool,
+    /// Where a display starts when its first fragment arrives. None: at that fragment's frame
+    /// (shadow mode). Live mode starts every display at 0, the id of the first frame the host
+    /// gives the lane, so a lost first frame is a loss like any other.
+    pub first_frame_id: Option<u32>,
 }
 
 impl Default for ReassemblyConfig {
@@ -100,6 +104,7 @@ impl Default for ReassemblyConfig {
             max_ahead: 64,
             max_frame_len: MAX_FRAME_LEN,
             gate_after_loss: true,
+            first_frame_id: None,
         }
     }
 }
@@ -213,6 +218,8 @@ struct DisplayState {
     /// Sorted by frame_id (wrapping), all at or after `next_id`.
     pending: Vec<PendingFrame>,
     awaiting_recovery: bool,
+    /// A frame was released (delivered, gated or declared lost), so `next_id - 1` is settled.
+    released: bool,
 }
 
 pub struct Reassembler {
@@ -246,7 +253,32 @@ impl Reassembler {
             next_id: first_frame_id,
             pending: Vec::new(),
             awaiting_recovery: false,
+            released: false,
         });
+    }
+
+    /// The last frame of `display` that is settled: delivered, dropped behind a loss, or
+    /// declared lost. None before the first.
+    pub fn settled(&self, display: u8) -> Option<u32> {
+        self.displays
+            .iter()
+            .find(|d| d.display == display && d.released)
+            .map(|d| d.next_id.wrapping_sub(1))
+    }
+
+    /// Drops frames of `display` until a key or recovery-point frame, as after a loss: the
+    /// caller could not use a frame that was delivered (it did not parse).
+    pub fn force_recovery(&mut self, display: u8) {
+        if let Some(d) = self.displays.iter_mut().find(|d| d.display == display) {
+            d.awaiting_recovery = true;
+        }
+    }
+
+    /// Whether `display` drops frames until a key or recovery-point frame.
+    pub fn awaiting_recovery(&self, display: u8) -> bool {
+        self.displays
+            .iter()
+            .any(|d| d.display == display && d.awaiting_recovery)
     }
 
     /// Records the lane seq of an authenticated datagram, for reorder and datagram loss.
@@ -282,7 +314,7 @@ impl Reassembler {
             return;
         }
         if !self.displays.iter().any(|d| d.display == h.display) {
-            self.start_display(h.display, h.frame_id);
+            self.start_display(h.display, config.first_frame_id.unwrap_or(h.frame_id));
         }
         let Some(di) = self.displays.iter().position(|d| d.display == h.display) else {
             return;
@@ -446,6 +478,7 @@ impl Reassembler {
 
     fn deliver(&mut self, di: usize, p: PendingFrame) {
         let d = &mut self.displays[di];
+        d.released = true;
         if d.awaiting_recovery && self.config.gate_after_loss {
             if p.flags & (FLAG_KEY | FLAG_RECOVERY_POINT) == 0 {
                 self.stats.frames_gated += 1;
@@ -494,6 +527,7 @@ impl Reassembler {
         }
         d.next_id = until;
         d.awaiting_recovery = true;
+        d.released = true;
         self.stats.frames_lost += lost;
         let display = d.display;
         if let Some(Event::Lost {
@@ -613,6 +647,45 @@ mod latency_tests {
         assert_eq!(s.datagram_loss(), 0.0);
     }
 
+    /// Live mode: every display starts at frame 0, so a first frame that never arrives is lost
+    /// and the P-frame after it is gated; `settled` follows every release.
+    #[test]
+    fn live_start_at_zero_and_settled() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            first_frame_id: Some(0),
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        assert_eq!(r.settled(0), None);
+        let f = frame_bytes(1_500, 1);
+        for (h, p) in fragment(&f, meta(1, 0), 1000).unwrap() {
+            r.push(&h, p, t0);
+        }
+        // Frame 0 never came: frame 1 completed, so after the grace 0 is lost and 1 is gated.
+        let ev = r.poll(t0 + Duration::from_millis(6));
+        assert_eq!(
+            ev,
+            vec![Event::Lost {
+                display: 0,
+                from: 0,
+                to: 0
+            }]
+        );
+        assert_eq!(r.settled(0), Some(1));
+        assert!(r.awaiting_recovery(0));
+        assert_eq!(r.stats().frames_gated, 1);
+        for (h, p) in fragment(&f, meta(2, FLAG_KEY), 1000).unwrap() {
+            r.push(&h, p, t0 + Duration::from_millis(7));
+        }
+        assert_eq!(
+            delivered_ids(&r.poll(t0 + Duration::from_millis(7))),
+            vec![2]
+        );
+        assert_eq!(r.settled(0), Some(2));
+        assert!(!r.awaiting_recovery(0));
+        assert_eq!(r.settled(1), None);
+    }
+
     #[test]
     fn duplicate_fragments_are_counted_not_delivered_twice() {
         let mut r = Reassembler::new(Default::default());
@@ -688,7 +761,11 @@ mod latency_tests {
         let t0 = Instant::now();
         let first_only = |r: &mut Reassembler, id: u32, t: Instant| {
             let f = frame_bytes(3_000, id as u8);
-            let (h, p) = fragment(&f, meta(id, 0), 1000).unwrap().into_iter().next().unwrap();
+            let (h, p) = fragment(&f, meta(id, 0), 1000)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
             r.push(&h, p, t);
         };
         first_only(&mut r, 11, t0);

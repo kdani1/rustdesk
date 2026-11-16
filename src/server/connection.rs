@@ -468,11 +468,14 @@ pub struct Connection {
     terminal_generic_service: Option<Box<GenericService>>,
     // The reason `on_close` was first called with (the split session's sticky fallback).
     close_reason: String,
-    // Fork-only UDP video lane, shadow probe (docs/UDP-VIDEO.md): what the offer gate needs to
-    // know about the transport, the hook in front of every TCP video send, and the lane.
+    // Fork-only UDP video lane (docs/UDP-VIDEO.md): what the offer gate needs to know about
+    // the transport, the hook in front of every TCP video send, and the lane.
     udp_gate: crate::udp_video::host::Gate,
-    udp_tap: Arc<crate::udp_video::host::ShadowTap>,
+    udp_tap: Arc<crate::udp_video::host::VideoTap>,
     udp_video: Option<crate::udp_video::host::UdpVideoHost>,
+    // Live mode: after a fallback to TCP, the next offer and how many were made.
+    udp_retry_at: Option<Instant>,
+    udp_retries: usize,
 }
 
 /// The connection's part of a split session's video writes, run by the writer task.
@@ -480,15 +483,21 @@ struct SplitHooks {
     id: i32,
     video_ack_required: bool,
     sends: Arc<super::latency_stats::SplitSends>,
-    udp_tap: Arc<crate::udp_video::host::ShadowTap>,
+    udp_tap: Arc<crate::udp_video::host::VideoTap>,
 }
 
 impl crate::session_io::WriterHooks for SplitHooks {
-    fn video_dequeued(&mut self, msg: &Arc<Message>, queued_at: Instant) {
-        // The UDP shadow copy starts before the TCP write (one atomic load while no lane).
-        self.udp_tap.offer(msg);
-        // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames.
-        if !self.video_ack_required {
+    fn video_dequeued(
+        &mut self,
+        msg: &Arc<Message>,
+        queued_at: Instant,
+    ) -> crate::udp_video::host::Route {
+        // The UDP lane decides before the TCP write (one atomic load while no lane): a shadow
+        // copy starts here, a live lane takes video frames off TCP.
+        let route = self.udp_tap.route(msg, queued_at.into_std());
+        // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames. A
+        // frame that went to a live lane is reported by the lane's sender (send window).
+        if !self.video_ack_required && route.tcp {
             if let Some(message::Union::VideoFrame(vf)) = &msg.union {
                 video_service::notify_video_frame_fetched(
                     vf.display as usize,
@@ -497,6 +506,7 @@ impl crate::session_io::WriterHooks for SplitHooks {
                 );
             }
         }
+        route
     }
 
     fn video_sent(&mut self, msg: &Message, send: Duration) {
@@ -768,6 +778,8 @@ impl Connection {
             udp_gate,
             udp_tap: Default::default(),
             udp_video: None,
+            udp_retry_at: None,
+            udp_retries: 0,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -1292,13 +1304,29 @@ impl Connection {
                 }
                 Some((instant, value)) = recv_video(&mut rx_video) => {
                     conn_stats.begin("video");
-                    if !conn.video_ack_required {
+                    // The UDP lane decides before the TCP send (one atomic load while no lane):
+                    // a shadow copy starts here, a live lane takes video frames off TCP and
+                    // reports them fetched itself (send window).
+                    let route = conn.udp_tap.route(&value, instant.into_std());
+                    if !conn.video_ack_required && route.tcp {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
-                    // The UDP shadow copy starts before the TCP send (one atomic load while no lane).
-                    conn.udp_tap.offer(&value);
+                    let mut marker_err = None;
+                    for marker in route.before {
+                        if let Err(err) = conn.stream.send(&marker).await {
+                            marker_err = Some(err);
+                            break;
+                        }
+                    }
+                    if let Some(err) = marker_err {
+                        conn.on_close(&err.to_string(), false).await;
+                        break;
+                    }
+                    if !route.tcp {
+                        continue;
+                    }
                     let send_begin = Instant::now();
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -3364,10 +3392,17 @@ impl Connection {
                 if let Some(tm) = self.last_test_delay {
                     self.last_test_delay = None;
                     let new_delay = tm.elapsed().as_millis() as u32;
+                    // A live UDP lane carries the video: TestDelay on the near-idle TCP stream
+                    // no longer sees the video queue, so QoS gets the lane's signal instead.
+                    let qos_delay = self
+                        .udp_video
+                        .as_ref()
+                        .and_then(|l| l.qos_delay(new_delay))
+                        .unwrap_or(new_delay);
                     video_service::VIDEO_QOS
                         .lock()
                         .unwrap()
-                        .user_network_delay(self.inner.id(), new_delay);
+                        .user_network_delay(self.inner.id(), qos_delay);
                     self.network_delay = new_delay;
                 }
             }
@@ -4151,6 +4186,9 @@ impl Connection {
                     }
                     Some(misc::Union::UdpVideoControl(c)) => {
                         self.on_udp_video_control(&c).await;
+                    }
+                    Some(misc::Union::UdpVideoFeedback(f)) => {
+                        self.on_udp_video_feedback(&f).await;
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -5932,44 +5970,66 @@ impl Connection {
         allow_err!(self.stream.send_msg(msg).await);
     }
 
-    /// After a remote-control login: offers a UDP video lane (shadow mode) when the viewer
-    /// advertised one and every gate passes; otherwise logs why not, once (docs/UDP-VIDEO.md).
+    /// After a remote-control login (and on a retry after a fallback): offers a UDP video
+    /// lane when the viewer advertised one and every gate passes; otherwise logs why not, once
+    /// (docs/UDP-VIDEO.md).
     async fn udp_video_offer(&mut self) {
+        use crate::udp_video::host::{self as udp, Mode};
         let version = self.lr.udp_video_version;
         if version == 0 || self.udp_video.is_some() {
             // A stock viewer, or one with enable-udp-video=N: nothing to say.
             return;
         }
         let id = self.inner.id;
-        let gate = if !cfg!(windows) {
-            Err("host is not Windows".to_owned())
-        } else if Config::get_option(keys::OPTION_ENABLE_UDP_VIDEO) != "Y" {
-            Err("host option enable-udp-video is not Y".to_owned())
-        } else if self.video_ack_required {
-            Err("the viewer acknowledges frames (web client)".to_owned())
-        } else {
-            crate::udp_video::host::offer_gate(&self.udp_gate)
+        let option = Config::get_option(keys::OPTION_ENABLE_UDP_VIDEO);
+        let gate = match udp::mode_from_option(&option) {
+            _ if !cfg!(windows) => Err("host is not Windows".to_owned()),
+            None => Err(format!(
+                "host option enable-udp-video is \"{option}\" (Y: live, shadow: shadow)"
+            )),
+            Some(Mode::Live) if version < udp::VIEWER_LIVE_VERSION => Err(
+                "the viewer's lane has no live mode (enable-udp-video=shadow for a probe)"
+                    .to_owned(),
+            ),
+            _ if self.video_ack_required => {
+                Err("the viewer acknowledges frames (web client)".to_owned())
+            }
+            Some(mode) => udp::offer_gate(&self.udp_gate).map(|(l, v)| (l, v, mode)),
         };
-        let (local, viewer) = match gate {
+        let (local, viewer, mode) = match gate {
             Ok(v) => v,
             Err(why) => {
                 log::info!("UDPVIDEO host conn={id} not offered (viewer v{version}): {why}");
                 return;
             }
         };
-        let every = Config::get_option(keys::OPTION_UDP_VIDEO_SHADOW_EVERY)
-            .parse::<u32>()
-            .ok()
-            .filter(|n| (1..=60).contains(n))
-            .unwrap_or(crate::udp_video::host::DEFAULT_SHADOW_EVERY);
-        match crate::udp_video::host::UdpVideoHost::start(
-            id,
-            self.udp_tap.clone(),
-            local,
-            viewer,
-            every,
-        ) {
+        let params = udp::Params::from_options(
+            mode,
+            &Config::get_option(keys::OPTION_UDP_VIDEO_SHADOW_EVERY),
+            &Config::get_option(keys::OPTION_UDP_VIDEO_BURST),
+            &Config::get_option(keys::OPTION_UDP_VIDEO_TIMEOUT_MS),
+        );
+        let hooks = (mode == Mode::Live).then(|| {
+            Arc::new(udp::LiveHooks {
+                fetched: Box::new(move |display, queued| {
+                    video_service::notify_video_frame_fetched(display, id, Some(queued))
+                }),
+                sent: Box::new(|msg, send| super::latency_stats::on_video_send(msg, send)),
+            })
+        });
+        match udp::UdpVideoHost::start(id, self.udp_tap.clone(), local, viewer, params, hooks) {
             Ok((lane, offer)) => {
+                if mode == Mode::Live {
+                    let forced = Config::get_option(keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y";
+                    log::info!(
+                        "UDPVIDEO host conn={id} live: a loss is repaired by {}",
+                        if forced {
+                            "a forced key frame (enable-refresh-keyframe=Y)"
+                        } else {
+                            "a capture restart (enable-refresh-keyframe is not Y)"
+                        }
+                    );
+                }
                 self.udp_video = Some(lane);
                 let mut misc = Misc::new();
                 misc.set_udp_video_offer(offer);
@@ -6002,26 +6062,58 @@ impl Connection {
         }
     }
 
-    /// Every second: ends a lane whose handshake timed out.
+    /// Live: the viewer lost frames of a display. A key frame through the refresh path (M13
+    /// forced key frame with enable-refresh-keyframe=Y, else a capture restart); sustained loss
+    /// falls back to TCP.
+    async fn on_udp_video_feedback(&mut self, f: &UdpVideoFeedback) {
+        let Some(lane) = self.udp_video.as_mut() else {
+            return;
+        };
+        match lane.on_feedback(f) {
+            Ok(Some(display)) => self.refresh_video_display(Some(display)),
+            Ok(None) => {}
+            Err(why) => self.udp_video_stop(&why, true).await,
+        }
+    }
+
+    /// Every second: ends a lane whose handshake timed out or (live) that went silent or whose
+    /// socket fails; makes the next offer after a fallback when its time has come.
     async fn udp_video_check(&mut self) {
         if let Some(Err(why)) = self.udp_video.as_ref().map(|l| l.check()) {
             self.udp_video_stop(&why, true).await;
         }
+        if self.udp_video.is_none() && self.udp_retry_at.map_or(false, |at| Instant::now() >= at)
+        {
+            self.udp_retry_at = None;
+            log::info!(
+                "UDPVIDEO host conn={} retry {} of {}",
+                self.inner.id,
+                self.udp_retries,
+                crate::udp_video::host::RETRY_BACKOFF.len()
+            );
+            self.udp_video_offer().await;
+        }
     }
 
     async fn udp_video_stop(&mut self, why: &str, tell_viewer: bool) {
-        let Some(lane) = self.udp_video.take() else {
+        let Some(mut lane) = self.udp_video.take() else {
             return;
         };
         let lane_id = lane.lane_id();
+        let info = lane.shutdown(why);
         log::warn!(
-            "UDPVIDEO host conn={} stop lane={:016x}: {}",
+            "UDPVIDEO host conn={} stop lane={:016x} mode={}: {} (in_band={} displays={:?})",
             self.inner.id,
             lane_id,
-            why
+            lane.mode().label(),
+            why,
+            info.in_band,
+            info.displays
         );
         drop(lane);
-        if tell_viewer {
+        // The STOP of a live lane that carried frames waits in the tap for the next video item
+        // (it must come right before the first TCP frame); otherwise it goes now.
+        if tell_viewer && !info.in_band {
             let mut misc = Misc::new();
             misc.set_udp_video_control(UdpVideoControl {
                 kind: udp_video_control::Kind::KindStop.into(),
@@ -6032,6 +6124,31 @@ impl Connection {
             let mut msg = Message::new();
             msg.set_misc(misc);
             self.send(msg).await;
+        }
+        // Back on TCP: the viewer may have lost UDP frames that those displays' next TCP frames
+        // reference, and waits for a key frame (this also brings the in-band STOP out soon on a
+        // static screen).
+        for display in &info.displays {
+            if *display >= 0 {
+                self.refresh_video_display(Some(*display as usize));
+            }
+        }
+        if info.was_live {
+            let backoff = crate::udp_video::host::RETRY_BACKOFF;
+            if let Some(after) = backoff.get(self.udp_retries) {
+                self.udp_retries += 1;
+                self.udp_retry_at = Some(Instant::now() + *after);
+                log::info!(
+                    "UDPVIDEO host conn={} video back on TCP, next offer in {} s",
+                    self.inner.id,
+                    after.as_secs()
+                );
+            } else {
+                log::info!(
+                    "UDPVIDEO host conn={} video back on TCP for the rest of the session",
+                    self.inner.id
+                );
+            }
         }
     }
 

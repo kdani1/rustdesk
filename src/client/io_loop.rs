@@ -337,6 +337,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                         if !self.handle_msg_from_peer(bytes, &mut peer).await {
                                             break
                                         }
+                                        // An ACTIVE marker or a SwitchDisplay may have released
+                                        // held UDP frames.
+                                        self.feed_udp_video(&mut peer).await;
                                     }
                                 }
                             } else {
@@ -361,6 +364,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             if let Some(msg) = self.udp_video.on_event(ev) {
                                 allow_err!(peer.send(&msg).await);
                             }
+                            self.feed_udp_video(&mut peer).await;
                         }
                         _msg = rx_clip_client.recv() => {
                             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -428,6 +432,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                 #[cfg(not(feature = "flutter"))]
                                 self.handler.msgbox("error", "Connection Error", "Timeout", "");
                                 break;
+                            }
+                            if let Some(msg) = self.udp_video.tick() {
+                                allow_err!(peer.send(&msg).await);
                             }
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
@@ -1996,72 +2003,93 @@ impl<T: InvokeUiSession> Remote<T> {
         return false;
     }
 
+    /// A video frame from the session stream or, in live mode, from the UDP video lane: the
+    /// same decoder queue, pacer, fps control and latency stats either way.
+    async fn handle_video_frame(&mut self, vf: VideoFrame, peer: &mut Stream) {
+        if !self.first_frame {
+            self.first_frame = true;
+            self.handler.close_success();
+            self.handler.adapt_size();
+            self.send_toggle_virtual_display_msg(peer).await;
+            self.send_toggle_privacy_mode_msg(peer).await;
+        }
+        self.video_format = CodecFormat::from(&vf);
+
+        let display = vf.display as usize;
+        if !self.video_threads.contains_key(&display) {
+            self.new_video_thread(display);
+        }
+        let Some(thread) = self.video_threads.get_mut(&display) else {
+            return;
+        };
+        client::latency::on_received(client::latency::stream_key(&thread.video_queue), &vf);
+        thread.counters.on_received();
+        let key_frame = Self::contains_key_frame(&vf);
+        thread.pacing.on_received(&vf, key_frame);
+        if key_frame {
+            thread.fps_control.key_frame_pending = false;
+            thread
+                .video_sender
+                .send(MediaData::VideoFrame(Box::new(vf)))
+                .ok();
+        } else {
+            let video_queue = thread.video_queue.read().unwrap();
+            if video_queue.force_push(vf).is_some() {
+                drop(video_queue);
+                thread.counters.on_discarded();
+                if !self.gentle_fps.enabled {
+                    self.handler.refresh_video(display as _);
+                } else if thread.fps_control.key_frame_refresh_allowed() {
+                    // Gentle fps control: a refresh restarts the host's capturer
+                    // and encoder for every viewer, so overflow refreshes are
+                    // spaced (`KEY_FRAME_REFRESH_SPACING`), not capped: without a
+                    // key frame the stream cannot be decoded again.
+                    self.handler.refresh_video(display as _);
+                    log::info!(
+                        "Refresh display {} after queue overflow (refresh_times={})",
+                        display,
+                        thread.fps_control.refresh_times
+                    );
+                    thread.fps_control.on_refresh();
+                } else if !thread.fps_control.key_frame_pending {
+                    // The evicted frame is a reference of the frames after it:
+                    // freeze (drop the queue until a key frame) rather than decode
+                    // across the hole, and refresh once the limit allows
+                    // (`fps_control_gentle`, every status tick).
+                    *thread.discard_queue.write().unwrap() = true;
+                    thread.fps_control.key_frame_pending = true;
+                    log::info!(
+                        "Queue overflow on display {}: refresh deferred by the limit, queue discarded until a key frame (refresh_times={})",
+                        display,
+                        thread.fps_control.refresh_times
+                    );
+                }
+            } else {
+                thread.video_sender.send(MediaData::VideoQueue).ok();
+            }
+        }
+    }
+
+    /// Feeds the live UDP frames the lane has ready (after a UDP event, or after an ACTIVE
+    /// marker or SwitchDisplay read on TCP released held ones).
+    async fn feed_udp_video(&mut self, peer: &mut Stream) {
+        let bytes = self.udp_video.take_udp_bytes();
+        if bytes > 0 {
+            self.data_count.fetch_add(bytes, Ordering::Relaxed);
+        }
+        while let Some(vf) = self.udp_video.next_ready() {
+            self.handle_video_frame(vf, peer).await;
+        }
+    }
+
     async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
-                    self.udp_video.on_tcp_frame(&vf);
-                    if !self.first_frame {
-                        self.first_frame = true;
-                        self.handler.close_success();
-                        self.handler.adapt_size();
-                        self.send_toggle_virtual_display_msg(peer).await;
-                        self.send_toggle_privacy_mode_msg(peer).await;
-                    }
-                    self.video_format = CodecFormat::from(&vf);
-
-                    let display = vf.display as usize;
-                    if !self.video_threads.contains_key(&display) {
-                        self.new_video_thread(display);
-                    }
-                    let Some(thread) = self.video_threads.get_mut(&display) else {
-                        return true;
-                    };
-                    client::latency::on_received(client::latency::stream_key(&thread.video_queue), &vf);
-                    thread.counters.on_received();
-                    let key_frame = Self::contains_key_frame(&vf);
-                    thread.pacing.on_received(&vf, key_frame);
-                    if key_frame {
-                        thread.fps_control.key_frame_pending = false;
-                        thread
-                            .video_sender
-                            .send(MediaData::VideoFrame(Box::new(vf)))
-                            .ok();
-                    } else {
-                        let video_queue = thread.video_queue.read().unwrap();
-                        if video_queue.force_push(vf).is_some() {
-                            drop(video_queue);
-                            thread.counters.on_discarded();
-                            if !self.gentle_fps.enabled {
-                                self.handler.refresh_video(display as _);
-                            } else if thread.fps_control.key_frame_refresh_allowed() {
-                                // Gentle fps control: a refresh restarts the host's capturer
-                                // and encoder for every viewer, so overflow refreshes are
-                                // spaced (`KEY_FRAME_REFRESH_SPACING`), not capped: without a
-                                // key frame the stream cannot be decoded again.
-                                self.handler.refresh_video(display as _);
-                                log::info!(
-                                    "Refresh display {} after queue overflow (refresh_times={})",
-                                    display,
-                                    thread.fps_control.refresh_times
-                                );
-                                thread.fps_control.on_refresh();
-                            } else if !thread.fps_control.key_frame_pending {
-                                // The evicted frame is a reference of the frames after it:
-                                // freeze (drop the queue until a key frame) rather than decode
-                                // across the hole, and refresh once the limit allows
-                                // (`fps_control_gentle`, every status tick).
-                                *thread.discard_queue.write().unwrap() = true;
-                                thread.fps_control.key_frame_pending = true;
-                                log::info!(
-                                    "Queue overflow on display {}: refresh deferred by the limit, queue discarded until a key frame (refresh_times={})",
-                                    display,
-                                    thread.fps_control.refresh_times
-                                );
-                            }
-                        } else {
-                            thread.video_sender.send(MediaData::VideoQueue).ok();
-                        }
+                    // After a live UDP video lane, a display whose UDP frames did not all
+                    // arrive restarts on TCP from a key frame.
+                    if self.udp_video.on_tcp_frame(&vf) {
+                        self.handle_video_frame(vf, peer).await;
                     }
                 }
                 Some(message::Union::Hash(hash)) => {
@@ -2636,6 +2664,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
                     }
                     Some(misc::Union::SwitchDisplay(s)) => {
+                        // Live UDP frames of the next epoch may be shown after this.
+                        self.udp_video.on_switch_display();
                         self.handler.handle_peer_switch_display(&s);
                         if let Some(thread) = self.video_threads.get_mut(&(s.display as usize)) {
                             thread.video_sender.send(MediaData::Reset).ok();
