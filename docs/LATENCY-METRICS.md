@@ -118,7 +118,7 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 ### Viewer (Rust)
 
 ```
-LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a shown_gap=… discard=0 dec_fail=0 via=TCP
+LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a noout=0 shown_gap=… discard=0 dec_fail=0 via=TCP
 ```
 
 | Field | Meaning |
@@ -142,10 +142,11 @@ LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=
 | `dec_fps` | frames `handle_frame` decoded to a picture per second |
 | `shown_fps` | decoded frames that reached the screen per second: handed to the UI callback, minus soft-render drops (`ui_dropped`) and frames a later one replaced before Flutter fetched them (`ui_replaced`). The overlay's `shown` is the same. |
 | `skip` | decoded frames not handed to the UI callback (`decoded` − handed), count in the window: the frames present pacing skipped. Always 0 with pacing off. Soft-render drops and replacements are not in it (they are left out of `shown_fps` instead). |
-| `decode_skip` | `decode` of the skipped frames (p50/p95/max ms), `n/a` when none was skipped |
+| `decode_skip` | `decode` of the skipped frames (p50/p95/max ms), `n/a` when none was skipped. With `enable-viewer-decode-no-output` (default) these are decoded without output (see "Decode without output" below): `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
+| `noout` | of the decoded frames, those decoded without output (`DecodeOutput::DecodedNoOutput`), count in the window. Equal to `skip` when every skipped frame was decided before its decode; lower when a frame turned stale only during its decode (the callback is skipped then, the conversion was already done) or the decoder always outputs (AMF/MFX GPU decoders) |
 | `shown_gap` | time between two consecutive frames that reached the screen (`to_ui` done → next `to_ui` done; frames counted in `ui_dropped`, and frames a later one replaced (`ui_replaced`), are left out: the gap runs from the frame shown before the replaced one to the replacing one), p50/p95/max ms. A gap is added once the next frame did not replace its frame, so the newest one lands in the next window. Gaps over 1 s (static screen) are left out. Its p95 shows stutter: with pacing on it must not grow in calm use. |
 | `discard` | received frames dropped undecoded, count in the window: `discard_queue` after a refresh request, or evicted by a full 120-deep queue |
-| `dec_fail` | `handle_frame` calls that returned no picture or an error |
+| `dec_fail` | `handle_frame` calls that returned no picture or an error (a frame decoded without output is not one) |
 | `via` | the session's transport, the `type` of the `TRANSPORT viewer` line (`TCP`, `UDP`, `IPv6`, `WebRTC`, `WebRTC/IPv6`, `Relay`, `WebSocket`) |
 
 The `rx_fps` / `dec_fps` / `shown_fps` / `skip` / `discard` / `dec_fail` counters come
@@ -164,6 +165,7 @@ LATENCY client pacing display=0 present_pacing=on
 LATENCY client priority thread=io_loop prio=above_normal
 LATENCY client priority process=above_normal ecoqos=opt_out
 LATENCY client priority thread=decoder display=0 prio=above_normal
+LATENCY client mmcss display=0 task=Playback state=on
 LATENCY client priority process=restored
 LATENCY client audio_policy=adaptive floor_ms=60
 audio trim 412ms to target 60ms, generation=3
@@ -177,6 +179,7 @@ RACE site=connect tcp=ok@180 udp=err@3010 v6=pending webrtc=pending winner=TCP m
 | `pacing` | once per video thread (display) start: whether present pacing is on for it (the option is read then) |
 | `priority thread=` | viewer priority boost (`enable-viewer-priority-boost`, Windows), once per `io_loop` round of a remote-control or camera session and once per decoder thread (`display=`) start. `prio`: `above_normal` (raised to THREAD_PRIORITY_ABOVE_NORMAL, restored when the round or thread ends), `off` (option `N`), `kept:<n>` (the thread already ran at that priority or higher, unchanged), `failed (<error>)` |
 | `priority process=` | the counted process boost: logged when the first such session raises it and when the last one ends (`restored`, or `kept_server` when the in-process server's host priority boost holds the class). `process`: `above_normal` (raised from NORMAL or lower), `kept:<class>` (the class, hex, was already higher: unchanged and not restored), `failed(<error>)`. `ecoqos`: `opt_out` (power throttling of execution speed off; the earlier state is put back on release), `failed(<error>)` |
+| `mmcss` | MMCSS "Playback" on a display's decoder thread (`enable-viewer-mmcss`, Windows): `state=on` when the decoder outputs GPU textures (vram) and the registration succeeded, `failed` (a `MMCSS Playback registration failed` warning has the error), `reverted` when the decoder stops being a GPU one (codec switch to software or RAM decoding), `off` once at the thread start with option `N`. Nothing is logged while the decoder never was a GPU one. |
 | `audio_policy` | once per audio format of a session (`AudioBuffer` creation): `adaptive` (the `audio-target-ms` target, `floor_ms` its lower bound) or `legacy` (`try_shrink`) |
 | `audio trim` | each trim of the adaptive policy: how much buffered audio was dropped, the target it trimmed to, and the playback discontinuity generation (crossfade). Not tied to the latency option; at most one every 2 s. The legacy rule logs `skip <samples>, based …` instead. |
 | `path` | `vram/<driver>` (hwcodec GPU decoder, D3D11 texture output; driver `FFMPEG`, `AMF`, `MFX` or `NV`), `hwram/<FFmpeg decoder>/<hw device>` (FFmpeg decoder with CPU output, converted to RGBA), `vpx`, `aom` (software), `other` (MediaCodec), `none` (creation failed) |
@@ -210,6 +213,7 @@ the default controller):
 | `decision` | `keep` (no trend), `init` (first request), `increase`, `decrease` (request `limited`), `halve` (decrease while `limited < max_queue_len`: request `limited/2`, floor 1), or `none` before any `decode_fps` exists |
 | `sent` | the fps sent to the host this tick, `-` if unchanged |
 | `d<N> rx/dec/shown/skip/discard/fail` | this display's `VideoCounters` for the tick (see the LATENCY line). `shown` here is every frame handed to the UI callback, `skip` = `dec` − `shown` |
+| `noout` | of `dec`, the frames decoded without output (see the LATENCY line) |
 | `ui_lost` | of the `shown` frames, those the soft renderer dropped or that a later frame replaced before Flutter fetched them (`ui_dropped` + `ui_replaced`): they never reached the screen. The gentle controller and `shown_fps` use `shown` − `ui_lost`. |
 | `queue_len` | `video_queue.len()` as the trend check saw it (the controller's input) |
 | `queue_max` | the largest queue length right after a decode during the tick |
@@ -338,6 +342,45 @@ Measured by `pacing`, `skip`, `decode_skip`, `shown_gap`, `ui_replaced` on the
 LATENCY line, `skip` on the `FPSCTL` line (always on), and the overlay's
 `fps dec D / shown S (skip K)`.
 
+#### Decode without output
+
+Local option `enable-viewer-decode-no-output`, on by default (`N` turns it off),
+read when a display's video thread starts; it acts only while present pacing is on.
+The pacer then decides **before** the decode, with the same rule as above, whether
+the frame will be shown. A frame that will not be shown is still decoded, but:
+
+- VP8/VP9/AV1 (libvpx/libaom): no YUV→RGBA conversion (`to(rgb)`).
+- Hardware decoding to RAM (FFmpeg, `hwram`): no conversion. With output, only the
+  last image of each packet's `decode()` call is converted (was: every image).
+- GPU decoding (`vram`), FFmpeg D3D11 driver: `ffmpeg_vram_decode2(output=0)` in
+  hwcodec skips the NV12→BGRA shader, the texture pool rotation and the texture
+  hand-off; one GPU event query still waits for the decode, so `decode_skip` stays an
+  honest decode time and the GPU queue cannot run ahead of the decoder. AMF/MFX
+  decoders ignore the flag and always output (counted in `skip`, not in `noout`).
+- Android MediaCodec: the output buffer is released without conversion (only with
+  pacing turned on there, `Y`).
+
+`handle_frame` returns `DecodeOutput::DecodedNoOutput` for such a frame, a success:
+it resets the decoder's fail counter like a shown frame, so skipped frames never get
+a codec (H.265) marked unsupported. A frame the pacer accepted because nothing newer
+was waiting yet is checked again after its decode; if a newer frame arrived
+meanwhile, only the UI callback is skipped (as without this option). With the
+option off, the decision is taken after the decode, as before. The recording
+(`record_screen`) writes the encoded frames and is not affected.
+
+Measured by `noout`, `decode_skip` vs `decode` (p50) and `dec_fail` on the LATENCY
+line, `noout` on the `FPSCTL` line, and the viewer's CPU and GPU 3D/Copy load with
+pacing on and off. `decode`'s meaning is unchanged (shown frames, with conversion).
+The gentle fps control's busy fraction is wall time, so it still sees the real
+decoder load; its per-frame capacity (`cap`) rises by what skipped frames save.
+
+The hwcodec `NativeDevice::Query` wait (used after the NV12→BGRA shader on every
+shown GPU frame, and by the no-output path above) no longer busy-polls 100 times
+before sleeping: for up to 2 ms each poll gives the processor to any other ready
+thread (`SwitchToThread`, which unlike `Sleep(0)` also yields to lower-priority
+threads such as the UI's raster thread), then it sleeps 1 ms per poll. No option
+(C++ in hwcodec); it changes no output.
+
 ### Viewer: priority boost
 
 Local option `enable-viewer-priority-boost` (Windows only, on by default, `N` turns
@@ -360,7 +403,22 @@ shares the class: the last viewer session does not restore it while the server's
 `enable-host-priority-boost` holds it at ABOVE_NORMAL (`process=kept_server`), and
 with that option `N` the server leaves a class the viewer raised. Logged by
 the `LATENCY client priority` lines above. MMCSS "Playback" on the decoder thread is
-not part of it.
+not part of it (next section).
+
+#### Decoder thread MMCSS "Playback"
+
+Local option `enable-viewer-mmcss` (Windows only, on by default, `N` turns it off),
+read when a display's video thread starts. While that display's decoder outputs GPU
+textures (`path=vram/…` on the `decoder` line), its decoder thread is registered
+with the Multimedia Class Scheduler as a "Playback" task (`mmcss_register`), so it
+keeps its time slices under CPU load. Only the thread: the process priority class
+is not touched (unlike the host's `mmcss_capture`, which also applies
+`enable-host-priority-boost`). Software and RAM decoding are not registered: a
+CPU-heavy decode at MMCSS priority could starve the Flutter UI and raster threads
+that present. The registration follows the decoder (codec switch, reset) and is
+reverted when the thread ends. It relies on the `Query` fix above (no busy wait at
+raised priority). Logged by the `LATENCY client mmcss` line. A/B it with the option
+on and off: decode p95, `queue`, `shown_gap` p95 and the Flutter `paint` p50.
 
 ### Viewer: input and audio
 

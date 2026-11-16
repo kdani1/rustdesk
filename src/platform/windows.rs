@@ -257,36 +257,55 @@ pub fn raise_server_priority() {
 static SERVER_PRIORITY_RAISED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// The calling thread's MMCSS "Capture" registration; reverted when dropped.
-pub struct MmcssCapture(Option<windows::Win32::Foundation::HANDLE>);
+/// The calling thread's MMCSS registration (`mmcss_register`); reverted when dropped, on the
+/// same thread (the guards are not `Send`).
+pub struct MmcssRegistration(windows::Win32::Foundation::HANDLE);
 
-/// Registers the calling thread (the video capture/encode loop) with the Multimedia Class
-/// Scheduler as a "Capture" task: Windows then keeps scheduling it under CPU load, as it does
-/// for audio and video capture.
-pub fn mmcss_capture() -> MmcssCapture {
-    use windows::{core::w, Win32::System::Threading::AvSetMmThreadCharacteristicsW};
-    raise_server_priority();
-    if !host_priority_boost_enabled() {
-        return MmcssCapture(None);
-    }
+/// Registers the calling thread with the Multimedia Class Scheduler as `task` (a task name under
+/// HKLM\...\Multimedia\SystemProfile\Tasks, e.g. "Capture", "Playback"): Windows then keeps
+/// scheduling it under CPU load. Only the thread; the process priority class is not touched.
+/// None (and a warning) when the registration fails.
+pub fn mmcss_register(task: &str) -> Option<MmcssRegistration> {
+    use windows::{core::PCWSTR, Win32::System::Threading::AvSetMmThreadCharacteristicsW};
+    let name: Vec<u16> = task.encode_utf16().chain(std::iter::once(0)).collect();
     let mut task_index = 0u32;
-    match unsafe { AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index) } {
-        Ok(handle) => MmcssCapture(Some(handle)),
+    match unsafe { AvSetMmThreadCharacteristicsW(PCWSTR(name.as_ptr()), &mut task_index) } {
+        Ok(handle) => Some(MmcssRegistration(handle)),
         Err(e) => {
-            log::warn!("MMCSS Capture registration failed: {e}");
-            MmcssCapture(None)
+            log::warn!("MMCSS {task} registration failed: {e}");
+            None
         }
     }
 }
 
-impl Drop for MmcssCapture {
+impl Drop for MmcssRegistration {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            let _ = unsafe {
-                windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
-            };
-        }
+        let _ = unsafe {
+            windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0)
+        };
     }
+}
+
+/// The calling thread's MMCSS "Capture" registration; reverted when dropped.
+pub struct MmcssCapture(#[allow(dead_code)] Option<MmcssRegistration>);
+
+/// Registers the calling thread (the video capture/encode loop) with the Multimedia Class
+/// Scheduler as a "Capture" task: Windows then keeps scheduling it under CPU load, as it does
+/// for audio and video capture. Also applies the server process priority
+/// (`raise_server_priority`, enable-host-priority-boost).
+pub fn mmcss_capture() -> MmcssCapture {
+    raise_server_priority();
+    if !host_priority_boost_enabled() {
+        return MmcssCapture(None);
+    }
+    MmcssCapture(mmcss_register("Capture"))
+}
+
+/// Whether a viewer display's decoder thread registers as MMCSS "Playback" while it decodes on
+/// the GPU (local option enable-viewer-mmcss, on by default).
+pub fn viewer_mmcss_enabled() -> bool {
+    hbb_common::config::LocalConfig::get_option(base::config::keys::OPTION_ENABLE_VIEWER_MMCSS)
+        != "N"
 }
 
 /// Whether the viewer raises its threads and process while a session is open (local option

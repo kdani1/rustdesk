@@ -301,6 +301,7 @@ impl StreamLatency {
         c.received += t.received;
         c.discarded += t.discarded;
         c.decoded += t.decoded;
+        c.no_output += t.no_output;
         c.failed += t.failed;
         c.shown += t.shown;
         c.ui_lost += t.ui_lost;
@@ -442,7 +443,7 @@ impl StreamLatency {
             let fmt_rate = |n: usize| rate(n).map_or("n/a".to_owned(), |r| format!("{:.1}", r));
             let skipped = c.decoded.saturating_sub(c.shown);
             let line = format!(
-                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} shown_gap={} discard={} dec_fail={} via={}",
+                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} noout={} shown_gap={} discard={} dec_fail={} via={}",
                 self.display,
                 self.codec.map_or("-".to_owned(), |c| c.to_string()),
                 self.gpu_texture,
@@ -464,6 +465,7 @@ impl StreamLatency {
                 fmt_rate(c.displayed()),
                 skipped,
                 format_summary(decode_skip),
+                c.no_output,
                 format_summary(shown_gap),
                 c.discarded,
                 c.failed,
@@ -981,6 +983,7 @@ mod tests {
             enabled: true,
             key_frames_pending: Default::default(),
             newest_pts: std::sync::atomic::AtomicI64::new(i64::MIN),
+            decode_no_output: true,
         }))
     }
 
@@ -1013,6 +1016,34 @@ mod tests {
         // A key frame is always shown.
         receive(&p, 500);
         assert!(p.should_present(true, Some(408), 5, ms(440)));
+    }
+
+    #[test]
+    fn present_pacing_latency_rechecks_after_decode() {
+        let mut p = pacer();
+        assert!(p.decode_without_output());
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // First frame: shown unconditionally, no recheck.
+        receive(&p, 0);
+        assert!(p.should_present(false, Some(0), 0, ms(0)));
+        receive(&p, 100);
+        assert!(p.still_present(Some(0), 3, ms(5)));
+        // Nothing waits before the decode: decoded with output. Two newer frames arrived during
+        // the decode: only the UI callback is skipped.
+        receive(&p, 17);
+        assert!(p.should_present(false, Some(17), 0, ms(20)));
+        receive(&p, 51);
+        assert!(!p.still_present(Some(17), 2, ms(30)));
+        // Nothing arrived during the decode: shown.
+        receive(&p, 68);
+        assert!(p.should_present(false, Some(68), 0, ms(70)));
+        assert!(p.still_present(Some(68), 0, ms(75)));
+        // A key frame is never rechecked.
+        receive(&p, 85);
+        assert!(p.should_present(true, Some(85), 0, ms(90)));
+        receive(&p, 200);
+        assert!(p.still_present(Some(85), 5, ms(95)));
     }
 
     #[test]

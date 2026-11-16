@@ -235,6 +235,18 @@ pub const OPTION_ENABLE_GENTLE_FPS_CONTROL: &str = "enable-gentle-fps-control";
 // from NORMAL or lower, restored when the last such session ends) with EcoQoS/power throttling
 // turned off. Read when a session round or a video thread starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_VIEWER_PRIORITY_BOOST: &str = "enable-viewer-priority-boost";
+// Viewer, local option: decode without output. A frame present pacing will not show is decoded
+// without its YUV->RGBA conversion (VP8/VP9/AV1, hardware decoding to RAM, Android MediaCodec)
+// or, on the FFmpeg D3D11 GPU decoder, without the NV12->BGRA shader and texture hand-off (one GPU
+// sync query is kept). Only acts while enable-viewer-present-pacing is on. On by default ("N"
+// converts every frame, as before). Read when a display's video thread starts. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT: &str = "enable-viewer-decode-no-output";
+// Windows viewer, local option: a display's decoder thread registers with the Multimedia Class
+// Scheduler as a "Playback" task while it decodes on the GPU (D3D11 texture output), without
+// changing the process priority class. On by default ("N" turns it off). Read when a display's
+// video thread starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_VIEWER_MMCSS: &str = "enable-viewer-mmcss";
 // Viewer, local option: playback buffer target for received audio, in ms. Empty: adaptive target
 // clamp(p95 of the audio arrival lateness over 20 s + 20 ms, 60, 300) ms, raised by 20 ms per
 // output underrun during a network stall (decays 10 ms per 15 s without one); buffered audio that
@@ -314,6 +326,8 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_VIEWER_PRESENT_PACING,
     OPTION_ENABLE_GENTLE_FPS_CONTROL,
     OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
+    OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
+    OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
