@@ -74,3 +74,6 @@ pub mod privacy_mode;
 pub mod virtual_display_manager;
 
 mod kcp_stream;
+// The host's session stream, whole or split into a reader and a writer task (roadmap M12).
+#[cfg(not(target_os = "ios"))]
+mod session_io;

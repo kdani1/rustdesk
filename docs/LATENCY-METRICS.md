@@ -14,7 +14,7 @@ Code:
 
 | Side | File | Hooks |
 |---|---|---|
-| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`) |
+| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`, split session), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`), `src/platform/windows_qos.rs` (TCP meter, `HostSocket`), `src/session_io.rs` (split writer) |
 | Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer, `fps_control`, writes of UI messages), `src/client.rs` `start_video_thread` (`VideoCounters`, `PresentPacer`), `AudioBuffer` / `start_audio_thread`, `src/client/audio_target.rs` (adaptive audio target), `src/platform/windows.rs` (`viewer_thread_boost`, `viewer_process_boost`), `RaceLog`, `VideoHandler`, `src/client/audio_playback.rs` (underruns), `src/ui_session_interface.rs` `Session::send`, `src/flutter.rs` (soft-render handoff, drop and replace, `next_rgba`, quality status) |
 | Flutter | `flutter/lib/models/model.dart` (`ImageModel.onRgba`, `_PaintLatencyStats`, `QualityMonitorModel`) | `flutter/lib/common/widgets/overlay.dart` (`QualityMonitor`) |
 
@@ -84,7 +84,7 @@ Not covered: the re-encode of the last image that non-latency-free encoders
 
 ```
 LATENCY switch source=monitor display=0 reason=refresh restarts=1 gap_ms=187 not_logged=0
-LATENCY conn id=3 via=TCP-punch busy=0.0/0.4/45.0 busy_max_in=video busy_slow=2 in_gap=… in_slow=4 in_n=812 send=… send_slow=1 frames=298
+LATENCY conn id=3 via=TCP-punch busy=0.0/0.4/45.0 busy_max_in=video busy_slow=2 in_gap=… in_slow=4 in_n=812 send=… send_slow=1 frames=298 io=whole ctrlq=n/a qmax_kb=0 adrop=0 bulk_n=0
 TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=accepted
 ```
 
@@ -108,12 +108,122 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 | `send` | this connection's video frame writes (`stream.send`), p50/p95/max ms. Unlike `send` of `LATENCY server`, which pools all connections of a display, this is one viewer. p50/p95 cover the first 1024 writes; the max all of them. |
 | `send_slow` | this connection's video frame writes over 16 ms |
 | `frames` | video frames this connection wrote in the window |
+| `io` | `whole`: the select loop writes everything itself (today's path). `split`: the session stream is split (`enable-split-session-io`, see "Host: split session I/O" below). Split, the loop has no `video` branch: `busy` no longer contains video writes, and `send`/`send_slow`/`frames` come from the writer task (same start and end points: serialization, encryption, the write). |
+| `ctrlq` | split only: how long control messages (replies, TestDelay, audio, cursor, clipboard, PeerInfo) waited in the writer's queue before their write started, p50/p95/max ms. This is the head-of-line wait behind an in-flight frame that remains on the host. `n/a` when whole. |
+| `qmax_kb` | split only: the most bytes control and bulk held at once in the window |
+| `adrop` | split only: audio frames the writer dropped because they were older than 1 s when it took them (whole: the loop drops them, uncounted) |
+| `bulk_n` | split only: bulk writes in the window (CM raw messages, file-clipboard messages, file read-job blocks, rx messages over 256 KB) |
 | `TRANSPORT host` | once per incoming connection, when it is admitted (before the identity handshake), whether logging is on or not |
 | `conn` | the connection id |
 | `type` | `Intranet` (the controller connected to our listener after `FetchLocalAddr`), `TCP-punch` (a TCP hole punch), `Direct` (direct IP access to the listening port), `KCP-UDP` / `KCP-IPv6` (KCP over a punched UDP socket), `WebRTC`, `Relay` (through hbbr) |
 | `peer` | the peer address the connection keys on (for `Relay` the controller's address hbbs reported, not hbbr's) |
 | `secure` | whether the identity handshake runs the key exchange |
 | `detail` | `TCP-punch`: `accepted` (the controller's connect reached our listener) or `dialed` (our own punch connected); `Relay`: the relay server; `-` otherwise |
+
+### Host: TCP meter and SO_SNDBUF (Windows)
+
+Off by default. Server options (`rustdesk.exe --option <key> <value>`), read when a
+connection is accepted:
+
+- `enable-tcp-meter`: `Y` meters the session socket of LAN peers, `all` of every peer,
+  `N` or empty: off. Covered paths are the ones where the host accepts the session socket
+  itself: `Intranet`, `Direct` and `TCP-punch` with `detail=accepted`. Not covered:
+  `Relay`, `TCP-punch` `dialed`, KCP, WebRTC (their socket is made inside hbb_common).
+- `video-sndbuf-kb`: a number of KB (16..65536) sets `SO_SNDBUF` of the session socket once
+  a LAN peer has logged in to remote control or camera view. Never for file transfer,
+  terminal or port forward, never for non-LAN peers. Empty (default) keeps Windows' dynamic
+  send buffering. Setting it turns dynamic send buffering off for that socket; it is an
+  experiment (A/B 256 and 512 against empty).
+
+With either option set, the socket gets a pass-through wrapper (`HostTcpStream`): reads go
+straight through; a write is counted only after it returned `Ready(Ok(n))`; `SIO_TCP_INFO`
+(version 1, falling back to 0) is queried after a write at most every 100 ms, after a write
+that returned Pending at most every 10 ms, and once per report window. The first query, when
+the wrapper is made, is the baseline for `BytesOut`/`BytesRetrans`. Any query error turns
+sampling off for that socket and never touches the connection. The wrapper marks the socket
+closed before it closes, and nothing queries a closed socket. Sampling runs only while
+`enable-latency-log` is `Y`. Both options off: the socket is exactly what it was (plain, or
+qWAVE-marked).
+
+```
+TCPMETER host conn=3 meter=yes ver=1 lan=true
+TCPMETER host conn=4 meter=no why=path via=Relay
+TCPMETER host conn=3 sndbuf_kb=256 was_kb=64 now_kb=256
+LATENCY tcp conn=3 via=Intranet ver=1 n=61 pend=4 app_kb=10240 out_kb=10260 rtt=0.9/2.1/31.0 minrtt=0.4 unsent_max_kb=310 unsent_last_kb=0 inflight_max_kb=180 cwnd_kb=640 sndwnd_kb=2048 retrans_kb=0 fastre=0 rto=0 dupack=0 lim_rwin_ms=0 lim_cwnd_ms=12 lim_snd_ms=4980
+```
+
+| Line / field | Meaning |
+|---|---|
+| `TCPMETER host` | once per connection when either option is set, whether logging is on or not: whether this connection has a meter. `why`: `option_off`, `not_lan` (`enable-tcp-meter=Y` and a non-LAN peer), `path` (not an accepted path, see above), `closed`. `meter=yes` with `ver=-` cannot happen; `meter=no` with a socket handle means `SIO_TCP_INFO` failed at the baseline. The `sndbuf_kb` form is logged when `video-sndbuf-kb` was applied: the value asked for and what Windows reported before and after. |
+| `LATENCY tcp` | every 5 s per metered, authorized connection, with logging on, when the window had a sample or a write |
+| `ver` | `SIO_TCP_INFO` version in use: 1, or 0 (no `lim_*` fields, `n/a`) |
+| `n` | samples in the window (including the one taken when the window is reported, so a write blocked for the whole window still gives one) |
+| `pend` | writes into the socket that returned Pending: the send buffer was full |
+| `app_kb` | bytes the session wrote into the socket in the window |
+| `out_kb` | `BytesOut` delta in the window, as Windows counts it. Over a long idle-ended window it should be about `app_kb` + `retrans_kb`. On loopback it is not: 430683 bytes out for 300000 written with no retransmits (test, Windows 11 26300), so `unsent_*` below must be checked on the real link first. |
+| `rtt` | `RttUs` over the samples, p50/p95/max ms |
+| `minrtt` | `MinRttUs` of the last sample, ms |
+| `unsent_max_kb` / `unsent_last_kb` | bytes written by the session that TCP has not sent yet: written − (`BytesOut` − `BytesRetrans`), both from the baseline. Max over the samples and the last sample. This is what `SO_SNDBUF` can cap. Idle, `unsent_last_kb` must be about 0; a value well below 0 means `BytesOut` does not count what the formula assumes. **Unverified**: on loopback it is far below 0 (see `out_kb`); confirm on the LAN/Wi-Fi link (idle window → about 0) before deciding `video-sndbuf-kb` from it. |
+| `inflight_max_kb` | `BytesInFlight` max: sent, not acknowledged |
+| `cwnd_kb` / `sndwnd_kb` | congestion window and the peer's advertised receive window, last sample |
+| `retrans_kb` / `fastre` / `rto` / `dupack` | in the window: retransmitted bytes, fast retransmits, RTO episodes (`TimeoutEpisodes`), duplicate ACKs received |
+| `lim_rwin_ms` / `lim_cwnd_ms` / `lim_snd_ms` | v1, in the window: ms the sender was limited by the peer's receive window (the viewer does not read: an overloaded Dell), by the congestion window, by the sender itself (nothing to send) |
+
+Classifying a `send` spike (`LATENCY conn` `send` max / `send_slow` in the same window):
+`rto` ≥ 1: TCP timeout; `fastre` > 0 with `rto` 0: loss recovered by duplicate ACKs;
+`lim_rwin_ms` large: the viewer stopped reading; none of these with a large `send` max and
+`pend` > 0: a pause of the link itself (Wi-Fi airtime), confirm once with `pktmon`.
+`SO_SNDBUF` only helps when `unsent_max_kb` during spikes is well above the cap.
+
+Rollback: `enable-tcp-meter N`, `video-sndbuf-kb` empty.
+
+### Host: split session I/O
+
+Off by default: server option `enable-split-session-io` `Y` (Windows hosts only; read when
+a connection is authorized). An authorized remote-control or camera-view session over TCP
+(intranet, direct, punch, relay) or KCP is split once it is authorized: the read half stays
+in the connection's select loop, and one writer task owns the write half. Input is read
+while a video write waits on a full socket. The wire does not change: same framing, same
+encryption and nonce counters (the writer alone encrypts, the reader alone decrypts), same
+messages, each source in order. WebSocket and WebRTC sessions, file transfer, terminal and
+port forward always stay whole.
+
+The writer takes, in this order: the control queue (every reply, the whole rx service channel:
+audio, cursor, clipboard, PeerInfo; TestDelay; the close reason), the video channel (frames and
+SwitchDisplay, "fetched" at dequeue as before, unless the web client acks frames), then the
+bulk queue (CM raw messages, file-clipboard messages, file read-job blocks, rx messages over
+256 KB). Bulk gets a write at least after every 4 video writes. Audio older than 1 s when the
+writer takes it is dropped. File reads pause while bulk holds 512 KB, and the reader pauses
+while control and bulk hold 16 MB (the backpressure the inline write gave); the writer wakes
+the loop when it takes something off. The send timeout is the writer's. When the writer ends
+for any reason (write error, send timeout, panic) the session closes, and the capture loop is
+told not to wait for this connection's fetch. A writer with work and no progress for the
+send timeout + 5 s is closed by a watchdog. A close reason is on the wire before `on_close`
+(flush, at most 1.5 s), and at the end the writer drains control (1.5 s, then aborted).
+
+```
+SPLIT host conn=5 via=Intranet carried=1
+SPLIT host conn=5 stays whole: transport
+SPLIT host conn=5 ended lived=812.4s reason=Peer close failure=false aborted=false counted=false
+SPLIT host: 2 split sessions ended early, enable-split-session-io is off until the service restarts
+```
+
+| Line / field | Meaning |
+|---|---|
+| `carried` | complete messages that were already in the read buffer at the split; they are delivered first |
+| `stays whole` | why a session that should split did not: `transport` (WebSocket, WebRTC), `unflushed write` |
+| `ended` | `lived`: time since the split; `reason`: the first close reason; `failure`: writer panic or watchdog; `aborted`: the writer did not drain in 1.5 s; `counted`: held against split |
+
+Sticky fallback: a split session counts when it ends in under 60 s for any reason other than
+the user or the CM closing it (`Peer close`, `connection manager`, `web console`,
+`auto disconnect`, `stop service`), and always on a writer panic or a watchdog trip. Two counts
+turn split off until the service restarts; a split session that lasted over 5 minutes clears
+the count. The way back without a working remote session: a terminal or file-transfer session
+(never split) running `rustdesk.exe --option enable-split-session-io N`.
+
+What changes in the numbers when split: `wait` (`LATENCY server`) no longer contains the loop
+being busy in other branches, only the writer's queue; `busy` has no `video`; `in_gap` spikes
+during a `send` spike should disappear when the stall is one-way (host to viewer).
 
 ### Viewer (Rust)
 
