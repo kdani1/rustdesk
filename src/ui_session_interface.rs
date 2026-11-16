@@ -1744,6 +1744,8 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn switch_back(&self, id: &str);
     fn portable_service_running(&self, running: bool);
     fn on_microphone_forwarding(&self, _state: &str, _error: &str) {}
+    /// The peer's foreground app took (or released) the pointer; drives automatic game mode.
+    fn on_pointer_captured(&self, _captured: bool) {}
     fn on_voice_call_started(&self);
     fn on_voice_call_closed(&self, reason: &str);
     fn on_voice_call_waiting(&self);

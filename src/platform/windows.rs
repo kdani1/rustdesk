@@ -220,6 +220,88 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
     }
 }
 
+fn host_priority_boost_enabled() -> bool {
+    Config::get_option(base::config::keys::OPTION_ENABLE_HOST_PRIORITY_BOOST) != "N"
+}
+
+/// Sets the server process to ABOVE_NORMAL while enable-host-priority-boost is on (NORMAL when
+/// it is "N"), so capture, encode and send keep up when other programs load the CPU (an
+/// all-core build delayed frames by up to 1.9 s). Not HIGH: a game on this machine must keep
+/// its share. Called at --server start and on every hardware capture start, so a changed
+/// option applies from the next capture restart.
+pub fn raise_server_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    };
+    let class = if host_priority_boost_enabled() {
+        ABOVE_NORMAL_PRIORITY_CLASS
+    } else {
+        NORMAL_PRIORITY_CLASS
+    };
+    if let Err(e) = unsafe { SetPriorityClass(GetCurrentProcess(), class) } {
+        log::warn!("server process priority unchanged: {e}");
+    }
+}
+
+/// The calling thread's MMCSS "Capture" registration; reverted when dropped.
+pub struct MmcssCapture(Option<windows::Win32::Foundation::HANDLE>);
+
+/// Registers the calling thread (the video capture/encode loop) with the Multimedia Class
+/// Scheduler as a "Capture" task: Windows then keeps scheduling it under CPU load, as it does
+/// for audio and video capture.
+pub fn mmcss_capture() -> MmcssCapture {
+    use windows::{core::w, Win32::System::Threading::AvSetMmThreadCharacteristicsW};
+    raise_server_priority();
+    if !host_priority_boost_enabled() {
+        return MmcssCapture(None);
+    }
+    let mut task_index = 0u32;
+    match unsafe { AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index) } {
+        Ok(handle) => MmcssCapture(Some(handle)),
+        Err(e) => {
+            log::warn!("MMCSS Capture registration failed: {e}");
+            MmcssCapture(None)
+        }
+    }
+}
+
+impl Drop for MmcssCapture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = unsafe {
+                windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
+            };
+        }
+    }
+}
+
+/// True when the foreground app (typically a game) has hidden the cursor AND confined it to
+/// clearly less than the virtual screen. Hidden alone never counts: without a mouse attached,
+/// Windows hides the cursor everywhere.
+pub fn is_pointer_captured() -> bool {
+    // Absorbs rounding of an unconfined rect in a DPI-virtualised process.
+    const TOLERANCE: i32 = 8;
+    unsafe {
+        let mut ci: CURSORINFO = mem::zeroed();
+        ci.cbSize = std::mem::size_of::<CURSORINFO>() as _;
+        // In-process, like GetClipCursor below: the portable-service sample is read once per
+        // poll by get_cursor(), and reading it here would leave get_cursor() without one.
+        if GetCursorInfo(&mut ci) == FALSE {
+            return false;
+        }
+        if ci.flags & CURSOR_SHOWING != 0 && !ci.hCursor.is_null() {
+            return false;
+        }
+        let mut clip: RECT = mem::zeroed();
+        if GetClipCursor(&mut clip) == FALSE {
+            return false;
+        }
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        (clip.right - clip.left) < width - TOLERANCE || (clip.bottom - clip.top) < height - TOLERANCE
+    }
+}
+
 struct IconInfo(ICONINFO);
 
 impl IconInfo {

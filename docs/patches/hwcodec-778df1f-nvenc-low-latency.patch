@@ -1,0 +1,77 @@
+diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
+index 45810b4..b251804 100644
+--- a/cpp/common/util.cpp
++++ b/cpp/common/util.cpp
+@@ -70,6 +70,20 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
+       LOG_ERROR(std::string("nvenc set_lantency_free failed, ret = ") + av_err2str(ret));
+       return false;
+     }
++    // Without these FFmpeg nvenc runs its defaults, preset p4 with tune hq,
++    // tuned for quality rather than latency. Best effort: an option this
++    // FFmpeg build does not know keeps its default instead of failing the
++    // encoder (this function also runs in the availability test encode).
++    // The driver only checks preset/tune in avcodec_open2; P2 with ULL is in
++    // the documented NVENC preset matrix for H.264 and HEVC.
++    const char *low_latency[][2] = {
++        {"preset", "p2"}, {"tune", "ull"}, {"zerolatency", "1"}, {"rc-lookahead", "0"}};
++    for (const auto &opt : low_latency) {
++      if ((ret = av_opt_set(priv_data, opt[0], opt[1], 0)) < 0) {
++        LOG_WARN(std::string("nvenc set ") + opt[0] + "=" + opt[1] + " failed, ret = " +
++                 av_err2str(ret));
++      }
++    }
+   }
+   if (name.find("amf") != std::string::npos) {
+     if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
+diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
+index 0a8d1b1..4f1da97 100644
+--- a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
++++ b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
+@@ -363,7 +363,8 @@ private:
+     }
+   _exit:
+     av_packet_unref(pkt_);
+-    return encoded ? 0 : -1;
++    // Callers only test for nonzero; pass FFmpeg's code (e.g. EAGAIN) on.
++    return encoded ? 0 : (ret < 0 ? ret : -1);
+   }
+ 
+   int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
+diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
+index 2b21b73..63789ed 100644
+--- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
++++ b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
+@@ -256,9 +256,11 @@ public:
+   }
+ 
+   int set_framerate(int framerate) {
+-    c_->time_base = av_make_q(1, framerate);
+-    c_->framerate = av_inv_q(c_->time_base);
+-    return 0;
++    // An open FFmpeg encoder does not take a new frame rate (nvenc reads it
++    // only at init), and time_base must stay 1/1000 for the ms pts.
++    LOG_WARN(std::string("not support change framerate, ") + encoder_->name_ +
++             ", requested " + std::to_string(framerate));
++    return -1;
+   }
+ 
+ private:
+@@ -339,7 +341,8 @@ private:
+     }
+   _exit:
+     av_packet_unref(pkt_);
+-    return encoded ? 0 : -1;
++    // Callers only test for nonzero; pass FFmpeg's code (e.g. EAGAIN) on.
++    return encoded ? 0 : (ret < 0 ? ret : -1);
+   }
+ 
+   bool convert(void *texture) {
+@@ -486,7 +489,7 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
+ 
+ int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
+   try {
+-    return encoder->set_bitrate(framerate);
++    return encoder->set_framerate(framerate);
+   } catch (const std::exception &e) {
+     LOG_ERROR(std::string("ffmpeg_vram_set_framerate failed, ") + std::string(e.what()));
+   }

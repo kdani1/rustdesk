@@ -154,6 +154,14 @@ class _RemotePageState extends State<RemotePage>
       WidgetsBinding.instance.addObserver(this);
       _tabStateSubscription =
           widget.tabController?.state.listen(_onMacOSTabStateChanged);
+    } else if (isWindows) {
+      // A deselected tab gives up keyboard focus, so it stops counting as the session under
+      // the pointer (automatic game mode) and stops taking keys.
+      _tabStateSubscription = widget.tabController?.state.listen((_) {
+        if (!_isSelectedTab && _rawKeyFocusNode.hasFocus) {
+          _rawKeyFocusNode.unfocus();
+        }
+      });
     }
     Get.put<FFI>(_ffi, tag: widget.id);
     _ffi.imageModel.addCallbackOnFirstImage((String peerId) {
@@ -644,9 +652,9 @@ class _RemotePageState extends State<RemotePage>
       if (closeSession) {
         _releaseMacOSRemoteInput();
       }
-      _tabStateSubscription?.cancel();
       WidgetsBinding.instance.removeObserver(this);
     }
+    _tabStateSubscription?.cancel();
     super.dispose();
     debugPrint("REMOTE PAGE dispose session $sessionId ${widget.id}");
 

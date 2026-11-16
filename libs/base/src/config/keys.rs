@@ -185,6 +185,14 @@ pub const OPTION_PRE_ELEVATE_SERVICE: &str = "pre-elevate-service";
 // "Y" turns on the LATENCY log lines: local option on the viewer, server option on the host.
 // Compared with "Y" directly because option2bool() treats "enable-*" as on by default.
 pub const OPTION_ENABLE_LATENCY_LOG: &str = "enable-latency-log";
+// Windows viewer: "N" keeps the Flutter-based relative mouse instead of raw input (on by default).
+pub const OPTION_ENABLE_RAW_RELATIVE_MOUSE: &str = "enable-raw-relative-mouse";
+// Windows viewer: enter relative mouse mode when the peer's game takes the pointer (on by default).
+pub const OPTION_ENABLE_AUTO_GAME_MODE: &str = "enable-auto-game-mode";
+// Windows host, server option: "N" keeps the server process and the capture thread at normal
+// priority (on by default: ABOVE_NORMAL process, MMCSS "Capture" for a hardware-encoder video
+// thread). A change applies from the next capture restart.
+pub const OPTION_ENABLE_HOST_PRIORITY_BOOST: &str = "enable-host-priority-boost";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -251,6 +259,8 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_KEEP_SCREEN_ON,
     // Client-side: keep client system awake during outgoing sessions (General setting)
     OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS,
+    OPTION_ENABLE_RAW_RELATIVE_MOUSE,
+    OPTION_ENABLE_AUTO_GAME_MODE,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
     OPTION_PRE_ELEVATE_SERVICE,

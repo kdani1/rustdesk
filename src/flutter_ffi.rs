@@ -300,6 +300,9 @@ pub fn will_session_close_close_session(session_id: SessionID) -> SyncReturn<boo
 }
 
 pub fn session_close(session_id: SessionID) {
+    // The raw-input thread holds a clone of the session; end it with the session.
+    #[cfg(windows)]
+    crate::platform::windows_raw_mouse::stop(&session_id.to_string());
     if let Some(session) = sessions::remove_session_by_session_id(&session_id) {
         // `release_remote_keys` is not required for mobile platforms in common cases.
         // But we still call it to make the code more stable.
@@ -1385,6 +1388,52 @@ pub fn main_clip_cursor(
     {
         let _ = (left, top, right, bottom, enable);
         SyncReturn(false)
+    }
+}
+
+/// Starts or stops raw-input relative mouse deltas for a session (Windows viewer only).
+///
+/// # Returns
+/// - `1`: started (or stopped)
+/// - `0`: the foreground window is not this app's, or not under the cursor, yet; retry later
+/// - `-2`: another session owns raw input
+/// - `-1`: unavailable (other platforms, turned off, registration failed)
+///
+/// On `-1`/`-2` a manual enable keeps the Flutter-based relative mouse path.
+pub fn session_set_raw_relative_mouse(session_id: SessionID, enable: bool) -> SyncReturn<i32> {
+    #[cfg(windows)]
+    {
+        let owner = session_id.to_string();
+        if !enable {
+            crate::platform::windows_raw_mouse::stop(&owner);
+            return SyncReturn(1);
+        }
+        let Some(session) = sessions::get_session_by_session_id(&session_id) else {
+            return SyncReturn(-1);
+        };
+        use crate::platform::windows_raw_mouse::{RawButton, RawMouseEvent};
+        let sink = Box::new(move |event: RawMouseEvent| match event {
+            RawMouseEvent::Move(dx, dy) => {
+                session.send_mouse(MOUSE_TYPE_MOVE_RELATIVE, dx, dy, false, false, false, false);
+            }
+            RawMouseEvent::Button { button, down } => {
+                let button = match button {
+                    RawButton::Left => MOUSE_BUTTON_LEFT,
+                    RawButton::Right => MOUSE_BUTTON_RIGHT,
+                    RawButton::Middle => MOUSE_BUTTON_WHEEL,
+                    RawButton::Back => MOUSE_BUTTON_BACK,
+                    RawButton::Forward => MOUSE_BUTTON_FORWARD,
+                };
+                let kind = if down { MOUSE_TYPE_DOWN } else { MOUSE_TYPE_UP };
+                session.send_mouse(kind | (button << 3), 0, 0, false, false, false, false);
+            }
+        });
+        SyncReturn(crate::platform::windows_raw_mouse::start(owner, sink))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (session_id, enable);
+        SyncReturn(-1)
     }
 }
 

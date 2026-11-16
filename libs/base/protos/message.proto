@@ -876,6 +876,10 @@ message Misc {
     // by id again, so the shape just selected is always there to give.
     uint64 request_cursor_data = 39;
     MicrophoneForwarding microphone_forwarding = 40;
+    // Fork-only (high tag, clear of upstream's next numbers): the peer's foreground app has
+    // hidden and confined the pointer (a game took the mouse), or released it. Sent on change.
+    // Older controllers ignore it.
+    bool pointer_captured = 1001;
   }
 }
 

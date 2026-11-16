@@ -2184,6 +2184,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::Misc(misc)) => match misc.union {
+                    Some(misc::Union::PointerCaptured(captured)) => {
+                        self.handler.on_pointer_captured(captured);
+                    }
                     Some(misc::Union::MicrophoneForwarding(response)) => {
                         if response.response && self.microphone_id == Some(response.request_id) {
                             if !response.enabled {

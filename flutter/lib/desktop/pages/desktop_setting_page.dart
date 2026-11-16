@@ -497,6 +497,9 @@ class _GeneralState extends State<_General> {
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
             kOptionEnableConfirmClosingTabs,
             isServer: false),
+      if (isWindows && !incomingOnly)
+        _OptionCheckBox(context, 'Auto game mode', kOptionEnableAutoGameMode,
+            isServer: false),
       if (!incomingOnly)
         _OptionCheckBox(
           context,

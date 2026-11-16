@@ -1061,6 +1061,11 @@ impl InvokeUiSession for FlutterHandler {
         self.push_event("microphone_forwarding", &[("state", state), ("error", error)], &[]);
     }
 
+    fn on_pointer_captured(&self, captured: bool) {
+        let captured = if captured { "1" } else { "0" };
+        self.push_event("pointer_captured", &[("captured", captured)], &[]);
+    }
+
     fn on_voice_call_started(&self) {
         self.push_event::<&str>("on_voice_call_started", &[], &[]);
     }

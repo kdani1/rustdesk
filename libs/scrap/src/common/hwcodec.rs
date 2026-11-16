@@ -236,7 +236,7 @@ impl HwRamEncoder {
                 data.append(v);
                 Ok(data)
             }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Err(code) => Err(anyhow!("hwcodec encode produced no packet, code: {code}")),
         }
     }
 

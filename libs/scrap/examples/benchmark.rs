@@ -281,10 +281,11 @@ mod hw {
                     let tmp_timer = Instant::now();
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data).unwrap();
                     let yuv = frame.yuv().unwrap();
-                    for ref frame in encoder
+                    // An encoder that buffers its first frames returns Err with no packet.
+                    let frames = encoder
                         .encode(&yuv, start.elapsed().as_millis() as _)
-                        .unwrap()
-                    {
+                        .unwrap_or_default();
+                    for ref frame in frames {
                         size += frame.data.len();
 
                         h26xs.push(frame.data.to_vec());

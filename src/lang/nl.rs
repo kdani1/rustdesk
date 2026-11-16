@@ -788,5 +788,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Stop forwarding microphone", ""),
         ("Cancel microphone forwarding", ""),
         ("Microphone permission denied", ""),
+        ("Auto game mode", ""),
     ].iter().cloned().collect();
 }

@@ -1222,6 +1222,14 @@ class InputModel {
     return _relativeMouse.setRelativeMouseMode(enabled);
   }
 
+  /// The peer reports that its foreground app (a game) took or released the pointer.
+  /// Windows viewers follow it when the auto game mode option is on.
+  void onHostPointerCaptured(bool captured) {
+    if (!isDesktop || !isWindows || isViewOnly) return;
+    _relativeMouse.onHostPointerCaptured(
+        captured, mainGetLocalBoolOptionSync(kOptionEnableAutoGameMode));
+  }
+
   /// Exit relative mouse mode and release all modifier keys to the remote.
   /// This is called when the user presses the exit shortcut (Ctrl+Alt on Win/Linux, Cmd+G on macOS).
   /// We need to send key-up events for all modifiers because the shortcut itself may have
@@ -1306,6 +1314,8 @@ class InputModel {
       isPhysicalMouse.value = true;
     }
     if (isPhysicalMouse.value) {
+      // An automatic entry that had to wait for this window to be in front.
+      _relativeMouse.retryAutoEnter();
       if (!_relativeMouse.handleRelativeMouseMove(e.localPosition)) {
         final canvasPosition = _pointerPositionForRemoteCanvas(e);
         handleMouse(_getMouseEvent(e, _kMouseEventMove), canvasPosition,

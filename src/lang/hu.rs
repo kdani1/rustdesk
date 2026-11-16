@@ -788,5 +788,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Stop forwarding microphone", "Mikrofontovábbítás leállítása"),
         ("Cancel microphone forwarding", "Mikrofontovábbítás megszakítása"),
         ("Microphone permission denied", "Nincs mikrofonengedély"),
+        ("Auto game mode", "Automatikus játék mód"),
     ].iter().cloned().collect();
 }

@@ -408,6 +408,8 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             #[cfg(windows)]
             crate::privacy_mode::restore_reg_connectivity(true, false);
+            #[cfg(windows)]
+            crate::platform::windows::raise_server_priority();
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 crate::start_server(true, false);

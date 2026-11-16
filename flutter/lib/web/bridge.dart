@@ -2035,6 +2035,11 @@ class RustdeskImpl {
     return false;
   }
 
+  int sessionSetRawRelativeMouse(
+      {required UuidValue sessionId, required bool enable, dynamic hint}) {
+    return -1;
+  }
+
   String mainResolveAvatarUrl({required String avatar, dynamic hint}) {
     return js.context.callMethod(
             'getByName', ['resolve_avatar_url', avatar])?.toString() ??

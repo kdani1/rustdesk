@@ -13,6 +13,7 @@ import 'package:get/get.dart';
 import '../common.dart';
 import '../consts.dart';
 import 'platform_model.dart';
+import 'state_model.dart';
 
 class RelativeMouseModel {
   final SessionID sessionId;
@@ -138,8 +139,61 @@ class RelativeMouseModel {
   }
 
   // Whether native relative mouse mode is currently active for this model
+  // (macOS native monitor, or the Windows raw-input thread in Rust).
   bool get _isNativeRelativeMouseModeActive =>
-      isMacOS && _activeNativeModel == this;
+      (isMacOS && _activeNativeModel == this) || _rawInputActive;
+
+  // Windows: raw-input deltas are sent by Rust (session_set_raw_relative_mouse), so the
+  // position-derived deltas, recenter and clip handling below stay off.
+  bool _rawInputActive = false;
+
+  /// Windows only. Returns the raw-input start result: 1 started, 0 this window is not in
+  /// front or not under the cursor yet, -2 another session owns raw input, -1 unavailable
+  /// (turned off, registration failed). On -1/-2 a manual enable uses the Flutter-based path.
+  int _startRawInput() {
+    final r = bind.sessionSetRawRelativeMouse(sessionId: sessionId, enable: true);
+    _rawInputActive = r == 1;
+    return r;
+  }
+
+  void _stopRawInput() {
+    if (!_rawInputActive) return;
+    _rawInputActive = false;
+    bind.sessionSetRawRelativeMouse(sessionId: sessionId, enable: false);
+  }
+
+  // Automatic game mode (Windows viewer): relative mode follows the peer's pointer capture.
+  // _autoEntered: the current relative mode was started by it, so a release ends it.
+  // _autoPending: a capture arrived before the window could take it; retried on hover.
+  bool _autoEntered = false;
+  bool _autoPending = false;
+
+  void onHostPointerCaptured(bool captured, bool autoOn) {
+    _autoPending = false;
+    if (captured) {
+      if (!autoOn || enabled.value) return;
+      // Only the session under the pointer in the focused window takes the mouse; a
+      // background tab or another window waits for a hover over its own image.
+      if (!stateGlobal.isFocused.value || !getPointerInsideImage()) {
+        _autoPending = true;
+        return;
+      }
+      _autoEntered = setRelativeMouseMode(true, auto: true);
+    } else if (_autoEntered) {
+      _autoEntered = false;
+      if (enabled.value) {
+        setRelativeMouseMode(false);
+      } else {
+        _enableRequestId++; // drop a Flutter-path entry that is still completing
+      }
+    }
+  }
+
+  void retryAutoEnter() {
+    if (!_autoPending || enabled.value || !stateGlobal.isFocused.value) return;
+    _autoPending = false;
+    _autoEntered = setRelativeMouseMode(true, auto: true);
+  }
 
   // Pointer lock center in LOCAL widget coordinates (for delta calculation)
   Offset? _pointerLockCenterLocal;
@@ -379,7 +433,9 @@ class RelativeMouseModel {
     setRelativeMouseMode(!enabled.value);
   }
 
-  bool setRelativeMouseMode(bool value) {
+  /// [auto]: started by automatic game mode (no toasts; waits instead of failing when the
+  /// session window is not ready or not in front yet).
+  bool setRelativeMouseMode(bool value, {bool auto = false}) {
     // Web is not supported due to Pointer Lock API integration complexity with Flutter's input system
     if (isWeb) {
       return false;
@@ -391,6 +447,10 @@ class RelativeMouseModel {
       }
 
       if (isDesktop && _imageWidgetSize == null) {
+        if (auto) {
+          _autoPending = true;
+          return false;
+        }
         // Desktop only: Ensure image widget size is available for proper center calculation.
         showToast(translate('rel-mouse-not-ready-tip'));
         return false;
@@ -398,15 +458,18 @@ class RelativeMouseModel {
 
       if (!isSupported) {
         // Check server version support before enabling.
-        showToast(translate('rel-mouse-not-supported-peer-tip'));
+        if (!auto) showToast(translate('rel-mouse-not-supported-peer-tip'));
         return false;
       }
     }
 
     if (value) {
+      // A manual enable is never owned by automatic game mode.
+      if (!auto) _autoEntered = false;
       try {
         if (isDesktop) {
           final requestId = ++_enableRequestId;
+          final rawStart = isWindows ? _startRawInput() : -1;
           if (isMacOS) {
             // macOS: Use native relative mouse mode with CGAssociateMouseAndMouseCursorPosition
             // This locks the cursor in place and provides raw delta via NSEvent monitor.
@@ -421,6 +484,15 @@ class RelativeMouseModel {
               }
               // Note: _enableNativeRelativeMouseMode already handles its own cleanup on failure
             });
+          } else if (rawStart == 1) {
+            // Windows: raw-input deltas from Rust; the cursor is confined there.
+            _completeEnableRelativeMouseMode(
+                showTip: !auto || stateGlobal.fullscreen.isTrue);
+          } else if (auto && (rawStart == 0 || rawStart == -2)) {
+            // Not in front yet, or another session holds raw input: retried on the next
+            // hover over the remote image instead of falling back to the Flutter path.
+            _autoPending = true;
+            return false;
           } else {
             // Windows/Linux: Use Flutter-based cursor recenter approach
             if (!getPointerInsideImage()) {
@@ -431,7 +503,8 @@ class RelativeMouseModel {
               if (_enableRequestId != requestId) {
                 return;
               }
-              _completeEnableRelativeMouseMode();
+              _completeEnableRelativeMouseMode(
+                showTip: !auto || stateGlobal.fullscreen.isTrue);
             }).catchError((e) {
               if (_enableRequestId != requestId) {
                 return;
@@ -449,6 +522,10 @@ class RelativeMouseModel {
         return false;
       }
     } else {
+      // Any exit, manual or automatic, ends the automatic entry: the next one comes with the
+      // next capture edge from the peer.
+      _autoPending = false;
+      _autoEntered = false;
       // Best-effort marker for Rust rdev grab loop (ESC behavior).
       // Bypass keyboardPerm check to ensure Rust state is always synced,
       // even if permission was revoked while relative mode was active.
@@ -467,6 +544,7 @@ class RelativeMouseModel {
           // This already calls CGAssociateMouseAndMouseCursorPosition(1) to re-associate mouse
           _disableNativeRelativeMouseMode();
         } else {
+          _stopRawInput();
           _releaseCursorClip();
         }
       }
@@ -479,11 +557,11 @@ class RelativeMouseModel {
   }
 
   /// Called when platform setup completes successfully to finalize enabling relative mouse mode.
-  void _completeEnableRelativeMouseMode() {
+  void _completeEnableRelativeMouseMode({bool showTip = true}) {
     enabled.value = true;
 
     // Show toast notification so user knows how to exit relative mouse mode (desktop only).
-    if (isDesktop) {
+    if (isDesktop && showTip) {
       showToast(
           translate('rel-mouse-exit-{${isMacOS ? "Cmd+G" : "Ctrl+Alt"}}-tip'),
           alignment: Alignment.center);
@@ -662,6 +740,9 @@ class RelativeMouseModel {
   /// Send mouse button event without position (for relative mouse mode).
   Future<void> sendRelativeMouseButton(Map<String, dynamic> evt) async {
     if (!enabled.value) return;
+    // Windows raw input sends the buttons itself, in order with the motion (and chords, which
+    // Flutter reports as moves). Sending them here too would press them twice.
+    if (_rawInputActive) return;
     _ensurePointerLockEngaged();
 
     final rawType = evt['type'];
@@ -766,6 +847,8 @@ class RelativeMouseModel {
 
   Future<void> updatePointerLockCenter({Offset? localCenter}) async {
     if (!isDesktop) return;
+    // Windows raw input: Rust confines the cursor; no Dart centre, clip or recenter.
+    if (_rawInputActive) return;
 
     // Null safety check for kWindowId.
     if (kWindowId == null) {
@@ -895,6 +978,7 @@ class RelativeMouseModel {
     if (!isDesktop) return;
 
     setPointerInsideImage(true);
+    if (_rawInputActive) return;
 
     final needsCenter =
         _pointerLockCenterLocal == null || _pointerLockCenterScreen == null;
@@ -1031,6 +1115,7 @@ class RelativeMouseModel {
     if (isMacOS) {
       _disableNativeRelativeMouseMode();
     } else {
+      _stopRawInput();
       _releaseCursorClip();
     }
 

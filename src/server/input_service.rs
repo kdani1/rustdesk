@@ -37,6 +37,29 @@ struct StateCursor {
     hcursor: u64,
     cursor_data: Arc<Message>,
     cached_cursor_data: HashMap<u64, Arc<Message>>,
+    // A game has hidden and confined the pointer (see is_pointer_captured); sent on change.
+    #[cfg(windows)]
+    pointer_captured: bool,
+}
+
+#[cfg(windows)]
+fn pointer_captured_message(captured: bool) -> Message {
+    let mut misc = Misc::new();
+    misc.set_pointer_captured(captured);
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    msg
+}
+
+/// Runs on every cursor poll, before anything in run_cursor can return early.
+#[cfg(windows)]
+fn check_pointer_captured(sp: &MouseCursorService, state: &mut StateCursor) {
+    let captured = crate::platform::windows::is_pointer_captured();
+    if captured != state.pointer_captured {
+        state.pointer_captured = captured;
+        super::log::info!("pointer captured: {captured}");
+        sp.send(pointer_captured_message(captured));
+    }
 }
 
 impl super::service::Reset for StateCursor {
@@ -393,6 +416,8 @@ fn run_pos(sp: EmptyExtraFieldService, state: &mut StatePos) -> ResultType<()> {
 }
 
 fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()> {
+    #[cfg(windows)]
+    check_pointer_captured(&sp, state);
     if let Some(hcursor) = crate::get_cursor()? {
         if hcursor != state.hcursor {
             let msg;
@@ -466,6 +491,11 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
     }
     sp.snapshot(|sps| {
         sps.send_shared(state.cursor_data.clone());
+        // A controller that joins mid-game learns the capture state too.
+        #[cfg(windows)]
+        if state.pointer_captured {
+            sps.send(pointer_captured_message(true));
+        }
         Ok(())
     })?;
     Ok(())

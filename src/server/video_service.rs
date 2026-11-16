@@ -688,6 +688,12 @@ fn run(vs: VideoService) -> ResultType<()> {
             )?
         }
     };
+    // Capture and encode run on this thread: keep it scheduled under CPU load. Only with a
+    // hardware encoder; a software encode at MMCSS priority would take CPU from a game.
+    #[cfg(windows)]
+    let _mmcss = encoder
+        .is_hardware()
+        .then(crate::platform::windows::mmcss_capture);
     #[cfg(feature = "vram")]
     c.set_output_texture(encoder.input_texture());
     #[cfg(target_os = "android")]

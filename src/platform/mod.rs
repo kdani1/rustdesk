@@ -11,6 +11,9 @@ pub mod windows;
 #[cfg(windows)]
 pub mod win_device;
 
+#[cfg(windows)]
+pub mod windows_raw_mouse;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 
