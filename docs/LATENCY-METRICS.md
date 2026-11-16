@@ -473,14 +473,14 @@ below lane v4). The window line gets, while the lane sends parity:
 | `fec_frames` | frames sent with parity |
 | `fec_dgrams` | parity datagrams among `dgrams` (`kB` includes them) |
 | `fec_off` | frames sent without parity because they are larger than 4 blocks of 254 fragments (about 1.37 MB) |
-| `fec_ms` | p50/p95/max of the parity encoding time per protected frame (part of `send_ms`) |
+| `fec_ms` | p50/p95/max of the parity encoding time per protected frame (part of `send_ms`). Each block's parity is encoded after its data shards were handed to the socket, so it delays later blocks and the parity, never the first datagram or `send_us` |
 
 Viewer: `fec` in the `accepted` line is the host's percentage. Both window lines (shadow and
 live) end with:
 
 | Field | Meaning |
 |---|---|
-| `fec_rec` | frames that completed only because lost data fragments were rebuilt from parity: losses repaired on arrival, with no key frame, request or wait |
+| `fec_rec` | delivered frames that completed only because lost data fragments were rebuilt from parity: losses repaired on arrival, with no key frame, request or wait. Counted on delivery: a rebuilt frame that is then gated behind an earlier loss counts in `gated` only. A data fragment merely reordered behind the parity that rebuilt it also counts here (the frame completed early) and then as `dup` |
 | `fec_unrec` | frames declared lost although at least one of their shards arrived and carried FEC: a block missed more shards than parity arrived. Part of `lost`; a frame of which nothing arrived counts in `lost` only |
 | `fec_shards` | data fragments rebuilt |
 | `parity` | parity datagrams received, also those of frames that needed none (they arrive after the frame was delivered and are only counted) |

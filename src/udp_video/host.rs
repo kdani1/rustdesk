@@ -1260,24 +1260,28 @@ struct Window {
 }
 
 impl Window {
-    /// Adds parity to a frame's fragments at `percent` and counts it.
+    /// The frame's shards with parity at `percent` (0: none), counted. Parity is encoded lazily
+    /// as the shards are taken (each block's after its data shards), so the first datagram does
+    /// not wait for it; pass the iterator to `protected` once it is drained.
     fn protect<'a>(
         &mut self,
         parts: Vec<(super::packet::VideoHeader, &'a [u8])>,
         percent: u32,
-    ) -> Vec<Shard<'a>> {
-        if percent == 0 {
-            return parts.into_iter().map(|(h, p)| Shard::Data(h, p)).collect();
-        }
-        let begin = Instant::now();
-        let (shards, blocks) = fec::protect(parts, percent);
-        if blocks > 0 {
+    ) -> fec::Protect<'a> {
+        let shards = fec::Protect::new(parts, percent);
+        if shards.blocks() > 0 {
             self.fec_frames += 1;
-            self.fec_enc.push_duration(begin.elapsed());
-        } else {
+        } else if percent > 0 {
             self.fec_off += 1;
         }
         shards
+    }
+
+    /// Records the encode time of a drained `protect` iterator.
+    fn protected(&mut self, shards: &fec::Protect<'_>) {
+        if shards.blocks() > 0 {
+            self.fec_enc.push_duration(shards.encode_time());
+        }
     }
 }
 
@@ -1571,14 +1575,20 @@ fn send_live(
             return None;
         }
     };
-    let shards = w.protect(parts, fec_percent);
+    let mut shards = w.protect(parts, fec_percent);
     // The pacer spreads the whole frame, parity included, within half a frame interval.
-    let wire: usize = shards.iter().map(|s| s.payload_len()).sum();
-    p.on_frame(wire, job.queued, begin);
-    let burst = if p.burst == 0 { shards.len() } else { p.burst };
+    p.on_frame(shards.wire_len(), job.queued, begin);
+    // Unpaced: one datagram at a time, so no parity is encoded ahead of the data before it.
+    let burst = if p.burst == 0 { 1 } else { p.burst };
     let mut paced = Duration::ZERO;
     let mut any_sent = false;
-    for chunk in shards.chunks(burst.max(1)) {
+    let mut chunk: Vec<Shard> = Vec::with_capacity(burst);
+    loop {
+        chunk.clear();
+        chunk.extend(shards.by_ref().take(burst));
+        if chunk.is_empty() {
+            break;
+        }
         if p.burst > 0 {
             let chunk_bytes = chunk
                 .iter()
@@ -1591,7 +1601,7 @@ fn send_live(
                 paced += delay;
             }
         }
-        for shard in chunk {
+        for shard in &chunk {
             match seal_send(sender, &shard.inner(), &mut send) {
                 Ok(n) => {
                     w.dgrams += 1;
@@ -1608,6 +1618,7 @@ fn send_live(
             }
         }
     }
+    w.protected(&shards);
     w.frames += 1;
     if job.flags & FLAG_KEY != 0 {
         w.keys += 1;
@@ -1669,7 +1680,8 @@ fn send_job(
             return;
         }
     };
-    for shard in w.protect(parts, fec_percent) {
+    let mut shards = w.protect(parts, fec_percent);
+    for shard in shards.by_ref() {
         match seal_send(sender, &shard.inner(), &mut send) {
             Ok(n) => {
                 w.dgrams += 1;
@@ -1682,6 +1694,7 @@ fn send_job(
             }
         }
     }
+    w.protected(&shards);
     w.frames += 1;
     if job.flags & FLAG_KEY != 0 {
         w.keys += 1;

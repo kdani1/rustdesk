@@ -461,20 +461,26 @@ key frame, no request and no wait.
 - Shard length of a block = its first data shard (only the frame's last fragment is short, and
   it is never a block's first unless it is alone in it); the short last fragment is
   zero-padded in the code, not on the wire, so a frame without loss costs only the parity.
-- Send order: block 0's data, block 0's parity, block 1's data, ... The pacer spreads the whole
-  frame, parity included, within half a frame interval (the frame bytes it sizes the rate on
-  include the parity).
+- Send order: block 0's data, block 0's parity, block 1's data, ... A block's parity is
+  encoded only when the sender reaches it (after its data shards are queued for the socket),
+  so the first datagram, and `send_us`, never wait for FEC; a later block's data waits for the
+  block before it. The pacer spreads the whole frame, parity included, within half a frame
+  interval (the frame bytes it sizes the rate on include the parity, computed without
+  encoding).
 - Overhead: 20% parity plus one datagram header per parity shard; a 1-fragment frame (cursor
   blink, small update) gets 2 parity datagrams (Sunshine does the same). Host CPU: one shard
   pass (1352 B) per parity shard per data shard of its block: about 155 KB of multiply-add for
   a 30 KB P-frame and 7 MB for a 300 KB IDR, estimated at tens of microseconds and under 1 ms
-  with AVX2; `fec_ms` in the host's window line measures it.
+  with AVX2 (nibble tables for all 256 coefficients are built at compile time, so no
+  multiply has setup cost; the scalar path off x86-64 does two table lookups per byte);
+  `fec_ms` in the host's window line measures it.
 
 ### Receiver
 
 - The reassembler keeps parity shards with their pending frame, per block. When a block holds
   at least as many parity shards as it misses data shards it rebuilds them at once and the frame
-  completes (`fec_rec`); its rebuilt last fragment is trimmed back to the frame length. A
+  completes (`fec_rec`, counted when it is delivered, so not for a frame gated after a loss);
+  its rebuilt last fragment is trimmed back to the frame length. A
   frame complete without loss is delivered before its parity arrives; that parity is counted
   (`parity`) and dropped, neither late nor duplicate.
 - Release rule, gate after loss, timeouts and ACKs are unchanged: a frame FEC cannot save is

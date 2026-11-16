@@ -166,7 +166,10 @@ pub struct LossStats {
     pub datagrams_received: u64,
     /// FEC (M21): parity shards received (also those of frames that needed none).
     pub parity_received: u64,
-    /// FEC: frames that completed only because missing data shards were rebuilt from parity.
+    /// FEC: delivered frames that completed only because missing data shards were rebuilt
+    /// from parity. Counted on delivery: a rebuilt frame that is gated after a loss is counted
+    /// in `frames_gated` only. A data fragment that was merely reordered behind the parity that
+    /// rebuilt it also counts here (it completed the frame early) and then as a duplicate.
     pub fec_recovered: u64,
     /// FEC: data shards rebuilt.
     pub fec_shards: u64,
@@ -338,9 +341,6 @@ impl PendingFrame {
         } else if self.received == self.frag_count {
             if self.bytes == self.frame_len as usize {
                 self.completed_at = Some(now);
-                if self.recovered > 0 {
-                    stats.fec_recovered += 1;
-                }
             } else {
                 self.corrupt = true;
                 stats.fragments_invalid += 1;
@@ -688,6 +688,11 @@ impl Reassembler {
             d.awaiting_recovery = false;
         }
         self.stats.frames_completed += 1;
+        // Counted on delivery, not on completion: a rebuilt frame that is then gated behind a
+        // loss saved nothing the decoder can use, and stays only in `frames_gated`.
+        if p.recovered > 0 {
+            self.stats.fec_recovered += 1;
+        }
         let mut data = Vec::with_capacity(p.frame_len as usize);
         for f in p.fragments.into_iter().flatten() {
             data.extend_from_slice(&f);

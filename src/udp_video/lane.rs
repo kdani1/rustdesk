@@ -414,6 +414,27 @@ mod latency_tests {
     }
 
     #[test]
+    fn latency_fec_rebuilt_but_gated_is_not_recovered() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        // Frame 0 arrives whole; frame 1 never arrives; frame 2 (a P-frame) loses one fragment
+        // that parity rebuilds, but it is gated behind the loss of frame 1: FEC saved nothing
+        // the decoder can use.
+        let f0 = frame_bytes(5_000, 1);
+        let d0 = tx.frame_fec(&f0, meta(0, FLAG_KEY), 20).unwrap();
+        send_except(&mut rx, &d0, &[], t0);
+        let _ = tx.frame_fec(&frame_bytes(5_000, 2), meta(1, 0), 20).unwrap();
+        let d2 = tx.frame_fec(&frame_bytes(5_000, 3), meta(2, 0), 20).unwrap();
+        send_except(&mut rx, &d2, &[1], t0);
+        let ev = rx.poll(t0 + Duration::from_millis(60));
+        assert_eq!(frames_of(&ev), vec![(0, f0)]);
+        let (loss, _) = rx.take_stats();
+        assert_eq!((loss.frames_lost, loss.frames_gated), (1, 1));
+        assert_eq!(loss.fec_shards, 1);
+        assert_eq!(loss.fec_recovered, 0);
+    }
+
+    #[test]
     fn latency_fec_too_many_lost_is_unrecoverable() {
         let (mut tx, mut rx) = ends(PathClass::Lan);
         let t0 = Instant::now();

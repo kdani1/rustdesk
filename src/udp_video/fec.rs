@@ -10,8 +10,11 @@
 //! - Data shards may be shorter than the block's shard length (only the frame's last fragment
 //!   is): they count as zero-padded, nothing pads them on the wire.
 //! - Speed: `mul_add` (dst ^= c * src) runs AVX2 or SSSE3 nibble-table shuffles on x86-64
-//!   (runtime detection), a 256-byte row table elsewhere. 20% parity on a 40 KB frame costs
-//!   6 x 30 shard passes of 1352 bytes.
+//!   (runtime detection), two nibble-table lookups per byte elsewhere. The nibble tables of all
+//!   256 coefficients are built at compile time (8 KB), so a call has no setup. 20% parity on a
+//!   40 KB frame costs 6 x 30 shard passes of 1352 bytes.
+//! - Send order: [`Protect`] yields a block's parity only after its data shards, and encodes it
+//!   then, so the frame's first datagram never waits for FEC.
 //!
 //! Layout (Sunshine style): a frame's `n` data fragments are split into at most
 //! [`MAX_BLOCKS`] blocks of at most [`MAX_DATA_PER_BLOCK`] data shards, sizes as equal as
@@ -24,6 +27,7 @@
 
 use super::packet::{Inner, VideoHeader};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 /// Data plus parity shards of one block, at most.
 pub const MAX_SHARDS: usize = 255;
@@ -70,6 +74,34 @@ const fn build_tables() -> Tables {
 }
 
 static GF: Tables = build_tables();
+
+const fn const_mul(t: &Tables, a: u8, b: u8) -> u8 {
+    if a == 0 || b == 0 {
+        0
+    } else {
+        t.exp[t.log[a as usize] as usize + t.log[b as usize] as usize]
+    }
+}
+
+/// `[c][0][i] = c * i` and `[c][1][i] = c * (i << 4)`: the products of `c` with every low and
+/// every high nibble.
+const fn build_nibbles() -> [[[u8; 16]; 2]; 256] {
+    let t = build_tables();
+    let mut out = [[[0u8; 16]; 2]; 256];
+    let mut c = 1;
+    while c < 256 {
+        let mut i = 0;
+        while i < 16 {
+            out[c][0][i] = const_mul(&t, c as u8, i as u8);
+            out[c][1][i] = const_mul(&t, c as u8, (i << 4) as u8);
+            i += 1;
+        }
+        c += 1;
+    }
+    out
+}
+
+static NIBBLES: [[[u8; 16]; 2]; 256] = build_nibbles();
 
 #[inline]
 pub fn mul(a: u8, b: u8) -> u8 {
@@ -123,25 +155,17 @@ pub fn mul_add(dst: &mut [u8], src: &[u8], c: u8) {
 }
 
 fn mul_add_scalar(dst: &mut [u8], src: &[u8], c: u8) {
-    let mut row = [0u8; 256];
-    for (x, r) in row.iter_mut().enumerate() {
-        *r = mul(c, x as u8);
-    }
+    let (lo, hi) = nibble_tables(c);
     for (d, s) in dst.iter_mut().zip(src) {
-        *d ^= row[*s as usize];
+        *d ^= lo[(*s & 0x0f) as usize] ^ hi[(*s >> 4) as usize];
     }
 }
 
-/// Products of `c` with every low nibble and every high nibble.
-#[cfg(target_arch = "x86_64")]
-fn nibble_tables(c: u8) -> ([u8; 16], [u8; 16]) {
-    let mut lo = [0u8; 16];
-    let mut hi = [0u8; 16];
-    for i in 0..16u8 {
-        lo[i as usize] = mul(c, i);
-        hi[i as usize] = mul(c, i << 4);
-    }
-    (lo, hi)
+/// Products of `c` with every low nibble and every high nibble (precomputed).
+#[inline]
+fn nibble_tables(c: u8) -> (&'static [u8; 16], &'static [u8; 16]) {
+    let t = &NIBBLES[c as usize];
+    (&t[0], &t[1])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -384,47 +408,124 @@ impl Shard<'_> {
 
 /// Adds parity to a fragmented frame (`fragment::fragment`'s output) at `percent`: each block's
 /// data shards, then its parity shards, block after block. Returns the shards and the block
-/// count (0: sent without FEC).
+/// count (0: sent without FEC). Eager form of [`Protect`].
 pub fn protect<'a>(parts: Vec<(VideoHeader, &'a [u8])>, percent: u32) -> (Vec<Shard<'a>>, usize) {
-    let n = parts.len();
-    let blocks = match plan_blocks(n, percent) {
-        Some(b) if parts.first().map_or(false, |(h, _)| h.frame_len > 0) => b,
-        _ => return (parts.into_iter().map(|(h, p)| Shard::Data(h, p)).collect(), 0),
-    };
-    let mut out = Vec::with_capacity(n + n * percent as usize / 100 + MIN_PARITY * blocks);
-    let mut parts = parts.into_iter();
-    for b in 0..blocks {
-        let range = block_range(n, blocks, b);
-        let d = range.len();
-        let parity = parity_for(d, percent);
-        let first = out.len();
-        for (mut h, p) in parts.by_ref().take(d) {
-            h.fec_block = block_byte(blocks, b);
-            h.fec_parity = parity as u8;
-            out.push(Shard::Data(h, p));
-        }
-        let data: Vec<&[u8]> = out[first..]
-            .iter()
-            .map(|s| match s {
-                Shard::Data(_, p) => *p,
-                Shard::Parity(_, p) => p.as_slice(),
-            })
-            .collect();
-        // Only the frame's last fragment is short, so a block's first shard is its longest.
-        let shard_len = data.first().map_or(0, |d| d.len());
-        let template = match &out[first] {
-            Shard::Data(h, _) => *h,
-            Shard::Parity(h, _) => *h,
+    let p = Protect::new(parts, percent);
+    let blocks = p.blocks();
+    (p.collect(), blocks)
+}
+
+/// The shards of a protected frame in send order (each block's data shards, then its parity
+/// shards), encoding a block's parity only when the iterator reaches it: the data shards before
+/// it can be sent while nothing has been encoded yet.
+pub struct Protect<'a> {
+    /// Data fragments with their FEC header fields set.
+    parts: Vec<(VideoHeader, &'a [u8])>,
+    blocks: usize,
+    percent: u32,
+    /// Next data fragment to yield.
+    next: usize,
+    /// Block whose parity is due once `next` reaches its end.
+    block: usize,
+    parity: std::vec::IntoIter<Shard<'a>>,
+    encode_time: Duration,
+}
+
+impl<'a> Protect<'a> {
+    pub fn new(mut parts: Vec<(VideoHeader, &'a [u8])>, percent: u32) -> Self {
+        let n = parts.len();
+        let blocks = match plan_blocks(n, percent) {
+            Some(b) if parts.first().map_or(false, |(h, _)| h.frame_len > 0) => b,
+            _ => 0,
         };
-        for (r, p) in encode(&data, shard_len, parity).into_iter().enumerate() {
-            let h = VideoHeader {
-                frag_index: r as u16,
-                ..template
-            };
-            out.push(Shard::Parity(h, p));
+        for b in 0..blocks {
+            let range = block_range(n, blocks, b);
+            let parity = parity_for(range.len(), percent) as u8;
+            for (h, _) in &mut parts[range] {
+                h.fec_block = block_byte(blocks, b);
+                h.fec_parity = parity;
+            }
+        }
+        Self {
+            parts,
+            blocks,
+            percent,
+            next: 0,
+            block: 0,
+            parity: Vec::new().into_iter(),
+            encode_time: Duration::ZERO,
         }
     }
-    (out, blocks)
+
+    /// Block count (0: no FEC).
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Payload bytes of all shards, parity included, without encoding anything.
+    pub fn wire_len(&self) -> usize {
+        let data: usize = self.parts.iter().map(|(_, p)| p.len()).sum();
+        let n = self.parts.len();
+        let parity: usize = (0..self.blocks)
+            .map(|b| {
+                let range = block_range(n, self.blocks, b);
+                // Only the frame's last fragment is short, so a block's first shard is its
+                // longest: the parity length.
+                parity_for(range.len(), self.percent) * self.parts[range.start].1.len()
+            })
+            .sum();
+        data + parity
+    }
+
+    /// Time spent encoding parity so far.
+    pub fn encode_time(&self) -> Duration {
+        self.encode_time
+    }
+
+    /// Encodes the parity of block `self.block` and moves on to the next block.
+    fn encode_block(&mut self) {
+        let begin = Instant::now();
+        let range = block_range(self.parts.len(), self.blocks, self.block);
+        let data: Vec<&[u8]> = self.parts[range.clone()].iter().map(|(_, p)| *p).collect();
+        let shard_len = data.first().map_or(0, |d| d.len());
+        let template = self.parts[range.start].0;
+        let parity = parity_for(data.len(), self.percent);
+        let shards: Vec<Shard<'a>> = encode(&data, shard_len, parity)
+            .into_iter()
+            .enumerate()
+            .map(|(r, p)| {
+                let h = VideoHeader {
+                    frag_index: r as u16,
+                    ..template
+                };
+                Shard::Parity(h, p)
+            })
+            .collect();
+        self.parity = shards.into_iter();
+        self.block += 1;
+        self.encode_time += begin.elapsed();
+    }
+}
+
+impl<'a> Iterator for Protect<'a> {
+    type Item = Shard<'a>;
+
+    fn next(&mut self) -> Option<Shard<'a>> {
+        loop {
+            if let Some(s) = self.parity.next() {
+                return Some(s);
+            }
+            if self.block < self.blocks
+                && self.next == block_range(self.parts.len(), self.blocks, self.block).end
+            {
+                self.encode_block();
+                continue;
+            }
+            let (h, p) = *self.parts.get(self.next)?;
+            self.next += 1;
+            return Some(Shard::Data(h, p));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -629,6 +730,18 @@ mod latency_tests {
                 assert_eq!(s.payload_len(), 1352);
             }
         }
+        // Lazy: nothing is encoded before the block's data shards were taken, and the bytes
+        // announced are the bytes yielded.
+        let parts = super::super::fragment::fragment(&frame, meta, 1352).unwrap();
+        let mut lazy = Protect::new(parts, 20);
+        let wire = lazy.wire_len();
+        let firsts: Vec<_> = lazy.by_ref().take(n).collect();
+        assert!(firsts.iter().all(|s| !s.is_parity()));
+        assert_eq!(lazy.encode_time(), Duration::ZERO);
+        let rest: Vec<_> = lazy.collect();
+        assert_eq!(rest.len(), parity);
+        let yielded: usize = firsts.iter().chain(&rest).map(|s| s.payload_len()).sum();
+        assert_eq!(yielded, wire);
         // Off: the fragments unchanged.
         let parts = super::super::fragment::fragment(&frame, meta, 1352).unwrap();
         let (shards, blocks) = protect(parts, 0);
