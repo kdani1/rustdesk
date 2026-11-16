@@ -374,7 +374,9 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
   0.5, one between 0.8 x `k` and `k` with 0.2; one under 0.8 x `k` is content-limited (typing,
   a static screen: the encoder undershoots) and is not learned from (`k_rej`); it only lets
   `k` drift down 1 % (never below the sample), so a real change of the coupling is followed
-  slowly. While `k` drifts so the target is not clamped to the ceiling. The target is kept in
+  slowly. While `k` drifts so the target is not clamped to the ceiling. A second in which the
+  configured bitrate changed (a fast cut, another viewer's, the backstop) gives no sample at
+  all: its rate belongs to two settings. The target is kept in
   measured kbps and
   `would_set_kbps = target / k` is the configured bitrate it would set. So nvenc's frame-rate
   coupling (30-fps budget at 60 fps) and the virtual framerate (M7) do not skew it.
@@ -395,7 +397,10 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
     100 ms while `RTT - MinRTT` < `T_lo`: the viewer does not read; never a cut.
   - `O` OVERUSE: the link is not paused, `Q` stayed above `T_hi` all through the last 100 ms
     (minimum of the step function; a write pending since before the window counts with its
-    age), and the queue grows now or has stood above `T_hi` for 500 ms. Grows: metered, TCP
+    age), and the queue grows now or has stood above `T_hi` for 500 ms without draining
+    (metered: `r_acked` over 1.05 x `r_send` drains it, a cut took effect, so a standing
+    queue is not cut again on every hold while it goes; unmetered rates are equal by
+    construction, unchanged). Grows: metered, TCP
     delivered under 0.95 x what was written over the last 100 ms; unmetered, a write was in
     progress for 80 % of the last 250 ms or more over at least 3 writes, or the last 3 or more
     frames' delays rose by 5 ms and ended above `T_lo`. Paused: metered, under 1500 bytes
@@ -419,7 +424,12 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
     1 s under 0.7 x target), at most every 500 ms: x1.08 per second below 0.9 x `C`, else
     +max(150 kbps, 2 %) per second, never above the ceiling. `C` (`c_kbps`) is the EWMA (0.3)
     of `r_acked` at cuts; OVERUSE within 10 s of reaching 0.9 x `C` lowers it by 10 %, and a
-    target 15 % above `C` forgets it (the link got better);
+    target 15 % above `C` forgets it (the link got better). App-limited (light content, the
+    link is not probed): increases only undo cuts, after 3 s in NORMAL and with frames in the
+    last second, at most back to the target before the cuts and not past `C`, without
+    reaching or forgetting `C` (`app_incs`). So a cut does not stay for as long as the content
+    stays light (the TestDelay loop raised then too), and the target never climbs past what
+    was in place before on unused budget. A quality change forgets the level to restore;
   - a user quality change sets the target to the new ceiling and forgets `C`.
 - **Eligible** (`elig`): `yes`, or why not: `ctx` (no encoder context yet), `vbr` (ABR off or
   an encoder that cannot change bitrate), `ack` (the viewer acks frames, `video_ack_required`:
@@ -461,10 +471,11 @@ the live-mode lines, are described under "Host: fast bitrate adaptation live" be
 | `floor_kbps` / `ceil_kbps` | the configured range QoS allows |
 | `c_kbps` | learned ceiling `C` (measured), `-` when none |
 | `r_send_1s` | send rate over the last second; `r_send` / `r_acked` the newest 500 ms values |
-| `app_lim` | 1: the stream does not use its target (static screen, encoder undershoot): no increase |
+| `app_lim` | 1: the stream does not use its target (static screen, encoder undershoot): increases only undo cuts (after 3 s in NORMAL with frames sent, at most to the target before the cuts and `c_kbps`) |
 | `q` | `Q` at every evaluation, p50/p95/max ms |
 | `st` | evaluations per state N/H/O/S/R in the window |
 | `cuts` / `severe` / `rto` / `rto_ign` / `incs` / `held` / `floor` / `fc` | decisions and skipped cuts in the window (see Decisions) |
+| `app_incs` | of `incs`, the ones made while app-limited (they neither reach nor forget `C`) |
 | `stalls` | capture-loop stall reports for this connection |
 | `k_rej` | full-rate seconds whose `k` sample was content-limited (under 0.8 x `k`): not learned from |
 | `react_max_ms` | largest `react_ms` in the window |
@@ -501,8 +512,13 @@ What changes with `Y` (`src/server/video_qos.rs` `on_fast`, `src/server/video_qo
 
 - **Reports.** After every decision, and once a second without one, a connection's estimator
   reports to the stream its target in configured kbps (`would_set_kbps`; none while shadow,
-  off or not eligible) and the decision. The configured kbps per unit of ratio come from the
-  bitrate the encoder was last set to and the ratio it was set at, so a cut converts exactly.
+  off or not eligible) and the decision. Kbps and ratio convert through the encoder's own
+  bitrate curve: hwcodec RAM and VRAM encoders (NVENC, AMF, QSV) compute their bitrate
+  non-linearly from the ratio (`HwRamEncoder::calc_bitrate`: x2 for H.264, x1.5 for H.265 up
+  to 2000 kbps of base x ratio, decaying toward x1 above), so the video service hands QoS
+  that curve and a kbps target is inverted on it by bisection. The curve is used only while
+  it reproduces the bitrate the encoder was last set to at its ratio (within 1 %); otherwise,
+  and for vpx/aom (linear), the kbps per unit of ratio come from that last set point.
   A connection with a target is "fast"; one without, or one the stream cannot take (`vbr`:
   ABR off or an encoder that cannot change bitrate; `displays`: several video services share
   the ratio; `br`: no bitrate yet; `epoch`: a quality choice since its last context), drops
@@ -706,13 +722,18 @@ A refresh request from the controller logs `Refresh display N to reduce delay
 (queue_len=… tolerable=… refresh_times=…)`.
 
 `field` in `Set fps to` (both controllers): how the fps went to the host (roadmap M16). With
-local option `enable-fps-cap-split` (on by default on Windows, `N` turns it off; off elsewhere
-unless `Y`; read when a connection starts) and a host of version 1.2.2 or later, `auto`: as
-`Misc.auto_adjust_fps` (upstream tag 28). Hosts since 1.2.2 cap the stream at
-min(`custom_fps`, `auto_adjust_fps`), so the effect is the same as before, but `custom_fps`
-stays the user's setting and the host can tell a decode limit from a user choice (the
-`fps_cap` field of `LATENCY fast`). Otherwise `custom`: as `OptionMessage.custom_fps`, as
-before (older hosts, which may not handle tag 28, always get this).
+local option `enable-fps-cap-split` (off by default on every platform, `Y` turns it on,
+until the stock host versions in use are checked to cap on tag 28; read when a connection
+starts) and a host of version 1.2.2 or later, `auto`: as `Misc.auto_adjust_fps` (upstream
+tag 28). Hosts since 1.2.2 cap the stream at min(`custom_fps`, `auto_adjust_fps`), so the
+effect is the same as before, but `custom_fps` stays the user's setting and the host can tell
+a decode limit from a user choice (the `fps_cap` field of `LATENCY fast`). Otherwise
+`custom`: as `OptionMessage.custom_fps`, as before (older hosts, which may not handle tag 28,
+always get this). Before the split a user `custom_fps` replaced the controller's limit on the
+host; with it the host would keep the lower auto cap, so a user `custom_fps` above the last
+auto cap sent on the connection is followed by `auto_adjust_fps` = that custom fps, logged
+`Set fps to N (field=auto reason=user-custom)`, and both controllers start again from the
+user's fps as before.
 
 #### Gentle fps control
 

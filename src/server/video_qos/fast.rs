@@ -68,6 +68,12 @@ const HOLD_MIN_US: u64 = 250_000;
 /// Increases need this long in NORMAL, at most one per spacing.
 const INCREASE_AFTER_US: u64 = 1_000_000;
 const INCREASE_SPACING_US: u64 = 500_000;
+/// App-limited (light content leaves the target unused, so the link is not probed): increases
+/// need this long in NORMAL and frames in the last second, and only undo cuts: at most back to
+/// the target before them, and not past the learned ceiling `C`. So a cut does not stay for
+/// as long as the content stays light (the old loop raised then too), but the target is never
+/// raised past what the link carried on unused budget.
+const APP_LIMITED_INCREASE_AFTER_US: u64 = 3_000_000;
 /// Below 0.9 x the learned ceiling: x1.08 per second (GCC); near it: +max(150 kbps, 2 %) per s.
 const MULT_INCREASE_PER_S: f64 = 1.08;
 const ADD_INCREASE_KBPS_PER_S: f64 = 150.0;
@@ -88,6 +94,9 @@ const RTO_AFTER_CUT_US: u64 = 500_000;
 const DELIVERY_SHORTFALL: f64 = 0.95;
 /// A queue above `T_hi` for this long is standing, not a transient: OVERUSE without growth.
 const STANDING_WINDOW_US: u64 = 500_000;
+/// Metered: delivery above this share of the send rate drains a standing queue (a cut took
+/// effect): no OVERUSE for it, the queue goes by itself.
+const DRAINING_SHARE: f64 = 1.05;
 /// No delivery for this long is a pause of the link (Wi-Fi airtime), not a capacity shortfall:
 /// it never counts as OVERUSE (a long one still is SEVERE through the capture loop's stall).
 const PAUSE_WINDOW_US: u64 = 100_000;
@@ -287,6 +296,8 @@ pub struct Counters {
     pub rto_cuts: u32,
     pub rto_ignored: u32,
     pub incs: u32,
+    /// Of `incs`: made while app-limited.
+    pub app_incs: u32,
     /// Cuts not made because a HOLD from the previous one was running.
     pub held: u32,
     /// Cuts not made because the target already was at the floor.
@@ -372,6 +383,9 @@ pub struct FastEstimator {
     app_limited: bool,
     displays_seen: usize,
     r_send_1s: f64,
+    frames_1s: u32,
+    // The target before the cuts not yet undone: how far an app-limited increase may go.
+    restore: Option<f64>,
     last_q: f64,
     last_rates: Rates,
     pub counters: Counters,
@@ -415,6 +429,8 @@ impl FastEstimator {
             app_limited: true,
             displays_seen: 0,
             r_send_1s: 0.0,
+            frames_1s: 0,
+            restore: None,
             last_q: 0.0,
             last_rates: Rates::default(),
             counters: Counters::default(),
@@ -596,6 +612,11 @@ impl FastEstimator {
     /// Once per second: the encoder context, `k`, app-limited, displays.
     pub fn on_second(&mut self, now: u64, ctx: Context) -> Option<Decision> {
         self.first_us.get_or_insert(now);
+        // The configured bitrate changed within the second just measured (a fast cut, another
+        // viewer's, the backstop): its rate belongs to two settings, no `k` sample.
+        let configured_changed = self
+            .ctx
+            .is_some_and(|old| old.configured_kbps != ctx.configured_kbps);
         if let Some(old) = self.ctx {
             if (old.quality != ctx.quality || old.epoch != ctx.epoch)
                 && ctx.ceil_kbps > 0
@@ -605,6 +626,7 @@ impl FastEstimator {
                 self.target = Some(ctx.ceil_kbps as f64 * self.k);
                 self.ceiling_c = None;
                 self.c_reached_at = None;
+                self.restore = None;
             }
         }
         self.ctx = Some(ctx);
@@ -622,6 +644,7 @@ impl FastEstimator {
             }
         }
         self.displays_seen = displays.len();
+        self.frames_1s = frames_1s;
         let r1 = match self.tcp_rate(now, 1_000_000, 500_000) {
             Some((r_send, _)) => r_send,
             None => bytes_1s as f64 * 8.0 / 1000.0,
@@ -629,7 +652,7 @@ impl FastEstimator {
         self.r_send_1s = r1;
         let full = ctx.fps > 0 && frames_1s as f64 >= 0.8 * ctx.fps as f64;
         let mut k_decayed = false;
-        if full && ctx.configured_kbps > 0 && r1 > 0.0 {
+        if full && !configured_changed && ctx.configured_kbps > 0 && r1 > 0.0 {
             let sample = (r1 / ctx.configured_kbps as f64).clamp(K_MIN, K_MAX);
             if self.k_samples == 0 {
                 self.k = sample;
@@ -1016,10 +1039,12 @@ impl FastEstimator {
         }
         let receiver = self.receiver_limited(now, t_lo);
         // OVERUSE: the queue stayed above T_hi for 100 ms, the link is not paused, and the queue
-        // grows now or has stood above T_hi for 500 ms (a pause drains faster than that).
+        // grows now or has stood above T_hi for 500 ms (a pause drains faster than that) and
+        // is not draining (metered: delivery over 1.05 x send).
+        let draining = rates.metered && rates.r_acked > DRAINING_SHARE * rates.r_send;
         let overuse = !rates.paused
             && self.q_min(now, OVERUSE_WINDOW_US) > t_hi
-            && (rates.growing || self.q_min(now, STANDING_WINDOW_US) > t_hi);
+            && (rates.growing || (self.q_min(now, STANDING_WINDOW_US) > t_hi && !draining));
         let normal = self.is_normal(now, t_lo);
         let state = if severe {
             State::Severe
@@ -1112,6 +1137,7 @@ impl FastEstimator {
                 self.ceiling_c = Some(c);
                 self.c_reached_at = None;
             }
+            self.restore = Some(self.restore.map_or(target, |r| r.max(target)));
             self.target = Some(to);
             self.hold_until = now + HOLD_MIN_US.max(2 * srtt_us);
             self.last_inc = now;
@@ -1138,14 +1164,22 @@ impl FastEstimator {
             self.counters.react_max_ms = self.counters.react_max_ms.max(react_ms);
             return Some(self.decision(kind, now, target, to, q, rates, react_ms, false_cut));
         }
+        let (increase_after, inc_ceil) = if self.app_limited {
+            let c = match (self.restore, self.frames_1s > 0) {
+                (Some(r), true) => r.min(self.ceiling_c.unwrap_or(r)).min(ceil),
+                _ => 0.0,
+            };
+            (APP_LIMITED_INCREASE_AFTER_US, c)
+        } else {
+            (INCREASE_AFTER_US, ceil)
+        };
         if state == State::Normal
-            && !self.app_limited
             && now >= self.hold_until
             && self
                 .normal_since
-                .is_some_and(|t| now.saturating_sub(t) >= INCREASE_AFTER_US)
+                .is_some_and(|t| now.saturating_sub(t) >= increase_after)
             && now >= self.last_inc + INCREASE_SPACING_US
-            && target < ceil
+            && target < inc_ceil
         {
             let dt = now.saturating_sub(self.last_inc).min(1_000_000) as f64 / 1e6;
             let near = self.ceiling_c.is_some_and(|c| target >= 0.9 * c);
@@ -1154,14 +1188,22 @@ impl FastEstimator {
             } else {
                 target * MULT_INCREASE_PER_S.powf(dt)
             }
-            .min(ceil);
-            if !near && self.ceiling_c.is_some_and(|c| to >= 0.9 * c) {
-                self.c_reached_at = Some(now);
+            .min(inc_ceil);
+            // Only a used target says anything about the ceiling.
+            if !self.app_limited {
+                if !near && self.ceiling_c.is_some_and(|c| to >= 0.9 * c) {
+                    self.c_reached_at = Some(now);
+                }
+                if self.ceiling_c.is_some_and(|c| to > CEILING_FORGET * c) {
+                    // Well past the learned ceiling without an overuse: the link got better.
+                    self.ceiling_c = None;
+                    self.c_reached_at = None;
+                }
+            } else {
+                self.counters.app_incs += 1;
             }
-            if self.ceiling_c.is_some_and(|c| to > CEILING_FORGET * c) {
-                // Well past the learned ceiling without an overuse: the link got better.
-                self.ceiling_c = None;
-                self.c_reached_at = None;
+            if self.restore.is_some_and(|r| to >= r) {
+                self.restore = None;
             }
             self.target = Some(to);
             self.last_inc = now;
@@ -1562,7 +1604,7 @@ impl ConnFastAbr {
         let (r_send, r_acked) = e.last_rates();
         let target = e.target();
         log::info!(
-            "LATENCY fast conn={} mode={} live={} elig={} state={} meter={} ack={} k={:.2} set_kbps={} stream_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={} applied={} refused={} resync={} fps_cap={}/{}",
+            "LATENCY fast conn={} mode={} live={} elig={} state={} meter={} ack={} k={:.2} set_kbps={} stream_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} app_incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={} applied={} refused={} resync={} fps_cap={}/{}",
             self.id,
             self.mode(),
             inner.log.live_state,
@@ -1594,6 +1636,7 @@ impl ConnFastAbr {
             c.rto_cuts,
             c.rto_ignored,
             c.incs,
+            c.app_incs,
             c.held,
             c.floor,
             c.false_cuts,

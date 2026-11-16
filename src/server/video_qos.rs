@@ -310,6 +310,10 @@ struct DisplayData {
     support_changing_quality: bool,
 }
 
+/// An encoder's configured bitrate (kbps) for a ratio, as its `set_quality` computes it
+/// (`video_service::bitrate_curve`). None: linear through the last set point.
+pub type BitrateCurve = Box<dyn Fn(f32) -> u32 + Send>;
+
 // Main QoS controller structure
 pub struct VideoQoS {
     fps: u32,
@@ -319,6 +323,8 @@ pub struct VideoQoS {
     bitrate_store: u32,
     // The ratio `bitrate_store` was set at: kbps per ratio for the fast estimators.
     bitrate_ratio: f32,
+    // The encoder's own kbps-for-ratio curve (hwcodec: not linear), for the fast estimators.
+    bitrate_curve: Option<BitrateCurve>,
     adjust_ratio_instant: Instant,
     abr_config: bool,
     first_reply_adjusts_ratio: bool, // false on Linux, where it can create vaapi twice
@@ -345,6 +351,7 @@ impl Default for VideoQoS {
             displays: Default::default(),
             bitrate_store: 0,
             bitrate_ratio: 0.0,
+            bitrate_curve: None,
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             first_reply_adjusts_ratio: !cfg!(target_os = "linux"),
@@ -409,6 +416,11 @@ impl VideoQoS {
         self.bitrate_ratio = ratio;
     }
 
+    // The encoder's bitrate curve (None: linear), set with each new encoder.
+    pub fn set_bitrate_curve(&mut self, curve: Option<BitrateCurve>) {
+        self.bitrate_curve = curve;
+    }
+
     // Get stored bitrate
     pub fn bitrate(&self) -> u32 {
         self.bitrate_store
@@ -440,12 +452,61 @@ impl VideoQoS {
 
     // Configured kbps per unit of ratio, from the bitrate the encoder was last set to.
     fn kbps_per_ratio(&self) -> Option<f32> {
-        let ratio = if self.bitrate_ratio > 0.0 {
+        let ratio = self.set_ratio();
+        (ratio > 0.0 && self.bitrate_store > 0).then(|| self.bitrate_store as f32 / ratio)
+    }
+
+    // The ratio `bitrate_store` stands for.
+    fn set_ratio(&self) -> f32 {
+        if self.bitrate_ratio > 0.0 {
             self.bitrate_ratio
         } else {
             self.ratio
+        }
+    }
+
+    // The encoder's curve, while it reproduces the bitrate the encoder was last set to at its
+    // ratio (within 1 %): a curve that does not (a clamped or refused bitrate, another
+    // encoder) is not trusted, the last set point's slope is used instead.
+    fn trusted_curve(&self) -> Option<&BitrateCurve> {
+        let curve = self.bitrate_curve.as_ref()?;
+        let ratio = self.set_ratio();
+        if self.bitrate_store == 0 || ratio <= 0.0 {
+            return None;
+        }
+        let at = curve(ratio) as f32;
+        let stored = self.bitrate_store as f32;
+        ((at - stored).abs() <= 0.01 * stored + 1.0).then_some(curve)
+    }
+
+    // The configured kbps the encoder takes for `ratio`.
+    fn kbps_at(&self, ratio: f32) -> Option<f32> {
+        match self.trusted_curve() {
+            Some(curve) => Some(curve(ratio) as f32),
+            None => self.kbps_per_ratio().map(|k| ratio * k),
+        }
+    }
+
+    // The ratio at which the encoder takes `kbps` configured: the curve inverted by bisection
+    // (it is non-decreasing), else linear through the last set point.
+    fn ratio_for_kbps(&self, kbps: f64) -> Option<f32> {
+        let Some(curve) = self.trusted_curve() else {
+            return self.kbps_per_ratio().map(|k| (kbps / k as f64) as f32);
         };
-        (ratio > 0.0 && self.bitrate_store > 0).then(|| self.bitrate_store as f32 / ratio)
+        let kbps = kbps.max(0.0);
+        let (mut lo, mut hi) = (0.0f32, BR_MAX * MAX_BR_MULTIPLE);
+        if curve(hi) as f64 <= kbps {
+            return Some(hi);
+        }
+        for _ in 0..32 {
+            let mid = 0.5 * (lo + hi);
+            if (curve(mid) as f64) < kbps {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(hi)
     }
 
     /// What connection `id`'s fast estimator (roadmap M15/M16) needs from the shared encoder,
@@ -453,8 +514,7 @@ impl VideoQoS {
     /// ceiling it may take: `min_ratio`, the latest quality), converted at the rate the encoder
     /// was last set at; `live`: enable-fast-abr=Y.
     pub fn fast_context(&self, id: i32, live: bool) -> fast::Context {
-        let kpr = self.kbps_per_ratio();
-        let to_kbps = |r: f32| -> u32 { kpr.map_or(0, |k| (r * k).round().max(0.0) as u32) };
+        let to_kbps = |r: f32| -> u32 { self.kbps_at(r).map_or(0, |k| k.round().max(0.0) as u32) };
         let quality = self.latest_quality().ratio();
         let user = self.users.get(&id);
         fast::Context {
@@ -497,19 +557,18 @@ impl VideoQoS {
         } else {
             None
         };
-        let kpr = self.kbps_per_ratio();
+        let own = report.set_kbps.and_then(|kbps| self.ratio_for_kbps(kbps));
         let Some(user) = self.users.get_mut(&id) else {
             return Applied::Refused("user");
         };
-        let (Some(set_kbps), Some(kpr), None) = (report.set_kbps, kpr, unusable) else {
+        let (Some(_), Some(own), None) = (report.set_kbps, own, unusable) else {
             user.fast_ratio = None;
-            return match (unusable, kpr, report.set_kbps) {
+            return match (unusable, own, report.set_kbps) {
                 (Some(why), _, Some(_)) => Applied::Refused(why),
                 (None, None, Some(_)) => Applied::Refused("br"),
                 _ => Applied::Kept,
             };
         };
-        let own = (set_kbps / kpr as f64) as f32;
         user.fast_ratio = Some(own);
         let Some(step) = report.step else {
             return Applied::Kept;

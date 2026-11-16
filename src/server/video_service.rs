@@ -748,10 +748,11 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
-    VIDEO_QOS
-        .lock()
-        .unwrap()
-        .store_bitrate_at(encoder.bitrate(), quality);
+    {
+        let mut qos = VIDEO_QOS.lock().unwrap();
+        qos.store_bitrate_at(encoder.bitrate(), quality);
+        qos.set_bitrate_curve(bitrate_curve(&encoder_cfg));
+    }
     VIDEO_QOS
         .lock()
         .unwrap()
@@ -1421,6 +1422,26 @@ fn setup_encoder(
     let use_i444 = Encoder::use_i444(&encoder_cfg);
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
+}
+
+// The encoder's configured kbps for a ratio, as its `set_quality` computes it, for the fast
+// bitrate estimators' conversions (roadmap M16): hwcodec RAM and VRAM encoders are not linear
+// in the ratio. None (vpx, aom): linear. QoS checks the curve against the stored bitrate, so a
+// fallback encoder with another curve is not misread.
+fn bitrate_curve(cfg: &EncoderCfg) -> Option<super::video_qos::BitrateCurve> {
+    match cfg {
+        #[cfg(feature = "hwcodec")]
+        EncoderCfg::HWRAM(c) => {
+            let (name, width, height) = (c.name.clone(), c.width, c.height);
+            Some(Box::new(move |r| HwRamEncoder::bitrate(&name, width, height, r)))
+        }
+        #[cfg(feature = "vram")]
+        EncoderCfg::VRAM(c) => {
+            let (format, width, height) = (c.feature.data_format, c.width, c.height);
+            Some(Box::new(move |r| VRamEncoder::bitrate(format, width, height, r)))
+        }
+        _ => None,
+    }
 }
 
 fn get_encoder_config(

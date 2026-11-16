@@ -273,9 +273,9 @@ pub const OPTION_ENABLE_GENTLE_FPS_CONTROL: &str = "enable-gentle-fps-control";
 // tag 28) instead of OptionMessage.custom_fps (roadmap M16), so custom_fps stays the user's
 // setting and the host can tell the two apart. Only to hosts of version 1.2.2 or later, which
 // cap the stream at min(custom_fps, auto_adjust_fps) exactly as at a lower custom_fps; older
-// hosts get custom_fps as before. Same for the legacy and the gentle controller. On by default
-// on Windows ("N" turns it off); off by default elsewhere ("Y" turns it on). Read when a
-// connection starts. See docs/LATENCY-METRICS.md.
+// hosts get custom_fps as before. Same for the legacy and the gentle controller. Off by default
+// on every platform ("Y" turns it on) until the stock host versions in use are checked to cap
+// on tag 28. Read when a connection starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_FPS_CAP_SPLIT: &str = "enable-fps-cap-split";
 // Windows viewer, local option: "N" leaves the viewer at normal priority (on by default). While a
 // remote-control or camera session is open, its io_loop thread and each display's decoder thread

@@ -871,7 +871,11 @@ fn latency_fast_live_closed_loop_capacity_step() {
         .into_iter()
         .filter(|d| (20_000_000..30_000_000).contains(&d.at_us))
         .collect();
-    assert!(episode.len() <= 4, "{:?}", episode);
+    // Settled within 3 s; later at most a probe or two at the capacity (x1.08/s climbs back
+    // to it within the 10 s).
+    let settle = episode.iter().filter(|d| d.at_us < 23_000_000).count();
+    assert!(settle <= 4, "{:?}", episode);
+    assert!(episode.len() - settle <= 2, "{:?}", episode);
     let lowest = episode
         .iter()
         .map(|d| d.set_kbps)
@@ -885,4 +889,88 @@ fn latency_fast_live_closed_loop_capacity_step() {
         .expect("never recovered");
     assert!(back.at_us - 30_000_000 <= 25_000_000, "{:?}", back);
     assert!(est.target().is_some_and(|t| t >= 0.9 * 8000.0));
+}
+
+/// One second of 30 frames carrying `kbps` measured, each written at once (no queue), then the
+/// once-a-second context.
+fn light_second(est: &mut FastEstimator, t: &mut u64, kbps: f64, c: Context) {
+    for _ in 0..30 {
+        est.on_write_begin(*t, *t, (kbps * 1000.0 / 8.0 / 30.0) as u32);
+        *t += 100;
+        let _ = est.on_write_end(*t, 0);
+        let _ = est.tick(*t);
+        *t += 33_233;
+    }
+    let _ = est.on_second(*t, c);
+}
+
+#[test]
+fn latency_fast_live_k_skips_a_second_with_a_bitrate_change() {
+    // k = 1 learned at 8 Mbps. Another viewer's cut halves the configured bitrate mid-second:
+    // that second carried 6 Mbps against 4 configured, which would read as k = 1.5.
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    for _ in 0..4 {
+        light_second(&mut est, &mut t, 8000.0, live_ctx(8000.0, 8000.0));
+    }
+    assert!((est.k() - 1.0).abs() < 0.05, "k {}", est.k());
+    light_second(&mut est, &mut t, 6000.0, live_ctx(4000.0, 4000.0));
+    assert!((est.k() - 1.0).abs() < 0.05, "k {}", est.k());
+    // The next whole second at the new setting is learned from again.
+    light_second(&mut est, &mut t, 4000.0, live_ctx(4000.0, 4000.0));
+    assert!((est.k() - 1.0).abs() < 0.05, "k {}", est.k());
+    // So its target is the stream's, not 20 % under it.
+    assert!(est.target().is_some_and(|x| (x - 4000.0).abs() < 200.0), "{:?}", est.target());
+}
+
+#[test]
+fn latency_fast_live_app_limited_increase_bounded_by_ceiling() {
+    // After a cut to 2 Mbps the content turns light (500 kbps sent at full frame rate): the
+    // target still climbs, with the stream following it, but not past the learned ceiling C.
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    for _ in 0..4 {
+        light_second(&mut est, &mut t, 8000.0, live_ctx(8000.0, 8000.0));
+    }
+    light_second(&mut est, &mut t, 2000.0, live_ctx(2000.0, 2000.0));
+    light_second(&mut est, &mut t, 2000.0, live_ctx(2000.0, 2000.0));
+    let climb = |est: &mut FastEstimator, t: &mut u64, secs: usize| {
+        est.counters = Counters::default();
+        for _ in 0..secs {
+            let stream = est.target().unwrap() / est.k();
+            light_second(est, t, 500.0, live_ctx(stream, stream));
+            assert!(est.app_limited());
+        }
+        est.target().unwrap()
+    };
+    // The content turns light (the second that tells it may still increase as before).
+    let start = climb(&mut est, &mut t, 1);
+    assert!(start <= 2200.0, "{start}");
+    // Not a cut (the stream was lowered elsewhere): nothing to undo, no app-limited increase.
+    assert_eq!(climb(&mut est, &mut t, 10), start);
+    assert_eq!(est.counters.incs, 0);
+    // A cut from 8 Mbps: undone up to C.
+    est.restore = Some(8000.0);
+    est.ceiling_c = Some(4000.0);
+    let end = climb(&mut est, &mut t, 30);
+    assert!(est.counters.app_incs > 0, "{:?}", est.counters.app_incs);
+    assert!(end > 1.5 * start, "{start} -> {end}");
+    assert!(end <= 4000.0 + 1.0, "{end}");
+    // An app-limited climb neither reaches nor forgets C.
+    assert_eq!(est.ceiling_c, Some(4000.0));
+    assert!(est.c_reached_at.is_none());
+    // Without C: back to the target before the cut, not beyond.
+    est.ceiling_c = None;
+    let end = climb(&mut est, &mut t, 30);
+    assert!((end - 8000.0).abs() < 1.0, "{end}");
+    assert!(est.restore.is_none());
+    assert_eq!(climb(&mut est, &mut t, 5), end);
+    // No frames at all (a static screen): no increase.
+    est.restore = Some(12_000.0);
+    est.counters = Counters::default();
+    for _ in 0..10 {
+        t += 1_000_000;
+        let _ = est.on_second(t, live_ctx(end, end));
+    }
+    assert_eq!(est.counters.app_incs, 0);
 }

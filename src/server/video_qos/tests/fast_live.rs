@@ -191,3 +191,73 @@ fn latency_fast_live_context_converts_at_the_stored_ratio() {
     qos.user_auto_adjust_fps(1, 24);
     assert_eq!(qos.fast_context(1, true).auto_fps, 24);
 }
+
+/// hwcodec's H.264 bitrate for `base` x `ratio` (`HwRamEncoder::calc_bitrate`, desktop): x2 up
+/// to 2000 kbps, then a factor decaying toward 1.
+fn hw_h264(base: f32, ratio: f32) -> u32 {
+    let b = base * ratio;
+    let factor = if b > 2000.0 {
+        1.0 + 1.0 / (1.0 + (b - 2000.0) * 0.001)
+    } else {
+        2.0
+    };
+    (b * factor) as u32
+}
+
+/// One viewer, 4K NVENC H.264 at Balanced: the encoder's bitrate is not linear in the ratio.
+fn hw_session() -> VideoQoS {
+    let mut qos = fast_session();
+    let base = 5000.0;
+    qos.set_bitrate_curve(Some(Box::new(move |r| hw_h264(base, r))));
+    let ratio = qos.ratio();
+    qos.store_bitrate_at(hw_h264(base, ratio), ratio);
+    qos
+}
+
+// The encoder takes the ratio at its next frame (check_qos).
+fn encoder_takes(qos: &mut VideoQoS) {
+    let ratio = qos.ratio();
+    let kbps = (qos.bitrate_curve.as_ref().unwrap())(ratio);
+    qos.store_bitrate_at(kbps, ratio);
+}
+
+#[test]
+fn latency_fast_live_hw_curve_converts_cuts_exactly() {
+    let mut qos = hw_session();
+    let start = qos.bitrate() as f64;
+    assert_eq!(qos.fast_context(1, true).stream_kbps as f64, start);
+    // A SEVERE halving and then 10 % overuse cuts land where the estimator asked, although
+    // the slope at the set point is not the curve's below it.
+    let mut expect = start;
+    for (i, share) in [0.5, 0.9, 0.9, 0.9].into_iter().enumerate() {
+        qos.advance_ms(300);
+        expect *= share;
+        let applied = qos.on_fast(1, report(&qos, expect, cut()));
+        assert!(matches!(applied, Applied::Ratio { .. }), "{i}: {applied:?}");
+        encoder_takes(&mut qos);
+        let got = qos.bitrate() as f64;
+        assert!((got - expect).abs() <= 0.01 * expect + 2.0, "{i}: {got} vs {expect}");
+        let ctx = qos.fast_context(1, true);
+        assert!((ctx.stream_kbps as f64 - got).abs() <= 2.0, "{i}: {ctx:?}");
+        // The estimator's own ratio is the stream's: its increase is not refused "min".
+        assert!((qos.users[&1].fast_ratio.unwrap() - qos.ratio).abs() < 1e-3);
+    }
+    qos.advance_ms(300);
+    let up = qos.bitrate() as f64 * 1.04;
+    let applied = qos.on_fast(1, report(&qos, up, None));
+    assert_eq!(applied, Applied::Kept);
+    assert!(matches!(
+        qos.on_fast(1, report(&qos, up, inc(1.04))),
+        Applied::Ratio { .. }
+    ));
+}
+
+#[test]
+fn latency_fast_live_hw_curve_untrusted_falls_back_to_linear() {
+    let mut qos = fast_session();
+    // A curve that does not reproduce the stored bitrate (a clamped or refused set): linear.
+    qos.set_bitrate_curve(Some(Box::new(|r| hw_h264(5000.0, r))));
+    assert!(qos.trusted_curve().is_none());
+    let r = qos.ratio_for_kbps(2000.0).unwrap();
+    assert!((r - 2000.0 / qos.kbps_per_ratio().unwrap()).abs() < 1e-6);
+}
