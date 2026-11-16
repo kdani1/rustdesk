@@ -336,12 +336,15 @@ whole stream's gap ends before the loop's video branch.
 
 ### Host: fast bitrate estimator, shadow mode (roadmap M15)
 
-Server option `enable-fast-abr-shadow`, **on** unless `N` (all platforms; it only logs). Each
+Server option `enable-fast-abr-shadow`: on Windows **on** unless `N` (it only logs); on other
+platforms off unless `Y`, so they behave as before by default. Each
 authorized remote-control or camera connection runs a delay-based congestion estimator
 (`src/server/video_qos/fast.rs`) and logs the bitrate it would give the shared encoder. It
 changes nothing the host sends: the existing TestDelay controller still sets the bitrate and
 the fps. Created when a connection is authorized while the option is on; `N` stops it within
-a second (back on: within a second for a connection that has one, else from the next one).
+a second (back on: within a second for a connection that has one, else from the next one),
+and once no connection has it on the capture loop's wait is the old one again (300 ms slices,
+no stall reports).
 Cost while on: per video write two clock reads and two short, uncontended locks (the estimator's),
 an evaluation at most every 50 ms over at most 2 s of frames, and with the meter one
 `SIO_TCP_INFO` call per 50 ms.
@@ -366,8 +369,13 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
 - **Units.** Rates are measured: `r_send` (bytes written into the socket per second, from the
   meter; unmetered: bytes the capture loop queued) and `r_acked` (bytes TCP delivered:
   `BytesOut - BytesRetrans - BytesInFlight` deltas; unmetered: bytes whose write ended), over
-  500 ms. `k` is an EWMA (0.2 per second) of measured / configured bitrate over seconds in
-  which the encoder ran at 80 % of its fps or more; the target is kept in measured kbps and
+  500 ms. `k` is an EWMA of measured / configured bitrate over seconds in which the encoder
+  ran at 80 % of its fps or more and used its budget: a sample above `k` comes in with weight
+  0.5, one between 0.8 x `k` and `k` with 0.2; one under 0.8 x `k` is content-limited (typing,
+  a static screen: the encoder undershoots) and is not learned from (`k_rej`); it only lets
+  `k` drift down 1 % (never below the sample), so a real change of the coupling is followed
+  slowly. While `k` drifts so the target is not clamped to the ceiling. The target is kept in
+  measured kbps and
   `would_set_kbps = target / k` is the configured bitrate it would set. So nvenc's frame-rate
   coupling (30-fps budget at 60 fps) and the virtual framerate (M7) do not skew it.
 - **Queue `Q`** (ms), the largest of: the newest frame's delay from queue to write end above
@@ -377,8 +385,12 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
 - **Threshold.** `T_hi` = clamp(2.5 x p95 of `Q` seen in NORMAL over 10 s, 30, 150) ms
   (60 until 20 samples), recomputed once per second; `T_lo` = `T_hi` / 3.
 - **States** (`st=N/H/O/S/R` counts evaluations):
-  - `S` SEVERE: a stall report of 200 ms or more (never for `ack=1` connections). Only the
-    capture loop's report triggers it, because a connection's own task is blocked in the write.
+  - `S` SEVERE: a stall report of 200 ms or more (never for `ack=1` connections), once per
+    stall episode: the capture loop reports the same unfetched frame after every slice, and
+    the reports until this connection's next write ends are one episode (an outage of any
+    length is halved once). When that write ends a HOLD starts, so the queue the episode left
+    is not cut again; only fresh frames showing a shortfall after it cut. Only the capture
+    loop's report triggers it, because a connection's own task is blocked in the write.
   - `R` RECEIVER: meter v1, the sender was receive-window limited more than half of the last
     100 ms while `RTT - MinRTT` < `T_lo`: the viewer does not read; never a cut.
   - `O` OVERUSE: the link is not paused, `Q` stayed above `T_hi` all through the last 100 ms
@@ -395,8 +407,11 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
 - **Decisions** (only with `elig=yes`):
   - cut on OVERUSE: max(floor, 0.5 x target, min(0.9 x target, 0.85 x `r_acked`));
   - severe: max(floor, 0.5 x target);
-  - rto: after an RTO episode (meter), only if within 500 ms delivery stays under
-    0.85 x send: max(floor, 0.5 x target, 0.85 x `r_acked`); otherwise it is ignored (`rto_ign`);
+  - rto: after an RTO episode (meter), judged once on delivery and send from the meter
+    reading that showed it on (never on the outage that caused it), over at least 300 ms and
+    not while the link is paused: if delivery stayed under 0.85 x send, max(floor, 0.5 x
+    target, 0.85 x that delivery). Otherwise, not judged within 1 s, seen within 500 ms after
+    a cut (the same episode), or covered by a cut while watched, it is ignored (`rto_ign`);
   - after any cut a HOLD of max(250 ms, 2 x srtt) in which no other cut is made (`held`), so
     a stall report and the write's own end do not cut one queue twice. A cut of under 3 % (at
     the floor) is not made (`floor`);
@@ -421,7 +436,7 @@ and the false-cut rate, not the depth.
 ```
 FASTABR shadow conn=5 ack=0
 FASTABR shadow conn=5 kind=cut from_kbps=11755 to_kbps=5877 would_set_kbps=5877 k=1.00 q_ms=148.5 t_hi_ms=30 r_send=8000 r_acked=6104 react_ms=100 fc=0 meter=1 skipped=0
-LATENCY fast conn=5 mode=shadow elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0
+LATENCY fast conn=5 mode=shadow elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0
 ```
 
 | Line / field | Meaning |
@@ -448,6 +463,7 @@ LATENCY fast conn=5 mode=shadow elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4
 | `st` | evaluations per state N/H/O/S/R in the window |
 | `cuts` / `severe` / `rto` / `rto_ign` / `incs` / `held` / `floor` / `fc` | decisions and skipped cuts in the window (see Decisions) |
 | `stalls` | capture-loop stall reports for this connection |
+| `k_rej` | full-rate seconds whose `k` sample was content-limited (under 0.8 x `k`): not learned from |
 | `react_max_ms` | largest `react_ms` in the window |
 
 Tests (`cargo test latency_fast`): replays of recorded `LATENCY server` windows
@@ -456,8 +472,10 @@ fps, 5 min LAN; each window's frame count and send/wait percentiles become frame
 these runs are unmetered), and a small fluid model (one sender buffer draining into a link)
 for a capacity step (metered: `react_ms` at most 200, first cut at most 300 ms after the step;
 unmetered: after the send buffer fills), 150 ms airtime pauses every 2 s for 10 min (at most
-1 cut), a 1 s outage (SEVERE once per HOLD), recovery (at most 8 %/s), receive-window
-limiting, RTO, `ack` and multi-display. The model is not a TCP model. The thresholds are to be
+1 cut), a 1 s outage (one SEVERE), recovery (at most 8 %/s), receive-window limiting, RTO
+(a 400 ms pause with an RTO in it and full delivery after: no cut), `ack` and multi-display;
+unit tests for one SEVERE per stall episode, the RTO judged on delivery after it, and `k`
+ignoring content-limited seconds. The model is not a TCP model. The thresholds are to be
 calibrated from the `LATENCY fast` / `FASTABR` lines of a week of normal use (roadmap gate),
 with the meter on where possible (`enable-tcp-meter`: without it the send buffer hides the
 queue until it is full). The meter's `unsent` is still unverified on the real link (see TCP

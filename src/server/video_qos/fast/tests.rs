@@ -122,6 +122,7 @@ fn add(t: &mut Counters, c: &Counters) {
     t.floor += c.floor;
     t.false_cuts += c.false_cuts;
     t.stalls += c.stalls;
+    t.k_rejected += c.k_rejected;
     t.react_max_ms = t.react_max_ms.max(c.react_max_ms);
 }
 
@@ -455,24 +456,68 @@ fn latency_fast_wifi_pauses_do_not_cut() {
 }
 
 #[test]
-fn latency_fast_long_outage_is_severe_once_per_hold() {
-    // A 1 s outage with a small sender buffer: the writes block, the capture loop reports the
-    // stall, SEVERE halves once per hold, and nothing else cuts in between.
-    let mut m = Model::new(|ms| if (30_000..31_000).contains(&ms) { 0.0 } else { 50_000.0 });
-    m.sndbuf = 32.0 * 1024.0;
-    let (out, _) = m.run(35);
+fn latency_fast_long_outage_is_severe_once() {
+    // A 1 s outage with a small sender buffer: the writes block and the capture loop reports
+    // the same unfetched frame after every slice. SEVERE halves once for the whole outage
+    // (metered and not), and nothing else cuts.
+    for metered in [true, false] {
+        let mut m =
+            Model::new(|ms| if (30_000..31_000).contains(&ms) { 0.0 } else { 50_000.0 });
+        m.sndbuf = 32.0 * 1024.0;
+        m.metered = metered;
+        let (out, _) = m.run(35);
+        let cuts: Vec<_> = out
+            .decisions
+            .iter()
+            .filter(|d| d.kind != Kind::Increase)
+            .collect();
+        assert_eq!(cuts.len(), 1, "metered={} {:?}", metered, cuts);
+        assert_eq!(cuts[0].kind, Kind::Severe);
+        assert!(cuts[0].at_us <= 30_000_000 + 300_000, "{:?}", cuts[0]);
+        assert!(out.totals.stalls > 5, "{:?}", out.totals);
+    }
+}
+
+#[test]
+fn latency_fast_severe_once_per_stall_episode() {
+    let mut est = FastEstimator::new(false);
+    let _ = est.on_second(0, ctx(8000.0, 30));
+    let _ = est.on_second(3_000_000, ctx(8000.0, 30));
+    assert_eq!(est.target(), Some(8000.0));
+    // One frame stays unfetched for 1.2 s: reported every 66 ms from 99 ms on.
+    est.on_write_begin(3_100_000, 3_100_000, 30_000);
+    let mut severe = 0;
+    let mut t = 3_200_000;
+    while t < 4_300_000 {
+        if let Some(d) = est.on_stall(t, t - 3_100_000) {
+            assert_eq!(d.kind, Kind::Severe);
+            severe += 1;
+        }
+        t += 66_000;
+    }
+    assert_eq!(severe, 1);
+    assert_eq!(est.target(), Some(4000.0));
+    // The write ended: a later stall of another frame is a new episode.
+    let _ = est.on_write_end(4_300_000, 0);
+    est.on_write_begin(4_400_000, 4_400_000, 30_000);
+    let d = est.on_stall(4_700_000, 300_000).expect("a new stall");
+    assert_eq!(d.kind, Kind::Severe);
+}
+
+#[test]
+fn latency_fast_rto_in_pause_does_not_cut() {
+    // A 400 ms airtime pause on a metered 50 Mbps link; Windows' minimum RTO (300 ms) fires in
+    // it, and delivery is full afterwards: judged on what followed the RTO, no cut of any kind.
+    let mut m = Model::new(|ms| if (20_000..20_400).contains(&ms) { 0.0 } else { 50_000.0 });
+    m.timeouts = Box::new(|ms| (ms >= 20_300) as u32);
+    let (out, _) = m.run(25);
     let cuts: Vec<_> = out
         .decisions
         .iter()
         .filter(|d| d.kind != Kind::Increase)
         .collect();
-    assert!(!cuts.is_empty());
-    assert!(cuts.iter().all(|d| d.kind == Kind::Severe), "{:?}", cuts);
-    assert!(cuts[0].at_us <= 30_000_000 + 300_000, "{:?}", cuts[0]);
-    for w in cuts.windows(2) {
-        assert!(w[1].at_us - w[0].at_us >= HOLD_MIN_US);
-    }
-    assert!(out.totals.held > 0);
+    assert!(cuts.is_empty(), "{:?}", cuts);
+    assert_eq!(out.totals.rto_ignored, 1, "{:?}", out.totals);
 }
 
 #[test]
@@ -543,7 +588,7 @@ fn latency_fast_rto_cuts_only_on_low_delivery() {
     let (out, _) = m.run(23);
     assert_eq!(out.totals.rto_cuts, 0, "{:?}", out.cuts());
     assert_eq!(out.totals.rto_ignored, 1);
-    // With delivery down to a third right after it, the cut goes to 0.85 x delivered.
+    // With delivery down to a third right after it, a cut follows (OVERUSE or the RTO's).
     let mut m = Model::new(|ms| if ms < 20_000 { 50_000.0 } else { 2_500.0 });
     m.timeouts = Box::new(|ms| (ms >= 20_000) as u32);
     let (out, _) = m.run(21);
@@ -554,6 +599,53 @@ fn latency_fast_rto_cuts_only_on_low_delivery() {
         "{:?}",
         out.cuts()
     );
+}
+
+#[test]
+fn latency_fast_rto_judged_on_delivery_after_it() {
+    // Unit level, no queue: an RTO followed by 300 ms of delivery at a third of the send rate
+    // is an RTO cut (0.85 x that delivery, at most a halving); the same RTO followed by full
+    // delivery is not.
+    for (acked_share, cut) in [(0.33, true), (1.0, false)] {
+        let mut est = FastEstimator::new(false);
+        let _ = est.on_second(0, ctx(8000.0, 30));
+        let _ = est.on_second(3_000_000, ctx(8000.0, 30));
+        let mut app = 0u64;
+        let mut acked = 0u64;
+        let mut decisions = Vec::new();
+        let mut t = 3_000_000u64;
+        while t <= 4_000_000 {
+            // 8 Mbps written; delivered at full rate before the RTO at 3.5 s.
+            app += 8000 * 1000 / 8 / 50;
+            let share = if t >= 3_500_000 { acked_share } else { 1.0 };
+            acked += (8000.0 * 1000.0 / 8.0 / 50.0 * share) as u64;
+            // Everything written is out (no unsent backlog, no RTT growth: no queue signal);
+            // what is not acked is in flight.
+            est.on_tcp(TcpInput {
+                at_us: t,
+                app_bytes: app,
+                unique_out: app,
+                in_flight: (app - acked) as u32,
+                rtt_us: 2_000,
+                min_rtt_us: 2_000,
+                timeouts: (t >= 3_500_000) as u32,
+                lim_rwin_ms: None,
+            });
+            if let Some(d) = est.tick(t) {
+                decisions.push(d);
+            }
+            t += 20_000;
+        }
+        let rto: Vec<_> = decisions.iter().filter(|d| d.kind == Kind::Rto).collect();
+        if cut {
+            assert_eq!(rto.len(), 1, "{:?}", decisions);
+            assert!(rto[0].at_us >= 3_800_000, "{:?}", rto[0]);
+            assert!((rto[0].to_kbps - 4000.0).abs() < 1.0, "{:?}", rto[0]);
+        } else {
+            assert!(rto.is_empty(), "{:?}", decisions);
+            assert_eq!(est.counters.rto_ignored, 1);
+        }
+    }
 }
 
 #[test]
@@ -594,6 +686,38 @@ fn latency_fast_k_follows_measured_rate() {
     assert!((14_400.0..=24_000.0 * 1.01).contains(&target), "target {}", target);
     assert!(target / est.k() <= 12_000.0 * 1.01);
     assert_eq!(est.ineligible(), None);
+}
+
+#[test]
+fn latency_fast_k_ignores_content_limited_seconds() {
+    // k = 2 learned on full-budget seconds; then 10 s of typing at full frame rate at a tenth
+    // of the budget. k barely moves (only the slow drift), the target keeps its ceiling, and
+    // the first full-budget second brings k back at once.
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    let mut second = |est: &mut FastEstimator, t: &mut u64, kbps: u64| {
+        for _ in 0..60 {
+            est.on_write_begin(*t, *t, (kbps * 1000 / 8 / 60) as u32);
+            *t += 100;
+            let _ = est.on_write_end(*t, 0);
+            *t += 16_567;
+        }
+        let _ = est.on_second(*t, ctx(8000.0, 60));
+    };
+    for _ in 0..5 {
+        second(&mut est, &mut t, 16_000);
+    }
+    assert!((est.k() - 2.0).abs() < 0.1, "k {}", est.k());
+    let target = est.target().unwrap();
+    est.counters = Counters::default();
+    for _ in 0..10 {
+        second(&mut est, &mut t, 1_600);
+    }
+    assert!(est.k() > 1.75, "k {}", est.k());
+    assert_eq!(est.counters.k_rejected, 10);
+    assert!(est.target().unwrap() >= target, "{:?} {}", est.target(), target);
+    second(&mut est, &mut t, 16_000);
+    assert!((est.k() - 2.0).abs() < 0.1, "k {}", est.k());
 }
 
 #[test]

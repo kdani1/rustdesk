@@ -9,9 +9,10 @@
 //! the decision is only logged; nothing the host sends changes.
 //!
 //! Units: the estimator works in measured kbps only (bytes the session wrote or TCP delivered).
-//! `k`, an EWMA of measured / configured bitrate while the encoder runs at full frame rate, turns
-//! a measured target into the configured bitrate it would set (`would_set_kbps`), so a 30-fps
-//! nvenc at 60 fps or a virtual framerate (M7) do not skew the thresholds.
+//! `k`, an EWMA of measured / configured bitrate over full-rate seconds that are not
+//! content-limited, turns a measured target into the configured bitrate it would set
+//! (`would_set_kbps`), so a 30-fps nvenc at 60 fps or a virtual framerate (M7) do not skew the
+//! thresholds.
 //!
 //! What each log field means: docs/LATENCY-METRICS.md, "Host: fast bitrate estimator (shadow)".
 
@@ -55,7 +56,8 @@ const BASE_BUCKET_US: u64 = 5_000_000;
 const FRAME_Q_HOLD_US: u64 = 200_000;
 /// A meter reading older than this is not used for the queue.
 const TCP_FRESH_US: u64 = 300_000;
-/// SEVERE: the capture loop waited this long for this connection to take a frame.
+/// SEVERE: the capture loop waited this long for this connection to take a frame. At most once
+/// per stall episode: the reports until this connection's next write ends are one episode.
 const SEVERE_STALL_US: u64 = 200_000;
 /// After a cut no other cut for max(this, 2 x srtt): one queue is punished once.
 const HOLD_MIN_US: u64 = 250_000;
@@ -70,9 +72,14 @@ const ADD_INCREASE_SHARE_PER_S: f64 = 0.02;
 const CEILING_RECUR_US: u64 = 10_000_000;
 const CEILING_EWMA: f64 = 0.3;
 const CEILING_FORGET: f64 = 1.15;
-/// After an RTO: cut only if delivery stays below 0.85 x send within this long.
-const RTO_WATCH_US: u64 = 500_000;
+/// After an RTO: judged once on the meter's delivery and send from the reading that showed it
+/// on, over at least `RTO_JUDGE_US` and outside a pause; cut only if delivery stayed below
+/// 0.85 x send. Not judged within `RTO_WATCH_US` (a pause longer than that is SEVERE's): ignored.
+const RTO_JUDGE_US: u64 = 300_000;
+const RTO_WATCH_US: u64 = 1_000_000;
 const RTO_SHORTFALL: f64 = 0.85;
+/// An RTO seen this soon after a cut belongs to the episode that cut: not judged again.
+const RTO_AFTER_CUT_US: u64 = 500_000;
 /// A growing queue: delivery below 0.95 x send (metered, last 100 ms).
 const DELIVERY_SHORTFALL: f64 = 0.95;
 /// A queue above `T_hi` for this long is standing, not a transient: OVERUSE without growth.
@@ -89,6 +96,13 @@ const MIN_CHANGE: f64 = 0.03;
 const K_MIN: f64 = 0.2;
 const K_MAX: f64 = 5.0;
 const K_EWMA: f64 = 0.2;
+/// A sample above `k` comes in with this weight (the encoder reaching its budget again).
+const K_EWMA_UP: f64 = 0.5;
+/// A full-rate second under this share of `k` is content-limited (a static or simple screen
+/// undershoots the budget): not learned from, `k` only drifts down by `K_DECAY` per such second
+/// (so a real change of the coupling is still followed, slowly).
+const K_CONTENT_LIMITED: f64 = 0.8;
+const K_DECAY: f64 = 0.99;
 /// Without a full-rate second to learn `k` from, the target starts after this long anyway.
 const INIT_AFTER_US: u64 = 3_000_000;
 const MAX_FRAMES: usize = 512;
@@ -231,6 +245,8 @@ pub struct Counters {
     pub floor: u32,
     pub false_cuts: u32,
     pub stalls: u32,
+    /// Full-rate seconds whose `k` sample was content-limited (not learned from).
+    pub k_rejected: u32,
     pub react_max_ms: f64,
 }
 
@@ -294,7 +310,11 @@ pub struct FastEstimator {
     t_hi: f64,
     t_hi_at: u64,
     timeouts_seen: Option<u32>,
-    rto_watch: Option<u64>,
+    // The time and the meter reading at which a new RTO was seen.
+    rto_watch: Option<(u64, TcpInput)>,
+    last_cut_at: Option<u64>,
+    // A stall report was SEVERE and this connection's write has not ended since.
+    severe_episode: bool,
     app_limited: bool,
     displays_seen: usize,
     r_send_1s: f64,
@@ -336,6 +356,8 @@ impl FastEstimator {
             t_hi_at: 0,
             timeouts_seen: None,
             rto_watch: None,
+            last_cut_at: None,
+            severe_episode: false,
             app_limited: true,
             displays_seen: 0,
             r_send_1s: 0.0,
@@ -419,6 +441,12 @@ impl FastEstimator {
     /// The write that `on_write_begin` started ended at `end`.
     pub fn on_write_end(&mut self, end: u64, display: i32) -> Option<Decision> {
         let p = self.pending.take()?;
+        // The connection takes frames again: a later stall is a new episode. The queue the
+        // episode built up (this write's delay, the stall samples) was its SEVERE's: a HOLD from
+        // here lets fresh frames show whether the link really falls short after it.
+        if std::mem::take(&mut self.severe_episode) {
+            self.hold_until = self.hold_until.max(end + HOLD_MIN_US);
+        }
         let delay = end.saturating_sub(p.enq);
         self.update_base(end, delay);
         let base = self.base();
@@ -514,14 +542,22 @@ impl FastEstimator {
         };
         self.r_send_1s = r1;
         let full = ctx.fps > 0 && frames_1s as f64 >= 0.8 * ctx.fps as f64;
+        let mut k_decayed = false;
         if full && ctx.configured_kbps > 0 && r1 > 0.0 {
             let sample = (r1 / ctx.configured_kbps as f64).clamp(K_MIN, K_MAX);
-            self.k = if self.k_samples == 0 {
-                sample
+            if self.k_samples == 0 {
+                self.k = sample;
+                self.k_samples = 1;
+            } else if sample < K_CONTENT_LIMITED * self.k {
+                // The content, not the encoder's coupling, limits this second.
+                self.k = (self.k * K_DECAY).max(sample);
+                self.counters.k_rejected += 1;
+                k_decayed = true;
             } else {
-                (1.0 - K_EWMA) * self.k + K_EWMA * sample
-            };
-            self.k_samples += 1;
+                let w = if sample > self.k { K_EWMA_UP } else { K_EWMA };
+                self.k = (1.0 - w) * self.k + w * sample;
+                self.k_samples += 1;
+            }
         }
         if self.target.is_none()
             && ctx.configured_kbps > 0
@@ -533,7 +569,8 @@ impl FastEstimator {
             self.target = Some(ctx.configured_kbps as f64 * self.k);
             self.last_inc = now;
         }
-        if let Some(t) = self.target.as_mut() {
+        // Not while `k` drifts down on content-limited seconds: that is not a lower ceiling.
+        if let Some(t) = self.target.as_mut().filter(|_| !k_decayed) {
             let ceil = ctx.ceil_kbps as f64 * self.k;
             if ceil > 0.0 && *t > ceil {
                 *t = ceil;
@@ -610,6 +647,20 @@ impl FastEstimator {
         let dt_ms = span as f64 / 1000.0;
         let r_send = new.app_bytes.saturating_sub(old.app_bytes) as f64 * 8.0 / dt_ms;
         let r_acked = new.acked().saturating_sub(old.acked()) as f64 * 8.0 / dt_ms;
+        Some((r_send, r_acked))
+    }
+
+    // Metered send and delivery rates (kbps) from `base` to the newest reading, if at least
+    // `min_span` apart.
+    fn rates_since(&self, now: u64, base: &TcpInput, min_span: u64) -> Option<(f64, f64)> {
+        let new = self.fresh_tcp(now)?;
+        let span = new.at_us.saturating_sub(base.at_us);
+        if span < min_span || span == 0 {
+            return None;
+        }
+        let dt_ms = span as f64 / 1000.0;
+        let r_send = new.app_bytes.saturating_sub(base.app_bytes) as f64 * 8.0 / dt_ms;
+        let r_acked = new.acked().saturating_sub(base.acked()) as f64 * 8.0 / dt_ms;
         Some((r_send, r_acked))
     }
 
@@ -846,13 +897,28 @@ impl FastEstimator {
         } else if q < t_lo {
             self.onset = None;
         }
-        if let Some(t) = self.tcp.back() {
+        if let Some(t) = self.tcp.back().copied() {
             if self.timeouts_seen.is_some_and(|seen| t.timeouts > seen) {
-                self.rto_watch = Some(now + RTO_WATCH_US);
+                if self
+                    .last_cut_at
+                    .is_some_and(|c| now.saturating_sub(c) < RTO_AFTER_CUT_US)
+                {
+                    // The pause or queue that just cut also made the RTO.
+                    self.rto_watch = None;
+                    self.counters.rto_ignored += 1;
+                } else {
+                    self.rto_watch = Some((now, t));
+                }
             }
             self.timeouts_seen = Some(t.timeouts);
         }
-        let severe = !self.ack && stall.is_some_and(|w| w >= SEVERE_STALL_US);
+        // One SEVERE per stall episode: the capture loop reports the same unfetched frame after
+        // every slice, and an outage is not shortened by halving again.
+        let severe_stall = !self.ack && stall.is_some_and(|w| w >= SEVERE_STALL_US);
+        let severe = severe_stall && !self.severe_episode;
+        if severe {
+            self.severe_episode = true;
+        }
         let receiver = self.receiver_limited(now, t_lo);
         // OVERUSE: the queue stayed above T_hi for 100 ms, the link is not paused, and the queue
         // grows now or has stood above T_hi for 500 ms (a pause drains faster than that).
@@ -888,16 +954,28 @@ impl FastEstimator {
         };
         let floor = ctx.floor_kbps as f64 * self.k;
         let ceil = (ctx.ceil_kbps as f64 * self.k).max(floor);
+        // The RTO is judged on what happened after it, never on the outage that caused it.
+        let mut rto_acked = 0.0;
         let rto_cut = match self.rto_watch {
-            Some(deadline) if now <= deadline => {
-                rates.metered && rates.r_send > 0.0 && rates.r_acked < RTO_SHORTFALL * rates.r_send
-            }
-            Some(_) => {
-                self.rto_watch = None;
-                self.counters.rto_ignored += 1;
-                false
-            }
             None => false,
+            Some((at, base)) => match self.rates_since(now, &base, RTO_JUDGE_US) {
+                Some((s, a)) if !rates.paused => {
+                    self.rto_watch = None;
+                    if s > 0.0 && a < RTO_SHORTFALL * s {
+                        rto_acked = a;
+                        true
+                    } else {
+                        self.counters.rto_ignored += 1;
+                        false
+                    }
+                }
+                _ if now > at + RTO_WATCH_US => {
+                    self.rto_watch = None;
+                    self.counters.rto_ignored += 1;
+                    false
+                }
+                _ => false,
+            },
         };
         let kind = if severe {
             Some(Kind::Severe)
@@ -916,7 +994,7 @@ impl FastEstimator {
             }
             let to = match kind {
                 Kind::Severe => 0.5 * target,
-                Kind::Rto => (BETA * rates.r_acked).max(0.5 * target),
+                Kind::Rto => (BETA * rto_acked).max(0.5 * target),
                 _ => (OVERUSE_STEP * target)
                     .min(BETA * rates.r_acked)
                     .max(0.5 * target),
@@ -943,9 +1021,9 @@ impl FastEstimator {
             self.hold_until = now + HOLD_MIN_US.max(2 * srtt_us);
             self.last_inc = now;
             self.normal_since = None;
-            if kind == Kind::Rto {
-                self.rto_watch = None;
-            }
+            self.last_cut_at = Some(now);
+            // An RTO being watched belongs to the episode this cut covers.
+            self.rto_watch = None;
             let react_ms = self
                 .onset
                 .take()
@@ -1031,7 +1109,8 @@ impl FastEstimator {
 // Per-connection wrapper: the estimator shared by the connection task, its writer task and the
 // capture threads, and its log lines.
 
-// Connections with a live estimator; the capture loop's wait keeps its 300 ms slices while 0.
+// Connections whose estimator is on (created on, and not turned off by the option since); the
+// capture loop's wait keeps its 300 ms slices and makes no stall reports while 0.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 // At most one `FASTABR` decision line per connection in this period.
 const DECISION_LOG_INTERVAL: Duration = Duration::from_secs(2);
@@ -1040,9 +1119,15 @@ lazy_static::lazy_static! {
     static ref REGISTRY: Mutex<HashMap<i32, Weak<ConnFastAbr>>> = Default::default();
 }
 
-/// enable-fast-abr-shadow: on unless "N".
+/// enable-fast-abr-shadow: on unless "N" on Windows (where the TCP meter pairs with it); off
+/// unless "Y" elsewhere, so other platforms behave as before by default.
 pub fn shadow_option() -> bool {
-    Config::get_option(keys::OPTION_ENABLE_FAST_ABR_SHADOW) != "N"
+    let v = Config::get_option(keys::OPTION_ENABLE_FAST_ABR_SHADOW);
+    if cfg!(windows) {
+        v != "N"
+    } else {
+        v == "Y"
+    }
 }
 
 /// The capture loop's wait slice while any connection runs an estimator: 2 frame periods,
@@ -1196,6 +1281,12 @@ impl ConnFastAbr {
     pub fn on_second(&self, ctx: Context) {
         let on = shadow_option();
         if self.on.swap(on, Ordering::Relaxed) != on {
+            // Only this timer flips `on`; `Drop` reads it to undo this connection's share.
+            if on {
+                LIVE.fetch_add(1, Ordering::Relaxed);
+            } else {
+                LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
             log::info!("FASTABR shadow conn={} {}", self.id, if on { "on" } else { "off" });
         }
         let Ok(mut inner) = self.inner.lock() else {
@@ -1293,7 +1384,7 @@ impl ConnFastAbr {
         let (r_send, r_acked) = e.last_rates();
         let target = e.target();
         log::info!(
-            "LATENCY fast conn={} mode=shadow elig={} state={} meter={} ack={} k={:.2} set_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0}",
+            "LATENCY fast conn={} mode=shadow elig={} state={} meter={} ack={} k={:.2} set_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={}",
             self.id,
             e.ineligible().unwrap_or("yes"),
             e.state().letter(),
@@ -1327,6 +1418,7 @@ impl ConnFastAbr {
             c.false_cuts,
             c.stalls,
             c.react_max_ms,
+            c.k_rejected,
         );
     }
 }
@@ -1341,7 +1433,9 @@ impl Drop for ConnFastAbr {
                 reg.remove(&self.id);
             }
         }
-        LIVE.fetch_sub(1, Ordering::Relaxed);
+        if self.on.load(Ordering::Relaxed) {
+            LIVE.fetch_sub(1, Ordering::Relaxed);
+        }
         #[cfg(windows)]
         if let Ok(inner) = self.inner.lock() {
             if let Some(t) = inner.tcp.as_ref() {

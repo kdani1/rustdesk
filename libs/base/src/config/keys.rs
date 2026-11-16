@@ -318,13 +318,14 @@ pub const OPTION_VIDEO_SNDBUF_KB: &str = "video-sndbuf-kb";
 // next connection; `rustdesk --option enable-split-session-io N` from a terminal session (never
 // split) turns it off. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
-// Host, server option (Config): fast bitrate estimator in shadow mode (roadmap M15). On unless
-// "N". Each authorized remote-control or camera connection runs a delay-based congestion
-// estimator fed by its video writes, the TCP meter (when enable-tcp-meter gives one) and the
+// Host, server option (Config): fast bitrate estimator in shadow mode (roadmap M15). Windows: on
+// unless "N"; other platforms: off unless "Y". Each authorized remote-control or camera
+// connection runs a delay-based congestion estimator fed by its video writes, the TCP meter (when enable-tcp-meter gives one) and the
 // capture loop's wait, and logs the bitrate it would set (`FASTABR` lines, `LATENCY fast` with
 // enable-latency-log). It changes nothing the host sends; while any connection runs it, the
 // capture loop waits for a slow connection in slices of 2 frame periods instead of 300 ms, to
-// report stalls. Created when a connection is authorized; "N" stops it within a second. See
+// report stalls. Created when a connection is authorized; "N" stops it within a second (also
+// the shorter slices and the stall reports, once no connection has it on). See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_FAST_ABR_SHADOW: &str = "enable-fast-abr-shadow";
 // Host and viewer, server option (Config), empty by default: KCP send window in segments
