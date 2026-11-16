@@ -20,6 +20,19 @@ pub struct KcpStream {
     stop_sender: Option<oneshot::Sender<()>>,
 }
 
+/// `kcp-sndwnd`: a send window in segments, 32..1024, or None (the turbo profile's 1024).
+fn kcp_sndwnd() -> Option<i32> {
+    parse_sndwnd(&config::Config::get_option(base::config::keys::OPTION_KCP_SNDWND))
+}
+
+fn parse_sndwnd(v: &str) -> Option<i32> {
+    v.trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|w| *w > 0)
+        .map(|w| w.clamp(32, 1024))
+}
+
 const KCP_IO_ERR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 static KCP_SEND_ERR_LOG: hbb_common::log_throttle::LogThrottle =
     hbb_common::log_throttle::LogThrottle::new(KCP_IO_ERR_LOG_INTERVAL);
@@ -32,11 +45,22 @@ impl KcpStream {
     // Sender-side only, so no wire negotiation is needed and either peer may run either profile.
     // Requires kcp-sys from the `rustdesk-patches` branch, which wires the config factory into
     // connection setup (on older revs the factory was stored but never consulted).
+    //
+    // `kcp-sndwnd` (roadmap M15) lowers the send window, which also bounds the queue the
+    // endpoint keeps (it stops taking data above 2 x the window). Sender-side too. The factory is
+    // installed when either option is set.
     fn apply_kcp_config(endpoint: &mut KcpEndpoint) {
-        if crate::get_kcp_cc_enabled() {
-            endpoint.set_kcp_config_factory(Box::new(|conv| {
+        let cc = crate::get_kcp_cc_enabled();
+        let sndwnd = kcp_sndwnd();
+        if cc || sndwnd.is_some() {
+            endpoint.set_kcp_config_factory(Box::new(move |conv| {
                 let mut config = kcp_sys::ffi_safe::KcpConfig::new_turbo(conv);
-                config.nc = Some(0);
+                if cc {
+                    config.nc = Some(0);
+                }
+                if let Some(w) = sndwnd {
+                    config.sndwnd = Some(w);
+                }
                 config
             }));
         }
@@ -310,5 +334,15 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "connect did not honor its deadline"
         );
+    }
+
+    #[test]
+    fn latency_kcp_sndwnd_option_parsing() {
+        assert_eq!(parse_sndwnd(""), None);
+        assert_eq!(parse_sndwnd("0"), None);
+        assert_eq!(parse_sndwnd("x"), None);
+        assert_eq!(parse_sndwnd("8"), Some(32));
+        assert_eq!(parse_sndwnd(" 128 "), Some(128));
+        assert_eq!(parse_sndwnd("5000"), Some(1024));
     }
 }

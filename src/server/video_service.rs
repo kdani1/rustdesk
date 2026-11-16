@@ -1266,15 +1266,33 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let mut fetched_conn_ids = HashSet::new();
         let timeout_millis = 3_000u64;
+        // A fast bitrate estimator runs (enable-fast-abr-shadow): shorter slices, and the
+        // connections that keep the frame waiting are reported to it.
+        let stall_slice = super::video_qos::fast::stall_slice(spf);
+        let stall_after = super::video_qos::fast::stall_threshold(spf);
+        let slice_millis = stall_slice.map_or(300, |d| d.as_millis() as u64);
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            frame_controller.try_wait_next(&mut fetched_conn_ids, slice_millis);
             // break if all connections have received current frame
             if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
                 break;
+            }
+            if stall_slice.is_some() {
+                let waited = wait_begin.elapsed();
+                if waited >= stall_after {
+                    super::video_qos::fast::on_send_stall(
+                        frame_controller
+                            .send_conn_ids
+                            .iter()
+                            .filter(|id| !fetched_conn_ids.contains(id))
+                            .copied(),
+                        waited,
+                    );
+                }
             }
         }
         latency_stats.on_wait(

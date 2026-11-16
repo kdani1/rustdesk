@@ -1,5 +1,8 @@
 use super::*;
 use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
+
+/// Fast delay-based congestion estimator, shadow mode (roadmap M15).
+pub(super) mod fast;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -387,6 +390,30 @@ impl VideoQoS {
     // Check if variable bitrate encoding is supported and enabled
     pub fn in_vbr_state(&self) -> bool {
         self.abr_config && self.displays.iter().all(|e| e.1.support_changing_quality)
+    }
+
+    /// What the fast estimator (roadmap M15, shadow) needs from the shared encoder, read once per
+    /// second by each connection: bitrates in configured kbps, the floor and the ceiling the
+    /// ratio may take (`min_ratio`, the latest quality), converted at the current ratio.
+    pub fn fast_context(&self) -> fast::Context {
+        let configured = self.bitrate_store;
+        let ratio = self.ratio;
+        let to_kbps = |r: f32| -> u32 {
+            if ratio > 0.0 && configured > 0 {
+                (r / ratio * configured as f32).round().max(0.0) as u32
+            } else {
+                0
+            }
+        };
+        let quality = self.latest_quality().ratio();
+        fast::Context {
+            configured_kbps: configured,
+            fps: self.fps(),
+            floor_kbps: to_kbps(self.min_ratio()),
+            ceil_kbps: to_kbps(quality * MAX_BR_MULTIPLE),
+            quality,
+            vbr: self.in_vbr_state() && !self.displays.is_empty(),
+        }
     }
 }
 

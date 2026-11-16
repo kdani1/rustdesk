@@ -475,10 +475,15 @@ struct SplitHooks {
     id: i32,
     video_ack_required: bool,
     sends: Arc<super::latency_stats::SplitSends>,
+    // Fast bitrate estimator (enable-fast-abr-shadow), fed by the writer's video writes.
+    fast_abr: Option<Arc<super::video_qos::fast::ConnFastAbr>>,
 }
 
 impl crate::session_io::WriterHooks for SplitHooks {
     fn video_dequeued(&mut self, msg: &Message, queued_at: Instant) {
+        if let Some(f) = self.fast_abr.as_ref() {
+            f.on_dequeue(msg, queued_at.into());
+        }
         // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames.
         if !self.video_ack_required {
             if let Some(message::Union::VideoFrame(vf)) = &msg.union {
@@ -492,6 +497,9 @@ impl crate::session_io::WriterHooks for SplitHooks {
     }
 
     fn video_sent(&mut self, msg: &Message, send: Duration) {
+        if let Some(f) = self.fast_abr.as_ref() {
+            f.on_sent(msg);
+        }
         super::latency_stats::on_video_send(msg, send);
         self.sends.push(send);
     }
@@ -832,6 +840,8 @@ impl Connection {
         let mut writer_shared: Option<Arc<crate::session_io::Shared>> = None;
         let mut split_failure = false;
         let mut post_auth_done = false;
+        // Fast bitrate estimator in shadow mode (roadmap M15): logs only.
+        let mut fast_abr: Option<Arc<super::video_qos::fast::ConnFastAbr>> = None;
 
         #[cfg(feature = "unix-file-copy-paste")]
         let rx_clip_holder;
@@ -865,6 +875,14 @@ impl Connection {
                 if conn.is_authed_remote_conn() || conn.is_authed_view_camera_conn() {
                     #[cfg(windows)]
                     Self::apply_video_sndbuf(id, host_socket.as_ref());
+                    if super::video_qos::fast::shadow_option() {
+                        let f = super::video_qos::fast::ConnFastAbr::new(id, conn.video_ack_required);
+                        #[cfg(windows)]
+                        if let Some(s) = host_socket.as_ref().filter(|s| s.is_metered()) {
+                            f.set_tcp(s.clone());
+                        }
+                        fast_abr = Some(f);
+                    }
                     if conn.port_forward_socket.is_none() && crate::session_io::split_allowed() {
                         if let Some(video) = rx_video.take() {
                             let sends = Arc::new(super::latency_stats::SplitSends::default());
@@ -872,6 +890,7 @@ impl Connection {
                                 id,
                                 video_ack_required: conn.video_ack_required,
                                 sends: sends.clone(),
+                                fast_abr: fast_abr.clone(),
                             });
                             match conn.stream.split(video, hooks) {
                                 Ok(handle) => {
@@ -1271,12 +1290,18 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    if let Some(f) = fast_abr.as_ref() {
+                        f.on_dequeue(&value, instant.into());
+                    }
                     let send_begin = Instant::now();
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
                     let send = send_begin.elapsed();
+                    if let Some(f) = fast_abr.as_ref() {
+                        f.on_sent(&value);
+                    }
                     super::latency_stats::on_video_send(&value, send);
                     conn_stats.on_video_send(send);
                 },
@@ -1365,6 +1390,10 @@ impl Connection {
                         break;
                     }
                     conn_stats.tick(conn.authorized);
+                    if let Some(f) = fast_abr.as_ref() {
+                        let ctx = video_service::VIDEO_QOS.lock().unwrap().fast_context();
+                        f.on_second(ctx);
+                    }
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
                     }

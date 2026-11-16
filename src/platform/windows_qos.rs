@@ -258,6 +258,8 @@ const SO_SNDBUF: i32 = 0x1001;
 // `SAMPLE_INTERVAL`.
 const SAMPLE_INTERVAL_PENDING: Duration = Duration::from_millis(10);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+// The fast estimator's snapshot (roadmap M15) takes a fresh sample when the last one is older.
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(50);
 const MAX_RTT_SAMPLES: usize = 1024;
 // Registry entries no connection claimed (the handshake failed) are dropped after this.
 const REGISTRY_TTL: Duration = Duration::from_secs(120);
@@ -439,7 +441,27 @@ pub struct HostSocket {
     app_bytes: AtomicU64,
     // Sample only while the connection reports (enable-latency-log); set by the connection.
     active: AtomicBool,
+    // Or while the connection's fast estimator reads the meter (enable-fast-abr-shadow).
+    fast: AtomicBool,
     state: Mutex<MeterState>,
+}
+
+/// The newest SIO_TCP_INFO reading of a metered socket, cumulative from the wrapper's baseline,
+/// for the fast estimator (roadmap M15).
+#[derive(Clone, Copy, Debug)]
+pub struct TcpSnapshot {
+    /// When the reading was taken.
+    pub at: Instant,
+    /// Bytes the session wrote into the socket.
+    pub app_bytes: u64,
+    /// Unique bytes TCP sent: BytesOut - BytesRetrans.
+    pub unique_out: u64,
+    pub in_flight: u32,
+    pub rtt_us: u32,
+    pub min_rtt_us: u32,
+    pub timeouts: u32,
+    /// v1: ms the sender was limited by the peer's receive window, cumulative.
+    pub lim_rwin_ms: Option<u32>,
 }
 
 impl HostSocket {
@@ -450,6 +472,7 @@ impl HostSocket {
             meter,
             app_bytes: AtomicU64::new(0),
             active: AtomicBool::new(false),
+            fast: AtomicBool::new(false),
             state: Mutex::new(MeterState {
                 alive: true,
                 version: None,
@@ -521,6 +544,50 @@ impl HostSocket {
         self.active.store(on, Ordering::Relaxed);
     }
 
+    /// Sampling for the fast estimator, independent of enable-latency-log.
+    pub fn set_fast_active(&self, on: bool) {
+        self.fast.store(on, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn sampling(&self) -> bool {
+        self.active.load(Ordering::Relaxed) || self.fast.load(Ordering::Relaxed)
+    }
+
+    /// The newest reading, refreshed first when it is older than 50 ms. Never blocks: None when
+    /// the meter is busy, off, or the socket is closed.
+    pub fn snapshot(&self) -> Option<TcpSnapshot> {
+        if !self.meter {
+            return None;
+        }
+        let mut st = self.state.try_lock().ok()?;
+        if !st.alive || st.version.is_none() {
+            return None;
+        }
+        let now = Instant::now();
+        if st
+            .last_at
+            .map_or(true, |t| now.saturating_duration_since(t) >= SNAPSHOT_MAX_AGE)
+        {
+            st.last_at = Some(now);
+            self.sample_locked(&mut st);
+        }
+        let last = st.last?;
+        Some(TcpSnapshot {
+            at: st.last_at.unwrap_or(now),
+            app_bytes: self.app_bytes.load(Ordering::Relaxed),
+            unique_out: last
+                .bytes_out
+                .wrapping_sub(st.base_out)
+                .wrapping_sub(last.bytes_retrans.wrapping_sub(st.base_retrans) as u64),
+            in_flight: last.in_flight,
+            rtt_us: last.rtt_us,
+            min_rtt_us: last.min_rtt_us,
+            timeouts: last.timeout_episodes,
+            lim_rwin_ms: last.snd_lim_ms.map(|l| l[0]),
+        })
+    }
+
     // From the stream wrapper's poll_write: counts only completed writes, samples now and then,
     // never blocks (try_lock) and never fails the write.
     #[inline]
@@ -536,7 +603,7 @@ impl HostSocket {
             Poll::Pending => true,
             Poll::Ready(Err(_)) => return,
         };
-        if !self.active.load(Ordering::Relaxed) {
+        if !self.sampling() {
             return;
         }
         let Ok(mut st) = self.state.try_lock() else {
@@ -626,7 +693,7 @@ impl HostSocket {
         if !self.meter || st.version.is_none() {
             return None;
         }
-        if st.alive && self.active.load(Ordering::Relaxed) {
+        if st.alive && self.sampling() {
             self.sample_locked(&mut st);
         }
         let app = self.app_bytes.load(Ordering::Relaxed);
