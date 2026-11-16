@@ -103,6 +103,8 @@ pub struct Remote<T: InvokeUiSession> {
     video_threads: HashMap<usize, VideoThread>,
     // Gentle fps control (`enable-gentle-fps-control`); when off, `fps_control` is the legacy one.
     gentle_fps: GentleFpsControl,
+    // `enable-fps-cap-split`: the fps limit goes out as Misc.auto_adjust_fps (roadmap M16).
+    fps_cap_split: bool,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
@@ -159,6 +161,7 @@ impl<T: InvokeUiSession> Remote<T> {
             peer_info: Default::default(),
             video_threads: Default::default(),
             gentle_fps: GentleFpsControl::new(gentle_fps_control_enabled()),
+            fps_cap_split: fps_cap_split_enabled(),
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
@@ -1695,17 +1698,11 @@ impl<T: InvokeUiSession> Remote<T> {
                 auto_fps = 1;
             }
             if Some(auto_fps) != last_auto_fps {
-                let mut misc = Misc::new();
-                misc.set_option(OptionMessage {
-                    custom_fps: auto_fps as _,
-                    ..Default::default()
-                });
-                let mut msg = Message::new();
-                msg.set_misc(misc);
-                self.sender.send(Data::Message(msg)).ok();
+                let field = self.send_fps_limit(auto_fps);
                 log::info!(
-                    "Set fps to {} (reason={} last_auto={:?} custom={} limited={} min_decode_fps={} max_queue_len={} direct={} |{})",
+                    "Set fps to {} (field={} reason={} last_auto={:?} custom={} limited={} min_decode_fps={} max_queue_len={} direct={} |{})",
                     auto_fps,
+                    field,
                     decision,
                     last_auto_fps,
                     custom_fps,
@@ -1758,6 +1755,32 @@ impl<T: InvokeUiSession> Remote<T> {
                 ctl.last_refresh_instant = Some(Instant::now());
             }
         }
+    }
+
+    /// Sends the fps limit of the fps controller (legacy or gentle) to the host. With
+    /// `enable-fps-cap-split` and a host of 1.2.2 or later (which caps the stream at
+    /// min(custom_fps, auto_adjust_fps)) as Misc.auto_adjust_fps, so the host's custom_fps stays
+    /// the user's setting (roadmap M16); otherwise as OptionMessage.custom_fps, as before.
+    /// Returns the field used, for the log line.
+    fn send_fps_limit(&self, fps: usize) -> &'static str {
+        let mut misc = Misc::new();
+        let split = self.fps_cap_split
+            && self.handler.lc.read().unwrap().version
+                >= hbb_common::get_version_number(FPS_CAP_SPLIT_MIN_HOST);
+        let field = if split {
+            misc.set_auto_adjust_fps(fps as _);
+            "auto"
+        } else {
+            misc.set_option(OptionMessage {
+                custom_fps: fps as _,
+                ..Default::default()
+            });
+            "custom"
+        };
+        let mut msg = Message::new();
+        msg.set_misc(misc);
+        self.sender.send(Data::Message(msg)).ok();
+        field
     }
 
     /// Per-display inputs of `fps_control` for its log lines: the counters of the last tick,
@@ -1861,18 +1884,12 @@ impl<T: InvokeUiSession> Remote<T> {
             .gentle_fps
             .tick(custom_fps, tick_ms.min(u64::MAX as u128) as u64, &ticks);
         if let Some(fps) = tick.send {
-            let mut misc = Misc::new();
-            misc.set_option(OptionMessage {
-                custom_fps: fps as _,
-                ..Default::default()
-            });
-            let mut msg = Message::new();
-            msg.set_misc(misc);
-            self.sender.send(Data::Message(msg)).ok();
+            let field = self.send_fps_limit(fps);
             self.handler.lc.write().unwrap().last_auto_fps = Some(fps);
             log::info!(
-                "Set fps to {} (gentle {} direct={} |{}|{})",
+                "Set fps to {} (field={} gentle {} direct={} |{}|{})",
                 fps,
+                field,
                 tick.summary(),
                 direct,
                 self.fps_control_displays(counts, &HashMap::new()),
@@ -3461,6 +3478,21 @@ impl FpsControl {
     fn on_refresh(&mut self) {
         self.refresh_times += 1;
         self.last_refresh_instant = Some(Instant::now());
+    }
+}
+
+/// The first host version that handles Misc.auto_adjust_fps (tag 28) as an fps cap (added
+/// upstream in July 2023, between 1.2.1 and 1.2.2).
+const FPS_CAP_SPLIT_MIN_HOST: &str = "1.2.2";
+
+/// Whether the fps limit goes out as Misc.auto_adjust_fps (`enable-fps-cap-split`, roadmap M16):
+/// by default on Windows ("N" turns it off), off elsewhere unless "Y". Read once per connection.
+fn fps_cap_split_enabled() -> bool {
+    let option = LocalConfig::get_option(keys::OPTION_ENABLE_FPS_CAP_SPLIT);
+    if cfg!(windows) {
+        option != "N"
+    } else {
+        option == "Y"
     }
 }
 

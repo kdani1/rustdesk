@@ -748,7 +748,10 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
-    VIDEO_QOS.lock().unwrap().store_bitrate(encoder.bitrate());
+    VIDEO_QOS
+        .lock()
+        .unwrap()
+        .store_bitrate_at(encoder.bitrate(), quality);
     VIDEO_QOS
         .lock()
         .unwrap()
@@ -1875,11 +1878,14 @@ fn check_qos(
     *spf = video_qos.spf();
     let fps_cap = video_qos.fps();
     let mut measured_fps = None;
+    // Fast mode (roadmap M16): a cut the encoder takes now, for its reaction time.
+    let mut fast_cut = None;
     if *ratio != video_qos.ratio() {
         *ratio = video_qos.ratio();
         if encoder.support_changing_quality() {
             allow_err!(encoder.set_quality(*ratio));
-            video_qos.store_bitrate(encoder.bitrate());
+            video_qos.store_bitrate_at(encoder.bitrate(), *ratio);
+            fast_cut = video_qos.take_fast_cut();
         } else {
             // Now only vaapi doesn't support changing quality
             if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
@@ -1900,6 +1906,17 @@ fn check_qos(
         *send_counter = 0;
     }
     drop(video_qos);
+    if let Some((conn, onset, unlogged)) = fast_cut {
+        log::info!(
+            "FASTABR applied conn={} display={} ratio={:.3} kbps={} reaction_ms={} unlogged={}",
+            conn,
+            name,
+            *ratio,
+            encoder.bitrate(),
+            onset.elapsed().as_millis(),
+            unlogged
+        );
+    }
     // Virtual framerate, after the lock: the NVENC SDK driver reconfigures the encoder here.
     #[cfg(windows)]
     if let Some(vf) = virtual_fps.as_mut() {

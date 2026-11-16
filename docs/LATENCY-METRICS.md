@@ -436,12 +436,15 @@ and the false-cut rate, not the depth.
 ```
 FASTABR shadow conn=5 ack=0
 FASTABR shadow conn=5 kind=cut from_kbps=11755 to_kbps=5877 would_set_kbps=5877 k=1.00 q_ms=148.5 t_hi_ms=30 r_send=8000 r_acked=6104 react_ms=100 fc=0 meter=1 skipped=0
-LATENCY fast conn=5 mode=shadow elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0
+LATENCY fast conn=5 mode=shadow live=- elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 stream_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0 applied=0 refused=0 resync=0 fps_cap=60/-
 ```
+
+The `mode`, `live`, `stream_kbps`, `applied`, `refused`, `resync` and `fps_cap` fields, and
+the live-mode lines, are described under "Host: fast bitrate adaptation live" below.
 
 | Line / field | Meaning |
 |---|---|
-| `FASTABR shadow conn= ack=` | once when the estimator starts; `... on` / `... off` when the option changes |
+| `FASTABR shadow conn= ack=` | once when the estimator starts (`FASTABR live ...` with `enable-fast-abr=Y`); `... on` / `... off` when the options turn it on or off |
 | `FASTABR shadow kind=` | always (not gated by `enable-latency-log`), at most one line per connection per 2 s (`skipped`: decisions not logged since the last line). `cut`, `severe`, `rto`; increases are only counted |
 | `from_kbps` / `to_kbps` | target before and after, measured kbps |
 | `would_set_kbps` | `to_kbps / k`: the encoder bitrate it would set |
@@ -452,7 +455,7 @@ LATENCY fast conn=5 mode=shadow elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4
 | `fc` | metered only: `1` when `r_acked` >= 0.95 x `r_send` at the cut, the roadmap's false-cut test (gate: at most 1 per 10 min). `-` unmetered: the lock-stepped capture loop makes both rates equal there, so the test says nothing |
 | `meter` | the decision used the TCP meter's rates |
 | `LATENCY fast` | every 5 s per connection with the estimator, with `enable-latency-log=Y` |
-| `elig` / `state` | see above; `state` is the newest one |
+| `elig` / `state` | see above; `state` is the newest one. Live only, `displays`: more than one video service (display or camera) shares the ratio |
 | `set_kbps` | the encoder's configured bitrate now (what the old controller set) |
 | `target_kbps` / `would_set_kbps` | the estimator's target (measured) and what it would configure; `-` before `init` |
 | `floor_kbps` / `ceil_kbps` | the configured range QoS allows |
@@ -482,6 +485,101 @@ queue until it is full). The meter's `unsent` is still unverified on the real li
 meter above); the metered backlog term depends on it.
 
 Rollback: `enable-fast-abr-shadow N`.
+
+### Host: fast bitrate adaptation live (roadmap M16)
+
+Server option `enable-fast-abr`: off unless `Y`, on every platform (the estimator works
+without the TCP meter too; the meter only exists on Windows). Read every second by each
+connection that runs an estimator: a connection authorized while `enable-fast-abr=Y` or
+`enable-fast-abr-shadow` is on (on Windows the shadow option is on by default, so every
+connection has one); `N` or empty hands the bitrate back to the TestDelay controller within a
+second. Stock viewers need nothing: the estimator only reads the host's own writes, the TCP
+meter and the capture loop. The viewer part (`enable-fps-cap-split`) is in "Viewer: fps
+control".
+
+What changes with `Y` (`src/server/video_qos.rs` `on_fast`, `src/server/video_qos/fast.rs`):
+
+- **Reports.** After every decision, and once a second without one, a connection's estimator
+  reports to the stream its target in configured kbps (`would_set_kbps`; none while shadow,
+  off or not eligible) and the decision. The configured kbps per unit of ratio come from the
+  bitrate the encoder was last set to and the ratio it was set at, so a cut converts exactly.
+  A connection with a target is "fast"; one without, or one the stream cannot take (`vbr`:
+  ABR off or an encoder that cannot change bitrate; `displays`: several video services share
+  the ratio; `br`: no bitrate yet; `epoch`: a quality choice since its last context), drops
+  out of the fast set and is left to the TestDelay loop.
+- **Cut** (`cut`, `severe`, `rto`): the stream's ratio comes down to this connection's target
+  at once (`check_qos` gives it to the encoder before the next frame). A target at or above
+  the stream changes nothing (`lower`); one at the floor neither (`floor`).
+- **Increase**: the ratio rises by the decision's factor (x1.08 per s, or the additive step
+  near the learned ceiling), but never above the lowest target of the fast connections (the
+  "min" policy: one slow viewer holds the stream; refused `min`), at most every 100 ms over
+  all connections (`spacing`), and not while any viewer's TestDelay replies average 150 ms of
+  excess or more (`delay`; as the old loop's own increases. A viewer without an estimator,
+  for example a stock web client acking frames, has no other voice, and a fast one's replies
+  may see a queue past the first hop, as over a relay, that its estimator does not).
+- **Following the stream.** Once a second each estimator lowers its target to what the stream
+  has (`stream_kbps` x `k`) when the stream is more than 3 % lower: another viewer's lower
+  target, a TestDelay backstop cut, or its own refused increase (`resync` counts these). So it
+  raises from the bitrate the encoder really has, not from its own past target.
+- **Quality choice.** Every image-quality message (also a repeated one) bumps an epoch and
+  drops every target: the ratio jumps to the new quality as before, reports made before it
+  are void (`epoch`), and each estimator's next second sets its target to the new ceiling
+  and forgets the learned ceiling `C`.
+- **TestDelay loop beside it**, while any connection is fast: it makes no increase (both
+  call sites, the 3 s periodic adjustment and the reply path); its cuts stay as a backstop but
+  are skipped for 2 s after a fast cut (one queue is not cut twice), with no cooldown started,
+  so a confirmation after that cuts at once (logged `FASTABR backstop cut`).
+- **FPS.** A fast connection's delay replies lower its fps only at the bitrate floor
+  (`min_ratio`, within 2 %) or for a reply with 1 s of excess or more; while the bitrate can
+  still come down, the estimator answers the delay. The probe-timeout brake (a probe
+  outstanding over 2 s) is unchanged, and so are fps increases and the viewers' fps caps
+  (`custom_fps`, `auto_adjust_fps`: the stream runs at the lowest cap, as before; `fps_cap`).
+- **M7 virtual framerate.** With `nvenc-nominal-fps` the encoder's real bitrate follows the
+  configured one at any fps, so `k` is about 1 and an fps change does not move the bitrate.
+  Without it nvenc's real bitrate scales with fps / 30; `k` absorbs it (learned over
+  full-rate seconds), so the estimator still converts in measured units, only slower after an
+  fps change.
+- **Several viewers.** Each connection runs its own estimator; the stream takes the lowest
+  target ("min"). The "primary" policy (a slow non-controlling viewer does not hold the
+  stream) is roadmap M18.
+
+Cost: a report locks `VIDEO_QOS` once per decision (at most every 50 ms per connection, in
+practice a few per second) and once per second; nothing per frame.
+
+```
+FASTABR live conn=5 ack=0
+FASTABR live conn=5 kind=cut from_kbps=8120 to_kbps=6730 would_set_kbps=6801 k=0.99 q_ms=61.0 t_hi_ms=30 r_send=7900 r_acked=7918 react_ms=110 fc=1 meter=1 skipped=0 ratio=0.670->0.561
+FASTABR applied conn=5 display=… ratio=0.561 kbps=6801 reaction_ms=126 unlogged=0
+FASTABR backstop cut ratio=0.561->0.393
+LATENCY fast conn=5 mode=live live=on elig=yes state=N … stream_kbps=6801 … applied=3 refused=1 resync=0 fps_cap=60/54
+```
+
+| Line / field | Meaning |
+|---|---|
+| `FASTABR live conn= mode` / `FASTABR shadow conn= mode` | the option changed between shadow and live for this connection |
+| `FASTABR live kind=… ratio=a->b` | the decision line (same fields as in shadow, same 2 s limit) with what the stream did: `ratio=` the ratio before and after, `refused=` why nothing changed (`lower`, `floor`, `min`, `spacing`, `delay`, `epoch`, `displays`, `vbr`, `br`, `user`) |
+| `FASTABR applied` | `check_qos` gave a fast cut to the encoder: `ratio`, the encoder's `kbps`, `reaction_ms` from the queue first passing `T_hi` (as `react_ms`) to here, the roadmap's reaction time (gate: 120-200 ms). At most one line per second; `unlogged` counts the cuts since the last line |
+| `FASTABR backstop cut` | the TestDelay loop cut while a connection is fast (outside the 2 s after a fast cut) |
+| `mode` | `live` or `shadow` (in the `LATENCY fast` line) |
+| `live` | what the stream did with the last report: `on` (this connection's target bounds the stream), the reason it does not (`displays`, `vbr`, `br`, `epoch`, `ack`, `multi`, `init`, `ctx`, `off`), `-` in shadow mode |
+| `stream_kbps` | the configured bitrate the stream's ratio stands for now (`set_kbps` is the encoder's, up to a frame behind) |
+| `applied` / `refused` | this connection's decisions the stream applied / did not apply in the window |
+| `resync` | seconds the target came down to the stream's bitrate |
+| `fps_cap` | this viewer's `custom_fps` / `auto_adjust_fps` caps as the host holds them, `-` when not sent. A fork viewer with `enable-fps-cap-split` sends its decode limit as the second one |
+
+Tests (`cargo test latency_fast_live`): `on_fast` (cut at once, increases bounded by the
+lowest target and spaced, no increase while a viewer shows delay, the TestDelay loop as
+backstop with the 2 s suppression and the fps hold, quality epoch, refusals), the estimator's
+report and its following of a lower stream, and a closed loop on the fluid model where the
+encoder follows the estimator (4 Mbps step under 8 Mbps: first cut within 300 ms, at most 4
+cuts, never under 2 Mbps; back at 8 Mbps within 25 s after the step ends).
+
+Gate (roadmap M16): a capacity step with `New-NetQosPolicy -PolicyStore ActiveStore` (at least
+2 Mbps, removed twice; check that it acts on the live connection), shadow vs live in the same
+session: `reaction_ms`, peak `wait`/`send` and recovery time improve; on Wi-Fi, cuts per minute
+no more than in shadow mode.
+
+Rollback: `enable-fast-abr` empty or `N` (shadow again), or also `enable-fast-abr-shadow N`.
 
 ### Host and viewer: KCP send window (roadmap M15)
 
@@ -573,7 +671,7 @@ RACE site=start rule=relay_hold preferred=ok@640 tcp_punch_round=ok@95 winner=UD
 
 ```
 FPSCTL tick_ms=1001 direct=true custom=60 last_auto=54 limited=54 min_decode_fps=60 max_queue_len=0 decision=keep sent=- | d0 rx=60 dec=60 shown=60 skip=0 discard=0 fail=0 queue_len=0 queue_max=1 decode_fps=62 dec_ms=8.1 present_ms=4.2 other_ms=3.8 idle=4 inactive=0 trend=- net+server=3.1/9.0;
-Set fps to 27 (reason=decrease last_auto=Some(54) custom=60 limited=27 min_decode_fps=30 max_queue_len=3 direct=true | d0 …;)
+Set fps to 27 (field=auto reason=decrease last_auto=Some(54) custom=60 limited=27 min_decode_fps=30 max_queue_len=3 direct=true | d0 …;)
 ```
 
 `FPSCTL` is logged every 1 s status tick while `enable-latency-log` = `Y` (not for the
@@ -606,6 +704,15 @@ the default controller):
 
 A refresh request from the controller logs `Refresh display N to reduce delay
 (queue_len=… tolerable=… refresh_times=…)`.
+
+`field` in `Set fps to` (both controllers): how the fps went to the host (roadmap M16). With
+local option `enable-fps-cap-split` (on by default on Windows, `N` turns it off; off elsewhere
+unless `Y`; read when a connection starts) and a host of version 1.2.2 or later, `auto`: as
+`Misc.auto_adjust_fps` (upstream tag 28). Hosts since 1.2.2 cap the stream at
+min(`custom_fps`, `auto_adjust_fps`), so the effect is the same as before, but `custom_fps`
+stays the user's setting and the host can tell a decode limit from a user choice (the
+`fps_cap` field of `LATENCY fast`). Otherwise `custom`: as `OptionMessage.custom_fps`, as
+before (older hosts, which may not handle tag 28, always get this).
 
 #### Gentle fps control
 
@@ -660,7 +767,7 @@ thread's load, not from the queue peak, which Wi-Fi bursts make large:
 
 ```
 FPSCTL mode=gentle tick_ms=1000 direct=true custom=60 target=43 floor=24 cap=47.9 overload=1/2 calm=0/5 below_floor=0/10 present_low=0/10 since_change_ms=1000 decision=keep sent=- | d0 rx=43 dec=43 shown=41 … net+server=3.1/9.0;| d0 ready=1 busy=0.93 cap=47.9 queue_p50=0 grow=0 big_queue=0 overload=1 present_low=0;
-Set fps to 37 (gentle custom=60 target=43 floor=24 cap=46.0 overload=2/2 … decision=decrease sent=37 direct=true | d0 …;| d0 ready=1 …;)
+Set fps to 37 (field=auto gentle custom=60 target=43 floor=24 cap=46.0 overload=2/2 … decision=decrease sent=37 direct=true | d0 …;| d0 ready=1 …;)
 Refresh display 0 to reduce delay (gentle: queue_max above 30 for 3 ticks, queue_len=41 refresh_times=0)
 Refresh display 0 after queue overflow (refresh_times=1)
 ```

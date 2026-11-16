@@ -123,6 +123,7 @@ fn add(t: &mut Counters, c: &Counters) {
     t.false_cuts += c.false_cuts;
     t.stalls += c.stalls;
     t.k_rejected += c.k_rejected;
+    t.resync += c.resync;
     t.react_max_ms = t.react_max_ms.max(c.react_max_ms);
 }
 
@@ -220,6 +221,7 @@ fn ctx(kbps: f64, fps: u32) -> Context {
         ceil_kbps: (kbps * 1.5) as u32,
         quality: 0.67,
         vbr: true,
+        ..Default::default()
     }
 }
 
@@ -264,6 +266,9 @@ fn latency_fast_replay_wifi_30fps_no_cut_on_isolated_writes() {
 // Fluid model
 
 struct Model {
+    // Live (roadmap M16): every decision sets the encoder's bitrate, as `VideoQoS::on_fast` does
+    // for a single viewer (cuts down to the target, increases by their factor).
+    live: bool,
     metered: bool,
     ack: bool,
     fps: f64,
@@ -282,6 +287,7 @@ struct Model {
 impl Model {
     fn new(cap: impl Fn(u64) -> f64 + 'static) -> Self {
         Self {
+            live: false,
             metered: true,
             ack: false,
             fps: 60.0,
@@ -299,7 +305,9 @@ impl Model {
         let mut est = FastEstimator::new(self.ack);
         let mut out = Outcome::default();
         let spf_us = (1e6 / self.fps) as u64;
-        let frame = self.enc_kbps * 1000.0 / 8.0 / self.fps;
+        // The encoder's bitrate: fixed in shadow mode, the estimator's live.
+        let mut enc = self.enc_kbps;
+        let (floor, ceil) = (self.enc_kbps * 0.3, self.enc_kbps * 1.5);
         let thr = stall_threshold(Duration::from_micros(spf_us)).as_micros() as u64;
         let slice = slice_for(Duration::from_micros(spf_us)).as_micros() as u64;
         let mut buffered = 0.0f64;
@@ -327,6 +335,7 @@ impl Model {
             let mut d = None;
             if writing.is_none() {
                 if let Some(enq) = queued.take() {
+                    let frame = enc * 1000.0 / 8.0 / self.fps;
                     est.on_write_begin(enq, now, frame as u32);
                     writing = Some(frame);
                 }
@@ -361,7 +370,23 @@ impl Model {
                 });
             }
             if ms % 1000 == 0 {
-                d = d.or(est.on_second(now, ctx(self.enc_kbps, self.fps as u32)));
+                let c = if self.live {
+                    Context {
+                        configured_kbps: enc as u32,
+                        fps: self.fps as u32,
+                        floor_kbps: floor as u32,
+                        ceil_kbps: ceil as u32,
+                        quality: 0.67,
+                        vbr: true,
+                        stream_kbps: enc as u32,
+                        displays: 1,
+                        live: true,
+                        ..Default::default()
+                    }
+                } else {
+                    ctx(self.enc_kbps, self.fps as u32)
+                };
+                d = d.or(est.on_second(now, c));
                 add(&mut out.totals, &est.counters);
                 est.counters = Counters::default();
             }
@@ -369,6 +394,17 @@ impl Model {
                 d = d.or(est.tick(now));
             }
             if let Some(d) = d {
+                if self.live {
+                    let r = est.report(Some(&d));
+                    match (r.step, r.set_kbps) {
+                        (Some(Step::Cut { .. }), Some(set)) => enc = enc.min(set),
+                        (Some(Step::Increase { factor }), Some(set)) => {
+                            enc = (enc * factor).min(set)
+                        }
+                        _ => {}
+                    }
+                    enc = enc.clamp(floor, ceil);
+                }
                 out.decisions.push(d);
             }
         }
@@ -695,7 +731,7 @@ fn latency_fast_k_ignores_content_limited_seconds() {
     // the first full-budget second brings k back at once.
     let mut est = FastEstimator::new(false);
     let mut t = 0u64;
-    let mut second = |est: &mut FastEstimator, t: &mut u64, kbps: u64| {
+    let second = |est: &mut FastEstimator, t: &mut u64, kbps: u64| {
         for _ in 0..60 {
             est.on_write_begin(*t, *t, (kbps * 1000 / 8 / 60) as u32);
             *t += 100;
@@ -747,4 +783,106 @@ fn latency_fast_quality_change_resets_target() {
     let _ = est.on_second(4_000_000, best);
     assert_eq!(est.target(), Some(18_000.0));
     assert!(est.ceiling().is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Live (roadmap M16)
+
+fn live_ctx(configured: f64, stream: f64) -> Context {
+    Context {
+        configured_kbps: configured as u32,
+        fps: 30,
+        floor_kbps: 1000,
+        ceil_kbps: 12_000,
+        quality: 0.67,
+        vbr: true,
+        stream_kbps: stream as u32,
+        displays: 1,
+        live: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn latency_fast_live_report_only_when_live_and_eligible() {
+    let mut est = FastEstimator::new(false);
+    let _ = est.on_second(0, ctx(8000.0, 30));
+    let _ = est.on_second(3_000_000, ctx(8000.0, 30));
+    // Shadow: no target for the stream.
+    assert!(est.report(None).set_kbps.is_none());
+    let _ = est.on_second(4_000_000, live_ctx(8000.0, 8000.0));
+    let r = est.report(None);
+    assert_eq!(r.set_kbps, Some(8000.0));
+    assert!(r.step.is_none());
+    // Several video services share the ratio: not eligible live.
+    let mut multi = live_ctx(8000.0, 8000.0);
+    multi.displays = 2;
+    let _ = est.on_second(5_000_000, multi);
+    assert_eq!(est.ineligible(), Some("displays"));
+    assert!(est.report(None).set_kbps.is_none());
+}
+
+#[test]
+fn latency_fast_live_target_follows_a_lower_stream() {
+    let mut est = FastEstimator::new(false);
+    let _ = est.on_second(0, live_ctx(8000.0, 8000.0));
+    let _ = est.on_second(3_000_000, live_ctx(8000.0, 8000.0));
+    assert_eq!(est.target(), Some(8000.0));
+    // Another viewer's target or the TestDelay backstop holds the stream at 5 Mbps.
+    let _ = est.on_second(4_000_000, live_ctx(8000.0, 5000.0));
+    assert_eq!(est.target(), Some(5000.0));
+    assert_eq!(est.counters.resync, 1);
+    // Within the quantisation step it is left alone.
+    let _ = est.on_second(5_000_000, live_ctx(5000.0, 4900.0));
+    assert_eq!(est.target(), Some(5000.0));
+    // A quality choice (new epoch) resets the target to the new ceiling.
+    let mut q = live_ctx(5000.0, 12_000.0);
+    q.epoch = 1;
+    let _ = est.on_second(6_000_000, q);
+    assert_eq!(est.target(), Some(12_000.0));
+}
+
+#[test]
+fn latency_fast_live_closed_loop_capacity_step() {
+    // 50 Mbps, 4 Mbps from t = 20 s to 30 s, then 50 Mbps again, under an 8 Mbps encoder that
+    // follows the estimator. The first cut comes within 300 ms of the step and the encoder
+    // settles under the capacity in a few cuts, without falling to the floor; afterwards it
+    // climbs back to 8 Mbps.
+    let mut m = Model::new(|ms| {
+        if (20_000..30_000).contains(&ms) {
+            4_000.0
+        } else {
+            50_000.0
+        }
+    });
+    m.live = true;
+    let (out, est) = m.run(60);
+    let before: Vec<_> = out
+        .cuts()
+        .into_iter()
+        .filter(|d| d.at_us < 20_000_000)
+        .collect();
+    assert!(before.is_empty(), "{:?}", before);
+    let first = first_cut_after(&out, 20_000_000).expect("no cut after the step");
+    assert!(first.at_us - 20_000_000 <= 300_000, "{:?}", first);
+    assert!(first.react_ms <= 200.0, "{:?}", first);
+    let episode: Vec<_> = out
+        .cuts()
+        .into_iter()
+        .filter(|d| (20_000_000..30_000_000).contains(&d.at_us))
+        .collect();
+    assert!(episode.len() <= 4, "{:?}", episode);
+    let lowest = episode
+        .iter()
+        .map(|d| d.set_kbps)
+        .fold(f64::INFINITY, f64::min);
+    assert!(lowest <= 4_000.0, "{:?}", episode);
+    assert!(lowest >= 2_000.0, "fell too far: {:?}", episode);
+    let back = out
+        .decisions
+        .iter()
+        .find(|d| d.at_us > 30_000_000 && d.set_kbps >= 0.9 * 8000.0)
+        .expect("never recovered");
+    assert!(back.at_us - 30_000_000 <= 25_000_000, "{:?}", back);
+    assert!(est.target().is_some_and(|t| t >= 0.9 * 8000.0));
 }

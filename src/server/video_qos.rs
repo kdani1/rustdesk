@@ -1,7 +1,7 @@
 use super::*;
 use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
 
-/// Fast delay-based congestion estimator, shadow mode (roadmap M15).
+/// Fast delay-based congestion estimator: shadow mode (roadmap M15), live (roadmap M16).
 pub(super) mod fast;
 use std::{
     collections::VecDeque,
@@ -42,6 +42,15 @@ b. 3 seconds timeout => update ratio according to network delay
     with another user's confirmation.
 c. confirmed congestion => decrease ratio at once, when the 3 seconds cooldown allows
 
+fast (enable-fast-abr=Y, roadmap M16; see fast.rs and on_fast):
+    Each connection's estimator reports its target; a connection whose estimator is eligible
+    is "fast". The stream's ratio comes down at once to a fast connection's cut and goes up
+    only as far as every fast connection's target allows (and no viewer's replies show delay).
+    While any connection is fast the TestDelay loop above makes no increase, makes no cut
+    within FAST_SUPPRESS_CUTS of a fast cut, and a fast connection's delay replies lower its
+    fps only at the bitrate floor or at a second of excess. A quality choice voids every
+    target (fast_epoch).
+
 delay:
     TestDelay shares the video stream, so it measures the queue in front of it rather
     than the path RTT. The baseline starts at the first reply and follows lower
@@ -68,6 +77,14 @@ const ADJUST_RATIO_INTERVAL: usize = 3; // Adjust quality ratio every 3 seconds
 const DYNAMIC_SCREEN_THRESHOLD: usize = 2; // Allow increase quality ratio if encode more than 2 times in one second
 const DELAY_THRESHOLD_150MS: u32 = 150; // 150ms is the threshold for good network condition
 const RESTORE_GUARD_SAMPLES: u8 = 5; // A restored level that congests this soon is lowered
+
+// Fast mode (roadmap M16): the TestDelay loop makes no cut this soon after a fast cut.
+const FAST_SUPPRESS_CUTS: Duration = Duration::from_secs(2);
+// Fast mode: increases are applied at most this often over all connections.
+const FAST_MIN_SPACING: Duration = Duration::from_millis(100);
+// Fast mode: a fast connection's delay replies lower its fps at this excess even while the
+// bitrate can still come down.
+const FAST_FPS_BRAKE_MS: u32 = 1000;
 
 #[derive(Default, Debug, Clone)]
 struct UserDelay {
@@ -269,6 +286,9 @@ struct UserData {
     delay: UserDelay,
     record: bool,
     joined_at: Option<Instant>, // set by on_connection_open; the start-up guard's clock
+    // Fast mode: the ratio this connection's estimator target stands for; None when it does
+    // not drive the stream (no estimator, shadow, not eligible).
+    fast_ratio: Option<f32>,
 }
 
 impl UserData {
@@ -297,9 +317,21 @@ pub struct VideoQoS {
     users: HashMap<i32, UserData>,
     displays: HashMap<String, DisplayData>,
     bitrate_store: u32,
+    // The ratio `bitrate_store` was set at: kbps per ratio for the fast estimators.
+    bitrate_ratio: f32,
     adjust_ratio_instant: Instant,
     abr_config: bool,
     first_reply_adjusts_ratio: bool, // false on Linux, where it can create vaapi twice
+    // Fast mode: bumped by every quality choice; reports from before it are void.
+    fast_epoch: u32,
+    fast_cut_at: Option<Instant>,
+    fast_change_at: Option<Instant>,
+    // The last applied fast cut: its connection and when its queue began, for the reaction
+    // time logged once the encoder took it (take_fast_cut).
+    fast_cut_pending: Option<(i32, Instant)>,
+    // At most one such log line per second; the cuts not logged since the last one.
+    fast_cut_logged_at: Option<Instant>,
+    fast_cuts_unlogged: u32,
     #[cfg(test)]
     test_now: Option<Instant>,
 }
@@ -312,9 +344,16 @@ impl Default for VideoQoS {
             users: Default::default(),
             displays: Default::default(),
             bitrate_store: 0,
+            bitrate_ratio: 0.0,
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             first_reply_adjusts_ratio: !cfg!(target_os = "linux"),
+            fast_epoch: 0,
+            fast_cut_at: None,
+            fast_change_at: None,
+            fast_cut_pending: None,
+            fast_cut_logged_at: None,
+            fast_cuts_unlogged: 0,
             #[cfg(test)]
             test_now: None,
         }
@@ -358,9 +397,16 @@ impl VideoQoS {
         }
     }
 
-    // Store bitrate for later use
+    // Store bitrate for later use (tests: at the current ratio)
+    #[cfg(test)]
     pub fn store_bitrate(&mut self, bitrate: u32) {
+        self.store_bitrate_at(bitrate, self.ratio);
+    }
+
+    // Store bitrate for later use, with the ratio the encoder was set to for it.
+    pub fn store_bitrate_at(&mut self, bitrate: u32, ratio: f32) {
         self.bitrate_store = bitrate;
+        self.bitrate_ratio = ratio;
     }
 
     // Get stored bitrate
@@ -392,28 +438,150 @@ impl VideoQoS {
         self.abr_config && self.displays.iter().all(|e| e.1.support_changing_quality)
     }
 
-    /// What the fast estimator (roadmap M15, shadow) needs from the shared encoder, read once per
-    /// second by each connection: bitrates in configured kbps, the floor and the ceiling the
-    /// ratio may take (`min_ratio`, the latest quality), converted at the current ratio.
-    pub fn fast_context(&self) -> fast::Context {
-        let configured = self.bitrate_store;
-        let ratio = self.ratio;
-        let to_kbps = |r: f32| -> u32 {
-            if ratio > 0.0 && configured > 0 {
-                (r / ratio * configured as f32).round().max(0.0) as u32
-            } else {
-                0
-            }
+    // Configured kbps per unit of ratio, from the bitrate the encoder was last set to.
+    fn kbps_per_ratio(&self) -> Option<f32> {
+        let ratio = if self.bitrate_ratio > 0.0 {
+            self.bitrate_ratio
+        } else {
+            self.ratio
         };
+        (ratio > 0.0 && self.bitrate_store > 0).then(|| self.bitrate_store as f32 / ratio)
+    }
+
+    /// What connection `id`'s fast estimator (roadmap M15/M16) needs from the shared encoder,
+    /// read once per second: bitrates in configured kbps (the stream's ratio, the floor and the
+    /// ceiling it may take: `min_ratio`, the latest quality), converted at the rate the encoder
+    /// was last set at; `live`: enable-fast-abr=Y.
+    pub fn fast_context(&self, id: i32, live: bool) -> fast::Context {
+        let kpr = self.kbps_per_ratio();
+        let to_kbps = |r: f32| -> u32 { kpr.map_or(0, |k| (r * k).round().max(0.0) as u32) };
         let quality = self.latest_quality().ratio();
+        let user = self.users.get(&id);
         fast::Context {
-            configured_kbps: configured,
+            configured_kbps: self.bitrate_store,
             fps: self.fps(),
             floor_kbps: to_kbps(self.min_ratio()),
             ceil_kbps: to_kbps(quality * MAX_BR_MULTIPLE),
             quality,
             vbr: self.in_vbr_state() && !self.displays.is_empty(),
+            stream_kbps: to_kbps(self.ratio),
+            epoch: self.fast_epoch,
+            displays: self.displays.len() as u32,
+            live,
+            custom_fps: user.and_then(|u| u.custom_fps).unwrap_or(0),
+            auto_fps: user.and_then(|u| u.auto_adjust_fps).unwrap_or(0),
         }
+    }
+
+    // Some connection's estimator drives the stream (fast mode, roadmap M16).
+    fn fast_live(&self) -> bool {
+        self.users.values().any(|u| u.fast_ratio.is_some())
+    }
+
+    /// Fast mode (roadmap M16): connection `id`'s estimator reports its target, and with
+    /// `report.step` a decision. A cut brings the ratio down to this connection's target at
+    /// once; an increase raises it by the decision's factor, at most to the lowest target of
+    /// the fast connections ("min" over viewers), at most every FAST_MIN_SPACING, and not while
+    /// any viewer's TestDelay replies show delay. Within [min_ratio, latest quality]. A report
+    /// without a target, or one the stream cannot take (ABR off, several video services, no
+    /// bitrate yet, a quality choice since), drops the connection from the fast set.
+    pub fn on_fast(&mut self, id: i32, report: fast::Report) -> fast::Applied {
+        use fast::{Applied, Step};
+        let now = self.now();
+        let unusable = if !self.in_vbr_state() || self.displays.is_empty() {
+            Some("vbr")
+        } else if self.displays.len() > 1 {
+            Some("displays")
+        } else if report.epoch != self.fast_epoch {
+            Some("epoch")
+        } else {
+            None
+        };
+        let kpr = self.kbps_per_ratio();
+        let Some(user) = self.users.get_mut(&id) else {
+            return Applied::Refused("user");
+        };
+        let (Some(set_kbps), Some(kpr), None) = (report.set_kbps, kpr, unusable) else {
+            user.fast_ratio = None;
+            return match (unusable, kpr, report.set_kbps) {
+                (Some(why), _, Some(_)) => Applied::Refused(why),
+                (None, None, Some(_)) => Applied::Refused("br"),
+                _ => Applied::Kept,
+            };
+        };
+        let own = (set_kbps / kpr as f64) as f32;
+        user.fast_ratio = Some(own);
+        let Some(step) = report.step else {
+            return Applied::Kept;
+        };
+        let min = self.min_ratio();
+        let max = (self.latest_quality().ratio() * MAX_BR_MULTIPLE).max(min);
+        let from = self.ratio;
+        let wanted = match step {
+            Step::Cut { .. } if own >= from => return Applied::Refused("lower"),
+            Step::Cut { .. } => own,
+            Step::Increase { factor } => match self.fast_increase(from, factor) {
+                Ok(v) => v,
+                Err(why) => return Applied::Refused(why),
+            },
+        };
+        let to = wanted.clamp(min, max);
+        let increase = matches!(step, Step::Increase { .. });
+        if (increase && to <= from) || (!increase && to >= from) {
+            return Applied::Refused(if increase { "min" } else { "floor" });
+        }
+        self.ratio = to;
+        self.fast_change_at = Some(now);
+        if let Step::Cut { react_ms } = step {
+            self.fast_cut_at = Some(now);
+            let onset = now
+                .checked_sub(Duration::from_micros((react_ms.max(0.0) * 1000.0) as u64))
+                .unwrap_or(now);
+            self.fast_cut_pending = Some((id, onset));
+        }
+        Applied::Ratio { from, to }
+    }
+
+    // Fast mode: the ratio an increase by `factor` from `from` may reach, or why none.
+    fn fast_increase(&self, from: f32, factor: f64) -> Result<f32, &'static str> {
+        if self
+            .fast_change_at
+            .is_some_and(|t| self.since(t) < FAST_MIN_SPACING)
+        {
+            return Err("spacing");
+        }
+        // As the TestDelay loop's own increases: none while any viewer's replies show delay
+        // (a viewer without an estimator has no other voice; a fast one's may see a queue past
+        // the first hop that its estimator does not).
+        if self
+            .users
+            .values()
+            .any(|u| u.delay.fps.is_some() && u.delay.avg_delay() >= DELAY_THRESHOLD_150MS)
+        {
+            return Err("delay");
+        }
+        let lowest = self
+            .users
+            .values()
+            .filter_map(|u| u.fast_ratio)
+            .fold(f32::INFINITY, f32::min);
+        Ok((from * factor as f32).min(lowest))
+    }
+
+    /// The fast cut the encoder just took (check_qos), for its log line: its connection, when
+    /// its queue began (the reaction time) and the cuts not logged before it. At most one per
+    /// second; the others are only counted.
+    pub fn take_fast_cut(&mut self) -> Option<(i32, Instant, u32)> {
+        let (id, onset) = self.fast_cut_pending.take()?;
+        if self
+            .fast_cut_logged_at
+            .is_some_and(|t| self.since(t) < Duration::from_secs(1))
+        {
+            self.fast_cuts_unlogged += 1;
+            return None;
+        }
+        self.fast_cut_logged_at = Some(self.now());
+        Some((id, onset, std::mem::take(&mut self.fast_cuts_unlogged)))
     }
 }
 
@@ -478,6 +646,10 @@ impl VideoQoS {
             user.quality = quality;
             // update ratio directly
             self.ratio = self.latest_quality().ratio();
+            // Fast mode: every estimator target was for the old quality.
+            self.fast_epoch = self.fast_epoch.wrapping_add(1);
+            self.fast_cut_pending = None;
+            self.users.values_mut().for_each(|u| u.fast_ratio = None);
         }
     }
 
@@ -508,6 +680,8 @@ impl VideoQoS {
         let mut adjust_ratio = false;
         let mut reduce_bitrate = false;
         if let Some(user) = self.users.get_mut(&id) {
+            // Fast mode: this connection's bitrate follows its estimator.
+            let fast_user = user.fast_ratio.is_some();
             let delay = delay.max(10);
             // The reply closes the outstanding probe, braked or not.
             user.delay.stall_ticks = 0;
@@ -590,6 +764,13 @@ impl VideoQoS {
             fps = user
                 .delay
                 .accelerate_startup(current_fps, fps, user_cap, delay, braked);
+            // Fast mode: while the bitrate can still come down, the estimator answers delay;
+            // the fps drops only for a second of excess (the probe-timeout brake stays too).
+            let excess =
+                delay.saturating_sub(user.delay.rtt_calculator.get_rtt().unwrap_or_default());
+            if fast_user && bitrate_first && excess < FAST_FPS_BRAKE_MS && fps < current_fps {
+                fps = current_fps;
+            }
             reduce_bitrate = bitrate_first
                 && user.delay.needs_bitrate_reduction()
                 && user.delay.replies_after_bitrate_reduction.is_none();
@@ -771,6 +952,18 @@ impl VideoQoS {
             .values()
             .filter_map(|u| u.delay.ratio_reduction())
             .reduce(f32::min);
+        // Fast mode: the estimators own increases; this loop stays a backstop for cuts, except
+        // right after a fast cut (one queue is not cut twice).
+        if self.fast_live() {
+            let after_fast_cut = self
+                .fast_cut_at
+                .is_some_and(|t| self.since(t) < FAST_SUPPRESS_CUTS);
+            if reduction.is_none() || after_fast_cut {
+                // No cooldown either: a confirmed reduction later is acted on at once.
+                self.reset_send_counters();
+                return;
+            }
+        }
         if reduction.is_none() && max_delay >= DELAY_THRESHOLD_150MS {
             // Elevated but unconfirmed: no change, and no cooldown either, so a
             // confirmation on the next reply is acted on at once.
@@ -835,6 +1028,13 @@ impl VideoQoS {
                         });
                 }
             }
+        }
+        if self.fast_live() && v.clamp(min, max) < current_ratio {
+            log::info!(
+                "FASTABR backstop cut ratio={:.3}->{:.3}",
+                current_ratio,
+                v.clamp(min, max)
+            );
         }
         self.ratio = v.clamp(min, max);
         self.reset_send_counters();
@@ -1040,6 +1240,7 @@ mod tests {
 
     mod adaptation;
     mod baseline;
+    mod fast_live;
     mod invariants;
     mod jitter;
     mod recovery;

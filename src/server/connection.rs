@@ -475,7 +475,8 @@ struct SplitHooks {
     id: i32,
     video_ack_required: bool,
     sends: Arc<super::latency_stats::SplitSends>,
-    // Fast bitrate estimator (enable-fast-abr-shadow), fed by the writer's video writes.
+    // Fast bitrate estimator (enable-fast-abr-shadow / enable-fast-abr), fed by the writer's
+    // video writes.
     fast_abr: Option<Arc<super::video_qos::fast::ConnFastAbr>>,
 }
 
@@ -840,7 +841,8 @@ impl Connection {
         let mut writer_shared: Option<Arc<crate::session_io::Shared>> = None;
         let mut split_failure = false;
         let mut post_auth_done = false;
-        // Fast bitrate estimator in shadow mode (roadmap M15): logs only.
+        // Fast bitrate estimator: shadow mode logs only (roadmap M15); live, with
+        // enable-fast-abr=Y, it sets the bitrate (roadmap M16).
         let mut fast_abr: Option<Arc<super::video_qos::fast::ConnFastAbr>> = None;
 
         #[cfg(feature = "unix-file-copy-paste")]
@@ -875,7 +877,7 @@ impl Connection {
                 if conn.is_authed_remote_conn() || conn.is_authed_view_camera_conn() {
                     #[cfg(windows)]
                     Self::apply_video_sndbuf(id, host_socket.as_ref());
-                    if super::video_qos::fast::shadow_option() {
+                    if super::video_qos::fast::enabled() {
                         let f = super::video_qos::fast::ConnFastAbr::new(id, conn.video_ack_required);
                         #[cfg(windows)]
                         if let Some(s) = host_socket.as_ref().filter(|s| s.is_metered()) {
@@ -1391,8 +1393,7 @@ impl Connection {
                     }
                     conn_stats.tick(conn.authorized);
                     if let Some(f) = fast_abr.as_ref() {
-                        let ctx = video_service::VIDEO_QOS.lock().unwrap().fast_context();
-                        f.on_second(ctx);
+                        f.on_second();
                     }
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;

@@ -269,6 +269,14 @@ pub const OPTION_ENABLE_VIEWER_PRESENT_PACING: &str = "enable-viewer-present-pac
 // default elsewhere ("Y" turns it on). Read when a connection starts. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_GENTLE_FPS_CONTROL: &str = "enable-gentle-fps-control";
+// Viewer, local option: send the decode-capacity fps limit as Misc.auto_adjust_fps (upstream
+// tag 28) instead of OptionMessage.custom_fps (roadmap M16), so custom_fps stays the user's
+// setting and the host can tell the two apart. Only to hosts of version 1.2.2 or later, which
+// cap the stream at min(custom_fps, auto_adjust_fps) exactly as at a lower custom_fps; older
+// hosts get custom_fps as before. Same for the legacy and the gentle controller. On by default
+// on Windows ("N" turns it off); off by default elsewhere ("Y" turns it on). Read when a
+// connection starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_FPS_CAP_SPLIT: &str = "enable-fps-cap-split";
 // Windows viewer, local option: "N" leaves the viewer at normal priority (on by default). While a
 // remote-control or camera session is open, its io_loop thread and each display's decoder thread
 // run at THREAD_PRIORITY_ABOVE_NORMAL, and the process at ABOVE_NORMAL_PRIORITY_CLASS (only raised
@@ -328,6 +336,16 @@ pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
 // the shorter slices and the stall reports, once no connection has it on). See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_FAST_ABR_SHADOW: &str = "enable-fast-abr-shadow";
+// Host, server option (Config): fast bitrate adaptation live (roadmap M16). "Y" turns it on;
+// anything else (default) leaves the bitrate to the TestDelay controller. With "Y" each
+// connection's estimator (the one enable-fast-abr-shadow runs; "Y" runs it even with the shadow
+// option "N") sets the shared encoder's bitrate within 100-200 ms: the stream takes the lowest
+// target over the connections whose estimator is eligible (one display, ABR on, no frame acks),
+// the TestDelay loop no longer raises the bitrate and does not cut within 2 s of a fast cut,
+// and its fps reductions wait for the bitrate floor or 1 s of probe excess. Stock viewers need
+// nothing. Read every second; "N" or empty hands the bitrate back within a second. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_FAST_ABR: &str = "enable-fast-abr";
 // Host and viewer, server option (Config), empty by default: KCP send window in segments
 // (32..1024; KCP's turbo profile uses 1024). Bounds the queue KCP keeps in front of the link to
 // about 2 x N segments (the endpoint stops taking data above that) instead of about 2048. Applies
@@ -404,6 +422,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_AUTO_GAME_MODE,
     OPTION_ENABLE_VIEWER_PRESENT_PACING,
     OPTION_ENABLE_GENTLE_FPS_CONTROL,
+    OPTION_ENABLE_FPS_CAP_SPLIT,
     OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
     OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
     OPTION_ENABLE_VIEWER_MMCSS,

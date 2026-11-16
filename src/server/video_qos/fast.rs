@@ -1,4 +1,4 @@
-//! Fast delay-based congestion estimator, shadow mode (roadmap M15).
+//! Fast delay-based congestion estimator: shadow mode (roadmap M15), live (roadmap M16).
 //!
 //! One estimator per authorized remote-control or camera connection, fed per video frame write
 //! (the connection's video branch, or the split session's writer task), by the TCP meter of the
@@ -6,7 +6,10 @@
 //! waits too long for this connection to take a frame (`on_send_stall`). Every 50 ms (driven by
 //! those events, plus the connection's 1 s timer) it decides what a fast controller would do to
 //! the shared encoder's bitrate: cut, cut hard, cut after an RTO, raise, or hold. In shadow mode
-//! the decision is only logged; nothing the host sends changes.
+//! the decision is only logged; nothing the host sends changes. Live (`enable-fast-abr=Y`), each
+//! decision goes to `VideoQoS::on_fast`, which sets the stream's ratio from the lowest target
+//! over the live connections (`Report`, `Applied`), and the estimator follows the ratio the
+//! stream really has (`Context::stream_kbps`).
 //!
 //! Units: the estimator works in measured kbps only (bytes the session wrote or TCP delivered).
 //! `k`, an EWMA of measured / configured bitrate over full-rate seconds that are not
@@ -14,7 +17,8 @@
 //! (`would_set_kbps`), so a 30-fps nvenc at 60 fps or a virtual framerate (M7) do not skew the
 //! thresholds.
 //!
-//! What each log field means: docs/LATENCY-METRICS.md, "Host: fast bitrate estimator (shadow)".
+//! What each log field means: docs/LATENCY-METRICS.md, "Host: fast bitrate estimator, shadow
+//! mode" and "Host: fast bitrate adaptation live".
 
 use base::{config::keys, message_proto::Message};
 use hbb_common::{config::Config, log};
@@ -129,6 +133,50 @@ pub struct Context {
     pub quality: f32,
     /// ABR on and every display's encoder can change its bitrate.
     pub vbr: bool,
+    /// The bitrate the stream's ratio stands for now, kbps (the encoder takes it at its next
+    /// frame).
+    pub stream_kbps: u32,
+    /// Counts the user's quality choices (also a repeated one): a change resets the target.
+    pub epoch: u32,
+    /// Video services (displays, camera) sharing the ratio.
+    pub displays: u32,
+    /// `enable-fast-abr=Y`: the decisions set the stream's bitrate.
+    pub live: bool,
+    /// This viewer's fps caps: its custom fps (user setting) and its auto-adjust fps (a fork
+    /// viewer's decode limit, `enable-fps-cap-split`); 0 when not sent.
+    pub custom_fps: u32,
+    pub auto_fps: u32,
+}
+
+/// What one connection's estimator asks of the stream, live (roadmap M16): `VideoQoS::on_fast`.
+#[derive(Clone, Copy, Debug)]
+pub struct Report {
+    /// `Context::epoch` the estimator last saw: a decision from before a quality change is void.
+    pub epoch: u32,
+    /// The configured bitrate its target stands for, kbps; None when it does not drive the
+    /// stream (shadow, off, or not eligible).
+    pub set_kbps: Option<f64>,
+    /// The decision of this evaluation; None for the once-a-second report.
+    pub step: Option<Step>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Step {
+    /// A cut (any kind): the stream goes down to this connection's target at once.
+    Cut { react_ms: f64 },
+    /// Raise the stream by this factor, never above any live connection's target.
+    Increase { factor: f64 },
+}
+
+/// What `VideoQoS::on_fast` did with a report.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Applied {
+    /// Registered or kept; no ratio change asked.
+    Kept,
+    /// The ratio went from `from` to `to`.
+    Ratio { from: f32, to: f32 },
+    /// Nothing changed, and why.
+    Refused(&'static str),
 }
 
 /// One TCP meter reading, cumulative.
@@ -247,6 +295,12 @@ pub struct Counters {
     pub stalls: u32,
     /// Full-rate seconds whose `k` sample was content-limited (not learned from).
     pub k_rejected: u32,
+    /// Live: seconds the target came down to the stream's bitrate (another viewer's lower
+    /// target, the TestDelay backstop, a refused increase).
+    pub resync: u32,
+    /// Live: decisions `VideoQoS::on_fast` applied, and refused.
+    pub applied: u32,
+    pub refused: u32,
     pub react_max_ms: f64,
 }
 
@@ -411,6 +465,32 @@ impl FastEstimator {
         self.ack
     }
 
+    /// Live: what this estimator asks of the stream (`VideoQoS::on_fast`), with this
+    /// evaluation's decision.
+    pub fn report(&self, d: Option<&Decision>) -> Report {
+        let ctx = self.ctx.unwrap_or_default();
+        let set_kbps = (ctx.live && self.ineligible().is_none())
+            .then(|| self.target.map(|t| t / self.k.max(K_MIN)))
+            .flatten();
+        let step = d.filter(|_| set_kbps.is_some()).map(|d| match d.kind {
+            Kind::Increase => Step::Increase {
+                factor: if d.from_kbps > 0.0 {
+                    d.to_kbps / d.from_kbps
+                } else {
+                    1.0
+                },
+            },
+            _ => Step::Cut {
+                react_ms: d.react_ms,
+            },
+        });
+        Report {
+            epoch: ctx.epoch,
+            set_kbps,
+            step,
+        }
+    }
+
     /// Why no decision is made, or None when the estimator decides.
     pub fn ineligible(&self) -> Option<&'static str> {
         let Some(ctx) = self.ctx else {
@@ -418,6 +498,9 @@ impl FastEstimator {
         };
         if !ctx.vbr {
             Some("vbr")
+        } else if ctx.live && ctx.displays > 1 {
+            // One ratio for several encoders: one connection's rate does not convert.
+            Some("displays")
         } else if self.ack {
             Some("ack")
         } else if self.displays_seen > 1 {
@@ -514,7 +597,10 @@ impl FastEstimator {
     pub fn on_second(&mut self, now: u64, ctx: Context) -> Option<Decision> {
         self.first_us.get_or_insert(now);
         if let Some(old) = self.ctx {
-            if old.quality != ctx.quality && ctx.ceil_kbps > 0 && self.target.is_some() {
+            if (old.quality != ctx.quality || old.epoch != ctx.epoch)
+                && ctx.ceil_kbps > 0
+                && self.target.is_some()
+            {
                 // The user changed the quality: QoS jumps to the new ceiling, so does the target.
                 self.target = Some(ctx.ceil_kbps as f64 * self.k);
                 self.ceiling_c = None;
@@ -574,6 +660,15 @@ impl FastEstimator {
             let ceil = ctx.ceil_kbps as f64 * self.k;
             if ceil > 0.0 && *t > ceil {
                 *t = ceil;
+            }
+            // Live: the stream runs lower than this target (a lower target of another viewer,
+            // the TestDelay backstop, an increase the stream refused). Raise from what it has.
+            if ctx.live && ctx.stream_kbps > 0 {
+                let stream = ctx.stream_kbps as f64 * self.k;
+                if *t > stream * (1.0 + MIN_CHANGE) {
+                    *t = stream;
+                    self.counters.resync += 1;
+                }
             }
         }
         self.app_limited = (ctx.fps > 0 && (frames_1s as f64) < 0.7 * ctx.fps as f64)
@@ -1130,6 +1225,16 @@ pub fn shadow_option() -> bool {
     }
 }
 
+/// enable-fast-abr (roadmap M16): the decisions set the bitrate. Off unless "Y", everywhere.
+pub fn live_option() -> bool {
+    Config::get_option(keys::OPTION_ENABLE_FAST_ABR) == "Y"
+}
+
+/// Whether a connection runs an estimator at all: shadow or live.
+pub fn enabled() -> bool {
+    live_option() || shadow_option()
+}
+
 /// The capture loop's wait slice while any connection runs an estimator: 2 frame periods,
 /// 20..300 ms, so a stall is reported at frame granularity. None: keep the 300 ms slice.
 pub fn stall_slice(spf: Duration) -> Option<Duration> {
@@ -1165,6 +1270,8 @@ pub fn on_send_stall(ids: impl Iterator<Item = i32>, waited: Duration) {
 
 struct LogState {
     latency_log: bool,
+    // Live: what the stream did with the last report ("on", or why it is not driven).
+    live_state: &'static str,
     window_start: Instant,
     q: crate::client::latency::Samples,
     last_line: Option<Instant>,
@@ -1178,24 +1285,29 @@ struct Inner {
     tcp: Option<Arc<crate::platform::windows_qos::HostSocket>>,
 }
 
-/// One connection's estimator in shadow mode.
+/// One connection's estimator, shadow or live.
 pub struct ConnFastAbr {
     id: i32,
     epoch: Instant,
     on: AtomicBool,
+    // enable-fast-abr=Y: decisions go to `VideoQoS::on_fast`. Flipped by the 1 s timer only.
+    live: AtomicBool,
     inner: Mutex<Inner>,
 }
 
 impl ConnFastAbr {
     pub fn new(id: i32, ack: bool) -> Arc<Self> {
+        let live = live_option();
         let c = Arc::new(Self {
             id,
             epoch: Instant::now(),
             on: AtomicBool::new(true),
+            live: AtomicBool::new(live),
             inner: Mutex::new(Inner {
                 est: FastEstimator::new(ack),
                 log: LogState {
                     latency_log: latency_log_enabled(),
+                    live_state: "-",
                     window_start: Instant::now(),
                     q: Default::default(),
                     last_line: None,
@@ -1209,8 +1321,12 @@ impl ConnFastAbr {
             reg.insert(id, Arc::downgrade(&c));
         }
         LIVE.fetch_add(1, Ordering::Relaxed);
-        log::info!("FASTABR shadow conn={} ack={}", id, ack as u8);
+        log::info!("FASTABR {} conn={} ack={}", mode_name(live), id, ack as u8);
         c
+    }
+
+    fn mode(&self) -> &'static str {
+        mode_name(self.live.load(Ordering::Relaxed))
     }
 
     /// The TCP meter of the session socket (metered sockets only).
@@ -1271,15 +1387,15 @@ impl ConnFastAbr {
         };
         #[cfg(windows)]
         self.feed_tcp(&mut inner);
-        let d = inner
-            .est
-            .on_stall(self.us(now), waited.as_micros() as u64);
+        let d = inner.est.on_stall(self.us(now), waited.as_micros() as u64);
         self.after_eval(&mut inner, d);
     }
 
-    /// From the connection's 1 s timer: the encoder context, the option, the report window.
-    pub fn on_second(&self, ctx: Context) {
-        let on = shadow_option();
+    /// From the connection's 1 s timer: the options, the encoder context, the report to the
+    /// stream (live), the report window.
+    pub fn on_second(&self) {
+        let live = live_option();
+        let on = live || shadow_option();
         if self.on.swap(on, Ordering::Relaxed) != on {
             // Only this timer flips `on`; `Drop` reads it to undo this connection's share.
             if on {
@@ -1287,7 +1403,16 @@ impl ConnFastAbr {
             } else {
                 LIVE.fetch_sub(1, Ordering::Relaxed);
             }
-            log::info!("FASTABR shadow conn={} {}", self.id, if on { "on" } else { "off" });
+            log::info!(
+                "FASTABR {} conn={} {}",
+                mode_name(live),
+                self.id,
+                if on { "on" } else { "off" }
+            );
+        }
+        let was_live = self.live.swap(live, Ordering::Relaxed);
+        if was_live != live && on {
+            log::info!("FASTABR {} conn={} mode", mode_name(live), self.id);
         }
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -1297,13 +1422,26 @@ impl ConnFastAbr {
             t.set_fast_active(on);
         }
         if !on {
+            if was_live {
+                // Hand the bitrate back: this connection no longer bounds the stream.
+                self.push(&mut inner, None);
+            }
             return;
         }
         let now = Instant::now();
         #[cfg(windows)]
         self.feed_tcp(&mut inner);
+        let ctx = super::super::video_service::VIDEO_QOS
+            .lock()
+            .unwrap()
+            .fast_context(self.id, live);
         let d = inner.est.on_second(self.us(now), ctx);
         self.after_eval(&mut inner, d);
+        if live || was_live {
+            // Once a second, decision or not: registers this connection's target with the
+            // stream, or drops it (shadow again, not eligible).
+            self.push(&mut inner, None);
+        }
         if inner.log.window_start.elapsed() >= crate::client::latency::REPORT_INTERVAL {
             if inner.log.latency_log {
                 self.log_window(&inner, ctx);
@@ -1333,6 +1471,34 @@ impl ConnFastAbr {
         inner.est.on_tcp(input);
     }
 
+    // Live: hands the estimator's target, and decision `d` if any, to the stream. Called with
+    // the inner lock held, so one connection's reports reach the stream in order (lock order:
+    // this connection's inner, then VIDEO_QOS; VideoQoS never calls back into an estimator).
+    fn push(&self, inner: &mut Inner, d: Option<&Decision>) -> Option<Applied> {
+        let mut report = inner.est.report(d);
+        if !self.live.load(Ordering::Relaxed) || !self.on.load(Ordering::Relaxed) {
+            // The context may still say live: the option changed after it was read.
+            report.set_kbps = None;
+            report.step = None;
+        }
+        let applied = super::super::video_service::VIDEO_QOS
+            .lock()
+            .unwrap()
+            .on_fast(self.id, report);
+        inner.log.live_state = match applied {
+            Applied::Refused(why) if report.step.is_none() => why,
+            _ if report.set_kbps.is_none() => inner.est.ineligible().unwrap_or("off"),
+            _ => "on",
+        };
+        if report.step.is_some() {
+            match applied {
+                Applied::Ratio { .. } => inner.est.counters.applied += 1,
+                _ => inner.est.counters.refused += 1,
+            }
+        }
+        report.step.map(|_| applied)
+    }
+
     fn after_eval(&self, inner: &mut Inner, d: Option<Decision>) {
         if inner.log.latency_log {
             let q = inner.est.last_q();
@@ -1340,6 +1506,11 @@ impl ConnFastAbr {
         }
         let Some(d) = d else {
             return;
+        };
+        let applied = if self.live.load(Ordering::Relaxed) {
+            self.push(inner, Some(&d))
+        } else {
+            None
         };
         if d.kind == Kind::Increase {
             return;
@@ -1356,7 +1527,8 @@ impl ConnFastAbr {
         let skipped = std::mem::take(&mut inner.log.skipped);
         inner.log.last_line = Some(now);
         log::info!(
-            "FASTABR shadow conn={} kind={} from_kbps={:.0} to_kbps={:.0} would_set_kbps={:.0} k={:.2} q_ms={:.1} t_hi_ms={:.0} r_send={:.0} r_acked={:.0} react_ms={:.0} fc={} meter={} skipped={}",
+            "FASTABR {} conn={} kind={} from_kbps={:.0} to_kbps={:.0} would_set_kbps={:.0} k={:.2} q_ms={:.1} t_hi_ms={:.0} r_send={:.0} r_acked={:.0} react_ms={:.0} fc={} meter={} skipped={}{}",
+            self.mode(),
             self.id,
             d.kind.name(),
             d.from_kbps,
@@ -1375,6 +1547,12 @@ impl ConnFastAbr {
             },
             d.metered as u8,
             skipped,
+            match applied {
+                None => String::new(),
+                Some(Applied::Ratio { from, to }) => format!(" ratio={:.3}->{:.3}", from, to),
+                Some(Applied::Kept) => " ratio=kept".to_owned(),
+                Some(Applied::Refused(why)) => format!(" refused={}", why),
+            },
         );
     }
 
@@ -1384,14 +1562,17 @@ impl ConnFastAbr {
         let (r_send, r_acked) = e.last_rates();
         let target = e.target();
         log::info!(
-            "LATENCY fast conn={} mode=shadow elig={} state={} meter={} ack={} k={:.2} set_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={}",
+            "LATENCY fast conn={} mode={} live={} elig={} state={} meter={} ack={} k={:.2} set_kbps={} stream_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={} applied={} refused={} resync={} fps_cap={}/{}",
             self.id,
+            self.mode(),
+            inner.log.live_state,
             e.ineligible().unwrap_or("yes"),
             e.state().letter(),
             e.is_metered() as u8,
             e.is_ack() as u8,
             e.k(),
             ctx.configured_kbps,
+            ctx.stream_kbps,
             fmt_kbps(target),
             fmt_kbps(target.map(|t| t / e.k().max(K_MIN))),
             ctx.floor_kbps,
@@ -1419,6 +1600,11 @@ impl ConnFastAbr {
             c.stalls,
             c.react_max_ms,
             c.k_rejected,
+            c.applied,
+            c.refused,
+            c.resync,
+            fmt_fps(ctx.custom_fps),
+            fmt_fps(ctx.auto_fps),
         );
     }
 }
@@ -1442,6 +1628,22 @@ impl Drop for ConnFastAbr {
                 t.set_fast_active(false);
             }
         }
+    }
+}
+
+fn mode_name(live: bool) -> &'static str {
+    if live {
+        "live"
+    } else {
+        "shadow"
+    }
+}
+
+fn fmt_fps(v: u32) -> String {
+    if v == 0 {
+        "-".to_owned()
+    } else {
+        v.to_string()
     }
 }
 
