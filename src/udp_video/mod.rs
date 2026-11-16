@@ -2,12 +2,15 @@
 //! shadow probe (negotiation over the session stream, sockets and threads on both ends, the
 //! host's copy of every Nth frame, the viewer's pairing with the TCP copy). M20: live mode,
 //! video frames over UDP with paced bursts, a send window, key frames on loss and a fallback
-//! to TCP video in the same session. See docs/UDP-VIDEO.md.
+//! to TCP video in the same session. M21: Reed-Solomon FEC per frame. See docs/UDP-VIDEO.md.
 //!
-//! - `packet`: wire format (frame id, fragment index/count, FEC placeholders, epoch, flags).
+//! - `packet`: wire format (frame id, fragment index/count, FEC block fields and parity
+//!   datagrams, epoch, flags).
 //! - `crypto`: per-direction keys derived from the lane secret, seq nonces, replay window.
 //! - `fragment`: fragmentation to MTU-safe sizes and reassembly with timeouts, a loss gate and
-//!   loss statistics.
+//!   loss statistics; parity shards rebuild lost fragments at once (M21).
+//! - `fec`: Reed-Solomon erasure code over GF(256) (in-tree, SIMD on x86-64) and the frame's
+//!   block layout (M21).
 //! - `pacing`: token-bucket pacing, the target rate and a high-resolution waiter (live mode).
 //! - `lane`: sender and receiver ends without sockets.
 //! - `net`: LAN address gate, socket setup, lane clock.
@@ -22,6 +25,7 @@
 // probe and the live lane use the rest.
 #[allow(dead_code)]
 pub mod crypto;
+pub mod fec;
 #[allow(dead_code)]
 pub mod fragment;
 pub mod host;

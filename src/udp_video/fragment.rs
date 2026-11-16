@@ -10,8 +10,16 @@
 //! After a loss the decoder must not get a frame whose reference is missing, so with
 //! `gate_after_loss` every frame up to the next KEY or RECOVERY_POINT frame is dropped and
 //! counted; the `Lost` event is the caller's cue to request a keyframe.
+//!
+//! FEC (M21): parity shards (`push_parity`) are kept with their frame; as soon as a block has
+//! as many parity shards as it misses data shards, the missing ones are rebuilt
+//! (`fec::reconstruct`) and the frame completes at once, with no wait. A frame that completes
+//! without loss is delivered before its parity arrives; that parity is then only counted.
 
-use super::packet::{VideoHeader, FLAG_KEY, FLAG_RECOVERY_POINT};
+use super::{
+    fec,
+    packet::{VideoHeader, FLAG_KEY, FLAG_RECOVERY_POINT},
+};
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -61,7 +69,7 @@ pub fn fragment<'a>(
         flags: meta.flags,
         frag_index: i as u16,
         frag_count: count as u16,
-        fec_group: 0,
+        fec_block: 0,
         fec_parity: 0,
         frame_len: frame.len() as u32,
         send_us: meta.send_us,
@@ -156,6 +164,16 @@ pub struct LossStats {
     /// Highest seq minus lowest seq plus one over the window: datagrams that should have come.
     pub datagrams_expected: u64,
     pub datagrams_received: u64,
+    /// FEC (M21): parity shards received (also those of frames that needed none).
+    pub parity_received: u64,
+    /// FEC: frames that completed only because missing data shards were rebuilt from parity.
+    pub fec_recovered: u64,
+    /// FEC: data shards rebuilt.
+    pub fec_shards: u64,
+    /// FEC: frames declared lost although they carried FEC (at least one of their shards
+    /// arrived and said so): more shards of a block were missing than parity arrived. Part of
+    /// `frames_lost`; a frame of which nothing arrived is lost without being counted here.
+    pub fec_unrecoverable: u64,
 }
 
 impl LossStats {
@@ -168,6 +186,17 @@ impl LossStats {
             .saturating_sub(self.datagrams_received) as f64
             / self.datagrams_expected as f64
     }
+}
+
+/// FEC state of one block of a pending frame.
+#[derive(Clone, Default)]
+struct FecBlock {
+    /// Parity shards of the block (0: no shard of the block arrived yet).
+    parity_count: u8,
+    parity: Vec<Option<Vec<u8>>>,
+    parity_received: u16,
+    /// Length of the parity shards (0: none arrived yet).
+    shard_len: usize,
 }
 
 struct PendingFrame {
@@ -183,10 +212,16 @@ struct PendingFrame {
     corrupt: bool,
     first_at: Instant,
     completed_at: Option<Instant>,
+    /// FEC block count of the frame (`fec_block >> 4`; 0: no FEC).
+    fec_blocks: u8,
+    fec: Vec<FecBlock>,
+    /// Data shards rebuilt from parity.
+    recovered: u16,
 }
 
 impl PendingFrame {
     fn new(h: &VideoHeader, now: Instant) -> Self {
+        let fec_blocks = h.fec_block >> 4;
         Self {
             frame_id: h.frame_id,
             epoch: h.epoch,
@@ -200,6 +235,9 @@ impl PendingFrame {
             corrupt: false,
             first_at: now,
             completed_at: None,
+            fec_blocks,
+            fec: vec![FecBlock::default(); fec_blocks as usize],
+            recovered: 0,
         }
     }
 
@@ -208,6 +246,106 @@ impl PendingFrame {
             && self.flags == h.flags
             && self.frag_count == h.frag_count
             && self.frame_len == h.frame_len
+            && self.fec_blocks == h.fec_block >> 4
+    }
+
+    /// The FEC block a shard with this header belongs to, after checking that its FEC fields
+    /// fit the frame: the block exists, holds `data_index` (data shards), and its parity count
+    /// agrees with what earlier shards of the block said. None: inconsistent.
+    fn fec_block_of(&mut self, h: &VideoHeader, data_index: Option<u16>) -> Option<usize> {
+        let (count, b) = fec::split_block_byte(h.fec_block)?;
+        let n = self.frag_count as usize;
+        if count != self.fec_blocks as usize || count > n {
+            return None;
+        }
+        let range = fec::block_range(n, count, b);
+        if data_index.map_or(false, |i| !range.contains(&(i as usize)))
+            || h.fec_parity == 0
+            || range.len() + h.fec_parity as usize > fec::MAX_SHARDS
+        {
+            return None;
+        }
+        let blk = &mut self.fec[b];
+        if blk.parity_count == 0 {
+            blk.parity_count = h.fec_parity;
+            blk.parity = vec![None; h.fec_parity as usize];
+        } else if blk.parity_count != h.fec_parity {
+            return None;
+        }
+        Some(b)
+    }
+
+    /// Rebuilds block `b`'s missing data shards if enough parity is there. False: the shards do
+    /// not fit together (the frame is corrupt).
+    fn try_recover(&mut self, b: usize, stats: &mut LossStats) -> bool {
+        // Without parity there is nothing to do (and no need to count holes on every fragment).
+        if self.fec[b].parity_received == 0 {
+            return true;
+        }
+        let n = self.frag_count as usize;
+        let range = fec::block_range(n, self.fec_blocks as usize, b);
+        let missing = range
+            .clone()
+            .filter(|i| self.fragments[*i].is_none())
+            .count();
+        let blk = &self.fec[b];
+        if missing == 0 || (blk.parity_received as usize) < missing {
+            return true;
+        }
+        let shard_len = blk.shard_len;
+        let mut data: Vec<Option<Vec<u8>>> = range
+            .clone()
+            .map(|i| self.fragments[i].take())
+            .collect();
+        let rebuilt = fec::reconstruct(&mut data, &blk.parity, shard_len);
+        let single = range.len() == 1;
+        let mut ok = rebuilt.is_ok();
+        let rebuilt = rebuilt.unwrap_or_default();
+        for k in rebuilt.iter().copied() {
+            let i = range.start + k;
+            // Every fragment but the frame's last is `shard_len` long (a block's first shard is
+            // its longest, and only the last fragment is short); the last one is what is left of
+            // the frame, or the whole shard when it is alone in its block.
+            let len = if i + 1 == n && !single {
+                (self.frame_len as usize).checked_sub((n - 1) * shard_len)
+            } else {
+                Some(shard_len)
+            };
+            match (len, data[k].as_mut()) {
+                (Some(len), Some(d)) if len >= 1 && len <= shard_len => {
+                    d.truncate(len);
+                    self.received += 1;
+                    self.bytes += len;
+                }
+                _ => ok = false,
+            }
+        }
+        for (k, d) in data.into_iter().enumerate() {
+            self.fragments[range.start + k] = d;
+        }
+        if ok {
+            self.recovered += rebuilt.len() as u16;
+            stats.fec_shards += rebuilt.len() as u64;
+        }
+        ok
+    }
+
+    /// Marks the frame complete (or corrupt) once every data fragment is there.
+    fn check_complete(&mut self, now: Instant, stats: &mut LossStats) {
+        if self.bytes > self.frame_len as usize {
+            self.corrupt = true;
+            stats.fragments_invalid += 1;
+        } else if self.received == self.frag_count {
+            if self.bytes == self.frame_len as usize {
+                self.completed_at = Some(now);
+                if self.recovered > 0 {
+                    stats.fec_recovered += 1;
+                }
+            } else {
+                self.corrupt = true;
+                stats.fragments_invalid += 1;
+            }
+        }
     }
 }
 
@@ -303,25 +441,17 @@ impl Reassembler {
         self.stats.datagrams_expected = self.highest_seq - lo + 1;
     }
 
-    /// Adds one fragment. Complete frames and losses are queued for `poll`.
-    pub fn push(&mut self, h: &VideoHeader, payload: &[u8], now: Instant) {
+    /// The pending frame a shard with this header goes to, created if new; None if the frame
+    /// was already delivered or declared lost (`late` then counts it).
+    fn locate(&mut self, h: &VideoHeader, now: Instant, late: bool) -> Option<(usize, usize)> {
         let config = self.config;
-        if h.frag_count == 0
-            || h.frag_index >= h.frag_count
-            || h.frame_len as usize > config.max_frame_len
-        {
-            self.stats.fragments_invalid += 1;
-            return;
-        }
         if !self.displays.iter().any(|d| d.display == h.display) {
             self.start_display(h.display, config.first_frame_id.unwrap_or(h.frame_id));
         }
-        let Some(di) = self.displays.iter().position(|d| d.display == h.display) else {
-            return;
-        };
+        let di = self.displays.iter().position(|d| d.display == h.display)?;
         if id_before(h.frame_id, self.displays[di].next_id) {
-            self.stats.fragments_late += 1;
-            return;
+            self.stats.fragments_late += late as u64;
+            return None;
         }
         let ahead = h.frame_id.wrapping_sub(self.displays[di].next_id);
         if ahead >= config.max_ahead {
@@ -345,20 +475,41 @@ impl Reassembler {
                 d.pending.len() - 1
             }
         };
-        let p = &mut d.pending[idx];
-        if p.completed_at.is_some() || p.corrupt {
-            self.stats.fragments_duplicate += (p.completed_at.is_some()) as u64;
-            self.stats.fragments_invalid += (p.corrupt) as u64;
+        Some((di, idx))
+    }
+
+    /// Adds one fragment. Complete frames and losses are queued for `poll`.
+    pub fn push(&mut self, h: &VideoHeader, payload: &[u8], now: Instant) {
+        if h.frag_count == 0
+            || h.frag_index >= h.frag_count
+            || h.frame_len as usize > self.config.max_frame_len
+        {
+            self.stats.fragments_invalid += 1;
             return;
         }
-        if !p.matches(h) {
+        let Some((di, idx)) = self.locate(h, now, true) else {
+            return;
+        };
+        let stats = &mut self.stats;
+        let p = &mut self.displays[di].pending[idx];
+        if p.completed_at.is_some() || p.corrupt {
+            stats.fragments_duplicate += (p.completed_at.is_some()) as u64;
+            stats.fragments_invalid += (p.corrupt) as u64;
+            return;
+        }
+        let block = if p.fec_blocks > 0 && p.matches(h) {
+            p.fec_block_of(h, Some(h.frag_index))
+        } else {
+            None
+        };
+        if !p.matches(h) || (p.fec_blocks > 0 && block.is_none()) {
             p.corrupt = true;
-            self.stats.fragments_invalid += 1;
+            stats.fragments_invalid += 1;
             return;
         }
         let slot = &mut p.fragments[h.frag_index as usize];
         if slot.is_some() {
-            self.stats.fragments_duplicate += 1;
+            stats.fragments_duplicate += 1;
             return;
         }
         // Every fragment but the last is the same size, so a frame can only fit if its bytes
@@ -366,18 +517,68 @@ impl Reassembler {
         *slot = Some(payload.to_vec());
         p.received += 1;
         p.bytes += payload.len();
-        self.stats.fragments_received += 1;
-        if p.bytes > p.frame_len as usize {
-            p.corrupt = true;
-            self.stats.fragments_invalid += 1;
-        } else if p.received == p.frag_count {
-            if p.bytes == p.frame_len as usize {
-                p.completed_at = Some(now);
-            } else {
+        stats.fragments_received += 1;
+        if let Some(b) = block {
+            if !p.try_recover(b, stats) {
                 p.corrupt = true;
-                self.stats.fragments_invalid += 1;
+                stats.fragments_invalid += 1;
             }
         }
+        if !p.corrupt {
+            p.check_complete(now, stats);
+        }
+        self.release(now);
+    }
+
+    /// Adds one parity shard (M21). A block that can be rebuilt is rebuilt at once.
+    pub fn push_parity(&mut self, h: &VideoHeader, payload: &[u8], now: Instant) {
+        self.stats.parity_received += 1;
+        if h.frag_count == 0
+            || h.fec_block == 0
+            || payload.is_empty()
+            || h.frame_len as usize > self.config.max_frame_len
+        {
+            self.stats.fragments_invalid += 1;
+            return;
+        }
+        // Parity of a frame delivered without it is the normal case, not a late fragment.
+        let Some((di, idx)) = self.locate(h, now, false) else {
+            return;
+        };
+        let stats = &mut self.stats;
+        let p = &mut self.displays[di].pending[idx];
+        if p.completed_at.is_some() || p.corrupt {
+            return;
+        }
+        let block = if p.matches(h) {
+            p.fec_block_of(h, None)
+        } else {
+            None
+        };
+        let Some(b) = block.filter(|b| {
+            let blk = &p.fec[*b];
+            (h.frag_index as usize) < blk.parity.len()
+                && (blk.shard_len == 0 || blk.shard_len == payload.len())
+        }) else {
+            p.corrupt = true;
+            stats.fragments_invalid += 1;
+            return;
+        };
+        let blk = &mut p.fec[b];
+        let slot = &mut blk.parity[h.frag_index as usize];
+        if slot.is_some() {
+            stats.fragments_duplicate += 1;
+            return;
+        }
+        *slot = Some(payload.to_vec());
+        blk.parity_received += 1;
+        blk.shard_len = payload.len();
+        if !p.try_recover(b, stats) {
+            p.corrupt = true;
+            stats.fragments_invalid += 1;
+            return;
+        }
+        p.check_complete(now, stats);
         self.release(now);
     }
 
@@ -523,6 +724,9 @@ impl Reassembler {
             let p = d.pending.remove(0);
             if p.completed_at.is_none() && !p.corrupt {
                 self.stats.fragments_missing += (p.frag_count - p.received) as u64;
+                if p.fec_blocks > 0 {
+                    self.stats.fec_unrecoverable += 1;
+                }
             }
         }
         d.next_id = until;

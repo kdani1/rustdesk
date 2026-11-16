@@ -68,7 +68,9 @@ pub enum PacketType {
     Hello = 1,
     HelloAck = 2,
     Video = 3,
-    /// Reserved for FEC parity shards (M21); not produced or accepted yet.
+    /// A Reed-Solomon parity shard of a frame (M21): `VideoHeader` fields as for `Video`, with
+    /// `frag_index` the parity index within its block and `frag_count` the frame's data
+    /// fragments. Sent only on a lane whose offer had `fec_percent` > 0.
     Fec = 4,
     Ping = 5,
     Pong = 6,
@@ -105,9 +107,10 @@ pub struct VideoHeader {
     pub flags: u8,
     pub frag_index: u16,
     pub frag_count: u16,
-    /// FEC placeholder (M21): block index within the frame. 0 while there is no FEC.
-    pub fec_group: u8,
-    /// FEC placeholder (M21): parity shards in this block. 0 = no FEC.
+    /// FEC (M21): `(block count << 4) | block index` of the Reed-Solomon block this shard
+    /// belongs to (`fec::block_byte`); 0 = the frame has no FEC.
+    pub fec_block: u8,
+    /// FEC (M21): parity shards of this block; 0 without FEC.
     pub fec_parity: u8,
     /// Bytes of the whole frame (the serialized protobuf Message).
     pub frame_len: u32,
@@ -142,6 +145,8 @@ pub enum Inner<'a> {
     Hello { lane_id: u64 },
     HelloAck { lane_id: u64 },
     Video(VideoHeader, &'a [u8]),
+    /// A parity shard (M21); the header as for `Video`, see `PacketType::Fec`.
+    Fec(VideoHeader, &'a [u8]),
     Ping { id: u32, send_us: u32 },
     Pong { id: u32, echo_us: u32 },
     Ack(Ack),
@@ -153,9 +158,8 @@ pub enum PacketError {
     BadMagic,
     BadVersion(u8),
     UnknownType(u8),
-    /// A type that exists but is not accepted in this version (FEC).
-    Unsupported(PacketType),
-    /// Fields that cannot be valid: frag_index >= frag_count, frag_count 0, trailing bytes.
+    /// Fields that cannot be valid: frag_index >= frag_count, frag_count 0, trailing bytes, a
+    /// parity shard without FEC fields or with frag_index >= fec_parity.
     BadHeader,
 }
 
@@ -201,15 +205,19 @@ pub fn encode_inner(inner: &Inner, out: &mut Vec<u8>) {
             out.push(PacketType::HelloAck as u8);
             out.extend_from_slice(&lane_id.to_le_bytes());
         }
-        Inner::Video(h, payload) => {
-            out.push(PacketType::Video as u8);
+        Inner::Video(h, payload) | Inner::Fec(h, payload) => {
+            out.push(if matches!(inner, Inner::Fec(..)) {
+                PacketType::Fec as u8
+            } else {
+                PacketType::Video as u8
+            });
             out.extend_from_slice(&h.frame_id.to_le_bytes());
             out.push(h.display);
             out.push(h.epoch);
             out.push(h.flags);
             out.extend_from_slice(&h.frag_index.to_le_bytes());
             out.extend_from_slice(&h.frag_count.to_le_bytes());
-            out.push(h.fec_group);
+            out.push(h.fec_block);
             out.push(h.fec_parity);
             out.extend_from_slice(&h.frame_len.to_le_bytes());
             out.extend_from_slice(&h.send_us.to_le_bytes());
@@ -288,7 +296,7 @@ pub fn decode_inner(bytes: &[u8]) -> Result<Inner<'_>, PacketError> {
                 Inner::HelloAck { lane_id }
             }
         }
-        PacketType::Video => {
+        PacketType::Video | PacketType::Fec => {
             let h = VideoHeader {
                 frame_id: r.u32()?,
                 display: r.u8()?,
@@ -296,15 +304,22 @@ pub fn decode_inner(bytes: &[u8]) -> Result<Inner<'_>, PacketError> {
                 flags: r.u8()?,
                 frag_index: r.u16()?,
                 frag_count: r.u16()?,
-                fec_group: r.u8()?,
+                fec_block: r.u8()?,
                 fec_parity: r.u8()?,
                 frame_len: r.u32()?,
                 send_us: r.u32()?,
             };
-            if h.frag_count == 0 || h.frag_index >= h.frag_count {
-                return Err(PacketError::BadHeader);
+            if t == PacketType::Fec {
+                if h.frag_count == 0 || h.fec_block == 0 || h.frag_index >= h.fec_parity as u16 {
+                    return Err(PacketError::BadHeader);
+                }
+                Inner::Fec(h, r.0)
+            } else {
+                if h.frag_count == 0 || h.frag_index >= h.frag_count {
+                    return Err(PacketError::BadHeader);
+                }
+                Inner::Video(h, r.0)
             }
-            Inner::Video(h, r.0)
         }
         PacketType::Ping | PacketType::Pong => {
             let id = r.u32()?;
@@ -334,7 +349,6 @@ pub fn decode_inner(bytes: &[u8]) -> Result<Inner<'_>, PacketError> {
             r.end()?;
             Inner::Ack(a)
         }
-        PacketType::Fec => return Err(PacketError::Unsupported(PacketType::Fec)),
     };
     Ok(inner)
 }
@@ -352,8 +366,8 @@ mod latency_tests {
             flags: FLAG_KEY | FLAG_SHADOW,
             frag_index: 3,
             frag_count: 9,
-            fec_group: 0,
-            fec_parity: 0,
+            fec_block: 0x21,
+            fec_parity: 4,
             frame_len: 123_456,
             send_us: 42,
         };
@@ -362,6 +376,11 @@ mod latency_tests {
         encode_inner(&Inner::Video(h, &payload), &mut out);
         assert_eq!(out.len(), VIDEO_HEADER_LEN + payload.len());
         assert_eq!(decode_inner(&out).unwrap(), Inner::Video(h, &payload[..]));
+        // The same header as a parity shard (index 3 of 4 in block 1 of 2).
+        let mut out = Vec::new();
+        encode_inner(&Inner::Fec(h, &payload), &mut out);
+        assert_eq!(out[0], PacketType::Fec as u8);
+        assert_eq!(decode_inner(&out).unwrap(), Inner::Fec(h, &payload[..]));
     }
 
     #[test]
@@ -392,8 +411,21 @@ mod latency_tests {
         assert_eq!(decode_inner(&[99]), Err(PacketError::UnknownType(99)));
         assert_eq!(
             decode_inner(&[PacketType::Fec as u8]),
-            Err(PacketError::Unsupported(PacketType::Fec))
+            Err(PacketError::TooShort)
         );
+        // Parity without FEC fields, or with an index beyond the block's parity count.
+        for (fec_block, fec_parity, frag_index) in [(0u8, 2u8, 0u16), (0x10, 2, 2), (0x10, 0, 0)] {
+            let h = VideoHeader {
+                frag_count: 3,
+                fec_block,
+                fec_parity,
+                frag_index,
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            encode_inner(&Inner::Fec(h, &[1, 2]), &mut out);
+            assert_eq!(decode_inner(&out), Err(PacketError::BadHeader));
+        }
         // Trailing byte after a Hello.
         let mut out = Vec::new();
         encode_inner(&Inner::Hello { lane_id: 1 }, &mut out);

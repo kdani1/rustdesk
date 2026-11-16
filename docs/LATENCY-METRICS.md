@@ -450,6 +450,45 @@ for 1 s but only of an ended epoch (none shown), the host is silent for `timeout
 receive errors come in a row (the watchdog runs on the 1 s status tick, so it acts after 1-2 s). With a live lane the viewer's `LATENCY client` fields keep their meaning:
 UDP frames enter the same handling as TCP frames; the session `kB/s` counts both.
 
+### UDP video lane (FEC, M21)
+
+Host server option `udp-video-fec-percent` (default 20, `0` = no parity) and a viewer that
+advertises lane version 4: every frame carries Reed-Solomon parity (at least 2 per block of at
+most 200 data shards, at most 4 blocks per frame), live and shadow lanes alike
+(docs/UDP-VIDEO.md, "FEC (M21)"). The fields below are added to the lines of the two sections
+above.
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=192.168.1.5:61234 every=2 burst=8 timeout_ms=1000 fec=20 viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 lane=3f2a… mode=live win_s=5.0 frames=300 keys=1 skipped=0 qdrop=0 dgrams=5320 kB=7050 send_ms=1.0/3.4/8.6 lag_ms=0.1/0.2/0.6 err=0 pings=25 refused=0 fec_frames=300 fec_dgrams=910 fec_off=0 fec_ms=0.01/0.03/0.40 paced_ms=… vlost=0 kf_req=0 tail_kf=0
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=live host=192.168.1.5:61234 local=192.168.1.9:50511 every=2 timeout_ms=1000 fec=20
+UDPVIDEO viewer peer=123456789 lane=3f2a… mode=live win_s=5.0 frames=300 lost=0 gated=0 frag_miss=0 dgrams=5402/5445 loss_pct=0.79 … rx_err=0 fec_rec=21 fec_unrec=0 fec_shards=37 parity=880
+```
+
+Host: `fec` in the `offer` line is the parity percentage offered (0: none, also for a viewer
+below lane v4). The window line gets, while the lane sends parity:
+
+| Field | Meaning |
+|---|---|
+| `fec_frames` | frames sent with parity |
+| `fec_dgrams` | parity datagrams among `dgrams` (`kB` includes them) |
+| `fec_off` | frames sent without parity because they are larger than 4 blocks of 254 fragments (about 1.37 MB) |
+| `fec_ms` | p50/p95/max of the parity encoding time per protected frame (part of `send_ms`) |
+
+Viewer: `fec` in the `accepted` line is the host's percentage. Both window lines (shadow and
+live) end with:
+
+| Field | Meaning |
+|---|---|
+| `fec_rec` | frames that completed only because lost data fragments were rebuilt from parity: losses repaired on arrival, with no key frame, request or wait |
+| `fec_unrec` | frames declared lost although at least one of their shards arrived and carried FEC: a block missed more shards than parity arrived. Part of `lost`; a frame of which nothing arrived counts in `lost` only |
+| `fec_shards` | data fragments rebuilt |
+| `parity` | parity datagrams received, also those of frames that needed none (they arrive after the frame was delivered and are only counted) |
+
+`dgrams` and `loss_pct` count parity datagrams like any other, so they are the raw datagram
+loss; `lost`, `frag_miss` and `kf_req` are what was left after FEC. Roadmap gate: with the same
+loss pattern as an M20 run, fewer `lost` and more `fec_rec`.
+
 ### Viewer (Rust)
 
 ```

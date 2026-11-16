@@ -1,11 +1,13 @@
 # UDP video lane
 
-Status: **M20 done: live mode.** A fork viewer and a fork host on the same LAN negotiate a
+Status: **M21 done: live mode with FEC.** A fork viewer and a fork host on the same LAN negotiate a
 UDP lane after login. In **shadow mode** (M19, host option `enable-udp-video=shadow`) the host
 sends a copy of every Nth video frame over it and the viewer only measures it. In **live mode**
 (M20, `enable-udp-video=live`) the video frames go over UDP only and the viewer decodes them;
 control, input, audio, cursor and clipboard stay on the session stream (TCP), and any trouble
-puts the video back on TCP in the same session. Off by default on the host. Roadmap:
+puts the video back on TCP in the same session. Since M21 every frame carries Reed-Solomon
+parity (20% by default, `udp-video-fec-percent`) when the viewer speaks lane v4, so scattered
+losses are repaired on arrival instead of costing a key frame. Off by default on the host. Roadmap:
 `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), M24 (internet).
 
 ## What exists
@@ -14,7 +16,8 @@ puts the video back on TCP in the same session. Off by default on the host. Road
 |---|---|
 | `src/udp_video/packet.rs` | Wire format, version 1, and the per-path datagram budgets |
 | `src/udp_video/crypto.rs` | Key derivation, datagram sealing/opening, 1024-seq replay window |
-| `src/udp_video/fragment.rs` | Fragmentation, reassembly with timeouts, loss gate, loss statistics |
+| `src/udp_video/fragment.rs` | Fragmentation, reassembly with timeouts, loss gate, loss statistics; parity shards rebuild lost fragments (M21) |
+| `src/udp_video/fec.rs` | Reed-Solomon erasure code over GF(256) (in-tree, AVX2/SSSE3 on x86-64), the frame's FEC block layout, `protect` (M21) |
 | `src/udp_video/pacing.rs` | Token-bucket pacer, target rate, `wait_until`, `Waiter` (high-resolution waitable timer) |
 | `src/udp_video/lane.rs` | `LaneSender` / `LaneReceiver`: the two ends without sockets |
 | `src/udp_video/net.rs` | LAN address gate, socket setup (`SIO_UDP_CONNRESET` off, buffers), lane clock |
@@ -43,7 +46,13 @@ with the last ids), queue drops reported fetched, the send window held and relea
 and by its time limit, the QoS excess and baseline, paced bursts, the reassembler's start at
 frame 0 and `settled`, the viewer's hold / epoch / gate / STOP decisions and watchdog, and a
 loopback live lane end to end (frames in order with ids from 0, ACKs, every frame fetched,
-the STOP marker after shutdown).
+the STOP marker after shutdown). FEC (M21) adds: GF(256) arithmetic, the SIMD and scalar
+multiply paths agreeing for every coefficient, every erasure pattern of a small block, random
+erasures of full 200+40 and 253+2 blocks, the block layout and parity counts for every frame
+size up to the 4-block limit, parity headers, a frame rebuilt at once (short last fragment,
+one-fragment frame, parity of a frame already delivered counted neither late nor duplicate), too
+many losses counted unrecoverable, a two-block frame reordered, FEC off sending the plain
+frame, and paced live sending with parity and three lost datagrams.
 
 ### Wire format
 
@@ -54,12 +63,14 @@ inner (encrypted)     type u8 | fields (little-endian)
 
 VIDEO inner (22 B + payload)
   type=3 | frame_id u32 | display u8 | epoch u8 | flags u8 | frag_index u16 | frag_count u16
-  | fec_group u8 | fec_parity u8 | frame_len u32 | send_us u32 | payload
+  | fec_block u8 | fec_parity u8 | frame_len u32 | send_us u32 | payload
+FEC inner (22 B + parity shard, M21)
+  type=4 | the VIDEO fields, with frag_index = parity index in its block (< fec_parity) and
+  frag_count = the frame's data fragments
 HELLO / HELLO_ACK     type=1/2 | lane_id u64
 PING / PONG           type=5/6 | id u32 | send_us/echo_us u32
 ACK (viewer -> host)  type=7 | display u8 | has_settled u8 | settled u32 | echo_send_us u32
                       | hold_us u32 | lost_total u32
-FEC                   type=4, reserved for M21 (rejected today)
 ```
 
 ACK (live mode, M20): `settled` is the last frame id of the display the reassembler released
@@ -80,8 +91,11 @@ A shadow-mode (M19) receiver drops type 7 as an unknown type, and an M19 host ne
   so counting all SwitchDisplays would leave the viewer an epoch ahead and every frame `stale`
   (the M20 review's finding). A video-service restart without a SwitchDisplay does not bump it
   and needs not: its first frame is a key frame.
-- `fec_group` / `fec_parity`: always 0 now. With FEC the last data shard of a block must be
-  padded to the shard length; today the last fragment is simply shorter.
+- `fec_block` / `fec_parity` (M21): `(block count << 4) | block index` of the Reed-Solomon
+  block the datagram belongs to and that block's parity shard count; both 0 for a frame without
+  FEC (any frame to a viewer below lane v4, `udp-video-fec-percent=0`, or one too large). Data
+  fragments keep their frame-wide `frag_index`; the last one stays short on the wire and counts
+  as zero-padded in the code. See "FEC (M21)".
 - The payload of a frame is the serialized `Message{VideoFrame}`, unchanged, so the viewer's
   existing frame handling and `net+server` measurement keep working on reassembled frames.
 
@@ -155,6 +169,7 @@ live sender uses a high-resolution waitable timer on Windows.
 | `udp-video-shadow-every` | host, server option | `2` | Shadow: one frame in N per display is copied to UDP (1..=60). Read at each offer. |
 | `udp-video-burst` | host, server option | `8` | Live: datagrams per paced burst (1..=64; `0` = unpaced, a frame at once). Read at each offer. |
 | `udp-video-timeout-ms` | host, server option | `1000` | Live: no datagram from the other end this long ends the lane (200..=10000). Sent in the offer; the viewer uses the same value. Read at each offer. |
+| `udp-video-fec-percent` | host, server option | `20` | FEC parity per block in percent of its data shards (0..=100; `0` = no parity; empty or invalid: 20), at least 2 per block. Live and shadow lanes, viewers of lane v4 only. Read at each offer (M21). |
 
 `rustdesk.exe --option enable-udp-video shadow` (or `Y`) on the host (elevated, installed)
 turns the probe on, `live` live mode, `N` off; it applies from the next login. **Note:** `Y`
@@ -166,14 +181,15 @@ frame.
 ### Negotiation (fork-only tags)
 
 Tag plan of the fork: Misc 1001 `pointer_captured`; the lane uses LoginRequest 1001 and Misc
-1002 (`UdpVideoOffer`), 1003 (`UdpVideoControl`) and 1004 (`UdpVideoFeedback`, M20); the next
-free Misc tag is 1005.
+1002 (`UdpVideoOffer`, field 10 `fec_percent` since M21), 1003 (`UdpVideoControl`) and 1004
+(`UdpVideoFeedback`, M20); the next free Misc tag is 1005.
 
 1. **Viewer -> host:** `LoginRequest.udp_video_version` (1001), set by a Windows viewer for
    remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 by the
-   first M20 build (live without EPOCH markers), 3 since the M20 review (live with them). Stock
-   hosts ignore the field. A host with `live` offers live mode to v3 only; an older viewer gets
-   a `not offered` line instead. Shadow offers have version 1, live offers version 2 (EPOCH
+   first M20 build (live without EPOCH markers), 3 since the M20 review (live with them), 4
+   since M21 (also takes FEC parity datagrams). Stock hosts ignore the field. A host with
+   `live` offers live mode to v3 and later only; an older viewer gets a `not offered` line
+   instead. Only a v4 viewer gets `fec_percent` > 0. Shadow offers have version 1, live offers version 2 (EPOCH
    markers); the viewer refuses a live offer of version 1 (the first M20 host). The datagram
    wire version stays 1.
 2. **Host gate**, checked once a remote-control session is authorized (right after the split,
@@ -397,7 +413,8 @@ mode. Kill switches: host `enable-udp-video` empty, `shadow` or `Y` (next login)
 
 ### Left out of M20
 
-- **FEC** (M21), **RFI** (M22), **per-frame QoS feedback** beyond the ACK (M23), **WAN** (M24).
+- **FEC** (done in M21, below), **RFI** (M22), **per-frame QoS feedback** beyond the ACK (M23),
+  **WAN** (M24).
 - **IDR spread over two frame periods per display**: the pacer sends every frame, an IDR
   included, within half a frame period; the bursts already keep it off the wire as one block.
 - **Viewer queue-overflow and decode-error refreshes as forced key frames**: they still send
@@ -408,3 +425,78 @@ mode. Kill switches: host `enable-udp-video` empty, `shadow` or `Y` (next login)
 - **A lost STOP marker cannot happen** (TCP), but a host that ends a live lane on a static
   screen with M13 off sends the marker only with the next captured frame; the viewer's lane
   stays quiet until then.
+
+## FEC (M21)
+
+Frame-level Reed-Solomon forward error correction, Sunshine style: a lost datagram is rebuilt
+from parity the moment enough shards of its block are there, so a scattered loss costs no
+key frame, no request and no wait.
+
+### Code (`src/udp_video/fec.rs`, in-tree)
+
+- Systematic erasure code over GF(2^8), polynomial 0x11D, generator 2. Data shards go out
+  unchanged; parity shard `r` of a block is `sum_j C[r][j] * data[j]` with the Cauchy matrix
+  `C[r][j] = 1 / ((255 - r) xor j)`. Every square submatrix of a Cauchy matrix is invertible, so
+  any `d` of a block's `d + p` shards rebuild it (MDS) while `d + p <= 256`; blocks stay at 255
+  or fewer.
+- Decoding: the syndromes of `m` received parity rows (parity minus the present data's share)
+  times the inverse of their `m x m` Cauchy submatrix (Gauss-Jordan) give the `m` missing
+  data shards.
+- `mul_add` (`dst ^= c * src`) uses AVX2 (32 B) or SSSE3 (16 B) nibble-table shuffles on x86-64,
+  detected at run time, and a 256-byte row table elsewhere; the tests check them against
+  each other for every coefficient.
+- No crate: the roadmap named `reed-solomon-simd`, but new crates are out for this build
+  (Cargo.lock is local-only). The in-tree code needs nothing but `std::arch`.
+
+### Frame layout
+
+- A frame's `n` data fragments (the M20 fragments, 1352 B on the LAN, the last one short) are
+  split into `blocks = min(4, ceil(n / max_data))` blocks of as equal size as possible (the
+  first `n % blocks` one larger). `max_data` is 200 data shards (roadmap), smaller only above
+  27% (`d + parity <= 255`; 127 at 100%).
+- Each block gets `max(2, ceil(d * percent / 100))` parity shards (Sunshine: 20%, at least 2),
+  capped at `255 - d`. At 20% a frame above 4 x 212 fragments (about 1.15 MB) therefore gets
+  less parity than the percentage (at 1000 fragments: 5 per block of 250); above 4 x 254
+  fragments (about 1.37 MB) it goes without FEC (`fec_off` on the host).
+- Shard length of a block = its first data shard (only the frame's last fragment is short, and
+  it is never a block's first unless it is alone in it); the short last fragment is
+  zero-padded in the code, not on the wire, so a frame without loss costs only the parity.
+- Send order: block 0's data, block 0's parity, block 1's data, ... The pacer spreads the whole
+  frame, parity included, within half a frame interval (the frame bytes it sizes the rate on
+  include the parity).
+- Overhead: 20% parity plus one datagram header per parity shard; a 1-fragment frame (cursor
+  blink, small update) gets 2 parity datagrams (Sunshine does the same). Host CPU: one shard
+  pass (1352 B) per parity shard per data shard of its block: about 155 KB of multiply-add for
+  a 30 KB P-frame and 7 MB for a 300 KB IDR, estimated at tens of microseconds and under 1 ms
+  with AVX2; `fec_ms` in the host's window line measures it.
+
+### Receiver
+
+- The reassembler keeps parity shards with their pending frame, per block. When a block holds
+  at least as many parity shards as it misses data shards it rebuilds them at once and the frame
+  completes (`fec_rec`); its rebuilt last fragment is trimmed back to the frame length. A
+  frame complete without loss is delivered before its parity arrives; that parity is counted
+  (`parity`) and dropped, neither late nor duplicate.
+- Release rule, gate after loss, timeouts and ACKs are unchanged: a frame FEC cannot save is
+  lost exactly as in M20 (key frame request, gate), and counted `fec_unrec` as well when any of
+  its shards arrived (a frame of which nothing arrived is only `lost`).
+- Shards that do not fit their frame (FEC fields differing between shards, a data fragment
+  outside its block, parity of another length) make the frame corrupt, as inconsistent
+  fragments always did; with authenticated datagrams this only happens on a sender bug.
+
+### Negotiation and compatibility
+
+- Viewer lane version 4 (`LoginRequest.udp_video_version`); offer field `fec_percent` (10).
+  The host sets it from `udp-video-fec-percent` (default 20) for a v4 viewer, 0 for v1-v3.
+- An M19/M20 viewer never gets parity (it would drop type 4 as an unknown type). An M20 host
+  sends none to this viewer (no `fec_percent`), and this viewer takes such a lane as before.
+- Stock peers never advertise or offer a lane, so nothing changes for them.
+- The datagram wire version stays 1; offer versions stay 1 (shadow) and 2 (live).
+
+### Left out of M21
+
+- **Adaptive FEC** (`clamp(10, 50, 2 x loss% + 5)` from feedback): needs the per-frame loss
+  feedback of M23; the percentage is fixed per lane.
+- **Recovered-frame count on the host**: the ACK layout is fixed (an M20 host rejects a longer
+  ACK), so `fec_rec` is in the viewer's window line only; the host sees fewer `vlost`.
+- **More than 4 blocks per frame**: very large frames get less parity instead (see layout).

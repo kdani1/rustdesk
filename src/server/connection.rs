@@ -6003,12 +6003,17 @@ impl Connection {
                 return;
             }
         };
-        let params = udp::Params::from_options(
+        let mut params = udp::Params::from_options(
             mode,
             &Config::get_option(keys::OPTION_UDP_VIDEO_SHADOW_EVERY),
             &Config::get_option(keys::OPTION_UDP_VIDEO_BURST),
             &Config::get_option(keys::OPTION_UDP_VIDEO_TIMEOUT_MS),
+            &Config::get_option(keys::OPTION_UDP_VIDEO_FEC_PERCENT),
         );
+        if version < udp::VIEWER_FEC_VERSION {
+            // An M19/M20 viewer drops parity datagrams as an unknown type: send none.
+            params.fec_percent = 0;
+        }
         let hooks = (mode == Mode::Live).then(|| {
             // A tail loss key frame, as `refresh_video_display`, from the lane's sender thread.
             let server = self.server.clone();

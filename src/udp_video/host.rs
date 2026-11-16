@@ -35,6 +35,7 @@
 
 use super::{
     crypto::{Role, SECRET_LEN},
+    fec::{self, Shard},
     fragment::{fragment, FrameMeta},
     lane::{LaneReceiver, LaneSender, Received},
     net::{self, LaneClock},
@@ -68,6 +69,9 @@ pub const LIVE_LANE_VERSION: u32 = 2;
 /// (1: shadow only; 2: the first M20 build, which bumps its epoch on every SwitchDisplay and is
 /// offered no live lane).
 pub const VIEWER_LIVE_VERSION: u32 = 3;
+/// `LoginRequest.udp_video_version` of a viewer that takes FEC parity shards (M21): it is
+/// offered `fec_percent` (`udp-video-fec-percent`); older viewers get lanes without parity.
+pub const VIEWER_FEC_VERSION: u32 = 4;
 /// From the offer to the viewer's READY.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default of `udp-video-shadow-every`: half the frames, so the extra Wi-Fi load stays at half
@@ -179,11 +183,20 @@ pub struct Params {
     /// Datagrams per burst, 0 = unpaced.
     pub burst: usize,
     pub timeout: Duration,
+    /// FEC parity in percent of each block's data shards (M21); 0 = no FEC. The caller sets it
+    /// to 0 for a viewer older than [`VIEWER_FEC_VERSION`].
+    pub fec_percent: u32,
 }
 
 impl Params {
     /// From the option strings, each falling back to its default when empty or invalid.
-    pub fn from_options(mode: Mode, every: &str, burst: &str, timeout_ms: &str) -> Self {
+    pub fn from_options(
+        mode: Mode,
+        every: &str,
+        burst: &str,
+        timeout_ms: &str,
+        fec_percent: &str,
+    ) -> Self {
         Self {
             mode,
             every: every
@@ -202,6 +215,11 @@ impl Params {
                 .filter(|n| (TIMEOUT_RANGE_MS.0..=TIMEOUT_RANGE_MS.1).contains(n))
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_TIMEOUT),
+            fec_percent: fec_percent
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n <= fec::MAX_PERCENT)
+                .unwrap_or(fec::DEFAULT_PERCENT),
         }
     }
 }
@@ -864,15 +882,17 @@ impl UdpVideoHost {
             max_datagram: PATH.max_datagram() as u32,
             shadow_every: params.every,
             timeout_ms: params.timeout.as_millis() as u32,
+            fec_percent: params.fec_percent,
             ..Default::default()
         };
         log::info!(
-            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} viewer={viewer} installed={}",
+            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} fec={} viewer={viewer} installed={}",
             params.mode.label(),
             SocketAddr::new(local, port),
             params.every,
             params.burst,
             params.timeout.as_millis(),
+            params.fec_percent,
             installed()
         );
         Ok((
@@ -1231,6 +1251,34 @@ struct Window {
     lag: Samples,
     /// Live: time spent waiting for the pacer per frame.
     paced: Samples,
+    /// FEC (M21): frames sent with parity, parity datagrams among `dgrams`, frames too large
+    /// for 4 blocks sent without, and the encode time per protected frame.
+    fec_frames: u64,
+    fec_dgrams: u64,
+    fec_off: u64,
+    fec_enc: Samples,
+}
+
+impl Window {
+    /// Adds parity to a frame's fragments at `percent` and counts it.
+    fn protect<'a>(
+        &mut self,
+        parts: Vec<(super::packet::VideoHeader, &'a [u8])>,
+        percent: u32,
+    ) -> Vec<Shard<'a>> {
+        if percent == 0 {
+            return parts.into_iter().map(|(h, p)| Shard::Data(h, p)).collect();
+        }
+        let begin = Instant::now();
+        let (shards, blocks) = fec::protect(parts, percent);
+        if blocks > 0 {
+            self.fec_frames += 1;
+            self.fec_enc.push_duration(begin.elapsed());
+        } else {
+            self.fec_off += 1;
+        }
+        shards
+    }
 }
 
 /// Live pacing state of the sender thread.
@@ -1333,8 +1381,16 @@ fn send_loop(
                             d.last_sent = Some(frame_id);
                         }
                     }
-                    let sent =
-                        send_live(sender, p, &mut w, &job, frame_id, clock, |d| socket.send(d));
+                    let sent = send_live(
+                        sender,
+                        p,
+                        &mut w,
+                        &job,
+                        frame_id,
+                        clock,
+                        params.fec_percent,
+                        |d| socket.send(d),
+                    );
                     if let (true, Some(hooks)) = (sent.is_some(), &hooks) {
                         (hooks.sent)(&job.msg, sent.unwrap_or_default());
                     }
@@ -1351,7 +1407,15 @@ fn send_loop(
                     }
                     on_live_sent(shared, job.display, frame_id, fetched);
                 }
-                _ => send_job(sender, &mut ids, &mut w, job, clock, |d| socket.send(d)),
+                _ => send_job(
+                    sender,
+                    &mut ids,
+                    &mut w,
+                    job,
+                    clock,
+                    params.fec_percent,
+                    |d| socket.send(d),
+                ),
             },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1465,8 +1529,10 @@ fn expire_window(shared: &Shared) {
     }
 }
 
-/// Seals and sends one live frame in paced bursts. Returns the send time (first datagram to
-/// last, pacing included) if the frame got to the socket.
+/// Seals and sends one live frame in paced bursts, with parity at `fec_percent` (0: none).
+/// Returns the send time (first datagram to last, pacing included) if the frame got to the
+/// socket.
+#[allow(clippy::too_many_arguments)]
 fn send_live(
     sender: &Mutex<LaneSender>,
     p: &mut Pacing,
@@ -1474,6 +1540,7 @@ fn send_live(
     job: &Job,
     frame_id: u32,
     clock: LaneClock,
+    fec_percent: u32,
     mut send: impl FnMut(&[u8]) -> io::Result<usize>,
 ) -> Option<Duration> {
     let begin = Instant::now();
@@ -1488,7 +1555,6 @@ fn send_live(
             return None;
         }
     };
-    p.on_frame(bytes.len(), job.queued, begin);
     let meta = FrameMeta {
         frame_id,
         display: job.display,
@@ -1505,14 +1571,18 @@ fn send_live(
             return None;
         }
     };
-    let burst = if p.burst == 0 { parts.len() } else { p.burst };
+    let shards = w.protect(parts, fec_percent);
+    // The pacer spreads the whole frame, parity included, within half a frame interval.
+    let wire: usize = shards.iter().map(|s| s.payload_len()).sum();
+    p.on_frame(wire, job.queued, begin);
+    let burst = if p.burst == 0 { shards.len() } else { p.burst };
     let mut paced = Duration::ZERO;
     let mut any_sent = false;
-    for chunk in parts.chunks(burst.max(1)) {
+    for chunk in shards.chunks(burst.max(1)) {
         if p.burst > 0 {
             let chunk_bytes = chunk
                 .iter()
-                .map(|(_, payload)| payload.len() + super::packet::VIDEO_OVERHEAD)
+                .map(|s| s.payload_len() + super::packet::VIDEO_OVERHEAD)
                 .sum();
             let now = Instant::now();
             let delay = p.pacer.schedule(chunk_bytes, now);
@@ -1521,10 +1591,11 @@ fn send_live(
                 paced += delay;
             }
         }
-        for (h, payload) in chunk {
-            match seal_send(sender, &Inner::Video(*h, payload), &mut send) {
+        for shard in chunk {
+            match seal_send(sender, &shard.inner(), &mut send) {
                 Ok(n) => {
                     w.dgrams += 1;
+                    w.fec_dgrams += shard.is_parity() as u64;
                     w.bytes += n as u64;
                     p.errors_in_row = 0;
                     any_sent = true;
@@ -1547,12 +1618,14 @@ fn send_live(
     any_sent.then_some(took)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_job(
     sender: &Mutex<LaneSender>,
     ids: &mut Vec<(u8, u32)>,
     w: &mut Window,
     job: Job,
     clock: LaneClock,
+    fec_percent: u32,
     mut send: impl FnMut(&[u8]) -> io::Result<usize>,
 ) {
     let begin = Instant::now();
@@ -1596,10 +1669,11 @@ fn send_job(
             return;
         }
     };
-    for (h, payload) in parts {
-        match seal_send(sender, &Inner::Video(h, payload), &mut send) {
+    for shard in w.protect(parts, fec_percent) {
+        match seal_send(sender, &shard.inner(), &mut send) {
             Ok(n) => {
                 w.dgrams += 1;
+                w.fec_dgrams += shard.is_parity() as u64;
                 w.bytes += n as u64;
             }
             Err(e) => {
@@ -1654,8 +1728,19 @@ fn log_window(
     } else {
         String::new()
     };
+    let fec = if w.fec_frames + w.fec_off > 0 {
+        format!(
+            " fec_frames={} fec_dgrams={} fec_off={} fec_ms={}",
+            w.fec_frames,
+            w.fec_dgrams,
+            w.fec_off,
+            w.fec_enc.ms3()
+        )
+    } else {
+        String::new()
+    };
     log::info!(
-        "UDPVIDEO host conn={} lane={:016x} mode={} win_s={:.1} frames={} keys={} skipped={} qdrop={} dgrams={} kB={} send_ms={} lag_ms={} err={} pings={} refused={}{}{}",
+        "UDPVIDEO host conn={} lane={:016x} mode={} win_s={:.1} frames={} keys={} skipped={} qdrop={} dgrams={} kB={} send_ms={} lag_ms={} err={} pings={} refused={}{}{}{}",
         conn_id,
         lane_id,
         mode.label(),
@@ -1671,6 +1756,7 @@ fn log_window(
         w.errors,
         take(&shared.pings),
         take(&shared.refused),
+        fec,
         live,
         w.first_error
             .as_ref()
@@ -1779,20 +1865,24 @@ pub(crate) mod latency_tests {
         assert_eq!(mode_from_option("Y"), Some(Mode::Shadow));
         assert_eq!(mode_from_option(""), None);
         assert_eq!(mode_from_option("N"), None);
-        let p = Params::from_options(Mode::Live, "", "", "");
+        let p = Params::from_options(Mode::Live, "", "", "", "");
         assert_eq!(
-            (p.every, p.burst, p.timeout),
-            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT)
+            (p.every, p.burst, p.timeout, p.fec_percent),
+            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT, 20)
         );
-        let p = Params::from_options(Mode::Live, "5", "0", "300");
+        let p = Params::from_options(Mode::Live, "5", "0", "300", "0");
         assert_eq!(
-            (p.every, p.burst, p.timeout),
-            (5, 0, Duration::from_millis(300))
+            (p.every, p.burst, p.timeout, p.fec_percent),
+            (5, 0, Duration::from_millis(300), 0)
         );
-        let p = Params::from_options(Mode::Live, "61", "65", "100");
+        let p = Params::from_options(Mode::Live, "61", "65", "100", "101");
         assert_eq!(
-            (p.every, p.burst, p.timeout),
-            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT)
+            (p.every, p.burst, p.timeout, p.fec_percent),
+            (DEFAULT_SHADOW_EVERY, DEFAULT_BURST, DEFAULT_TIMEOUT, 20)
+        );
+        assert_eq!(
+            Params::from_options(Mode::Live, "", "", "", "35").fec_percent,
+            35
         );
     }
 
@@ -2057,7 +2147,7 @@ pub(crate) mod latency_tests {
         };
         let (mut ids, mut w) = (Vec::new(), Window::default());
         let mut n = 0usize;
-        send_job(&sender, &mut ids, &mut w, job, LaneClock::new(), |d| {
+        send_job(&sender, &mut ids, &mut w, job, LaneClock::new(), 0, |d| {
             wire.lock().unwrap().push(d.to_vec());
             n += 1;
             if n == 10 {
@@ -2095,8 +2185,9 @@ pub(crate) mod latency_tests {
         assert_eq!(loss.datagrams_received, wire.len() as u64);
     }
 
-    /// Live sending in paced bursts: every datagram of a frame goes out in order, the bursts
-    /// are spaced by the pacer, and the frame is whole on the other end.
+    /// Live sending in paced bursts with 20% FEC: every datagram of a frame goes out in order,
+    /// parity after the data, the bursts are spaced by the pacer, and the frame is whole on
+    /// the other end although three data datagrams are lost.
     #[test]
     fn latency_live_paced_bursts() {
         use crate::udp_video::{fragment::Event, lane::LaneReceiver};
@@ -2116,13 +2207,15 @@ pub(crate) mod latency_tests {
         let mut p = Pacing::new(4);
         let mut w = Window::default();
         let mut wire: Vec<(Instant, Vec<u8>)> = Vec::new();
-        let took = send_live(&sender, &mut p, &mut w, &job, 0, LaneClock::new(), |d| {
+        let took = send_live(&sender, &mut p, &mut w, &job, 0, LaneClock::new(), 20, |d| {
             wire.push((Instant::now(), d.to_vec()));
             Ok(d.len())
         });
         assert!(took.is_some());
         let n = bytes.len().div_ceil(PATH.max_fragment_payload());
-        assert_eq!(wire.len(), n);
+        let parity = fec::parity_for(n, 20);
+        assert_eq!(wire.len(), n + parity);
+        assert_eq!((w.fec_frames, w.fec_dgrams, w.fec_off), (1, parity as u64, 0));
         // 63 KB at the frame term (whole frame within ~8.3 ms): bursts of 4 datagrams are
         // spaced, so the frame took a few milliseconds, not microseconds.
         let span = wire.last().unwrap().0 - wire[0].0;
@@ -2130,8 +2223,10 @@ pub(crate) mod latency_tests {
         assert!(span <= Duration::from_millis(100), "{span:?}");
         let mut rx = LaneReceiver::new(&secret, 12, Role::Viewer, Default::default());
         let now = Instant::now();
-        for (_, mut d) in wire {
-            rx.on_datagram(&mut d, now).unwrap();
+        for (i, (_, mut d)) in wire.into_iter().enumerate() {
+            if ![0, 5, n - 1].contains(&i) {
+                rx.on_datagram(&mut d, now).unwrap();
+            }
         }
         let frames: Vec<_> = rx
             .poll(now)
@@ -2143,6 +2238,8 @@ pub(crate) mod latency_tests {
             .collect();
         assert_eq!(frames, vec![bytes]);
         assert_eq!(w.errors, 0);
+        let (loss, _) = rx.take_stats();
+        assert_eq!((loss.fec_recovered, loss.fec_shards), (1, 3));
     }
 
     #[test]

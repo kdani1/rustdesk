@@ -1,8 +1,11 @@
 //! Viewer end of the UDP video lane: shadow probe (M19) and live video (M20).
 //!
-//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 3: live
-//!   mode with EPOCH markers too) on Windows, for remote control, unless `enable-udp-video` is
-//!   `N`.
+//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 4: live
+//!   mode with EPOCH markers and FEC parity shards too) on Windows, for remote control, unless
+//!   `enable-udp-video` is `N`.
+//! - FEC (M21): the receive thread takes parity shards whenever they come and rebuilds lost
+//!   fragments at once (`fragment::Reassembler::push_parity`); the window line splits losses
+//!   into recovered (`fec_rec`) and unrecoverable (`fec_unrec`).
 //! - On the host's offer, [`ViewerLane::on_offer`] checks it and starts a [`UdpVideoClient`]:
 //!   a socket bound to the session's own local TCP address (never the wildcard), connected to
 //!   the host's offered address, and one receive thread. The thread sends HELLO every 20 ms for
@@ -31,9 +34,8 @@
 use super::{
     crypto::{Role, SECRET_LEN},
     fragment::{Event, LossStats, ReassemblyConfig},
-    host::{
-        DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_LIVE_VERSION,
-    },
+    fec,
+    host::{DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_FEC_VERSION},
     lane::{DropStats, LaneReceiver, LaneSender, Received},
     net::{self, LaneClock, ReadTimeout},
     packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, VIDEO_OVERHEAD},
@@ -88,7 +90,7 @@ pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 /// The lane version to advertise in the login request, 0 for none.
 pub fn advertised_version(conn_type: ConnType) -> u32 {
     if cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled() {
-        VIEWER_LIVE_VERSION
+        VIEWER_FEC_VERSION
     } else {
         0
     }
@@ -187,6 +189,9 @@ pub struct Accepted {
     pub live: bool,
     /// Live: silence from the host this long ends the lane.
     pub timeout: Duration,
+    /// FEC parity the host adds, in percent (0: none). Logged only: parity shards are taken
+    /// whenever they come.
+    pub fec: u32,
 }
 
 /// Checks an offer against what this build speaks and the session's own local address.
@@ -236,6 +241,7 @@ pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted,
         every: offer.shadow_every.max(1),
         live,
         timeout,
+        fec: offer.fec_percent.min(fec::MAX_PERCENT),
     })
 }
 
@@ -782,14 +788,15 @@ impl ViewerLane {
         match UdpVideoClient::start(&a, offer.lane_id, tx) {
             Ok((client, bound)) => {
                 log::info!(
-                    "UDPVIDEO viewer peer={} accepted lane={:016x} mode={} host={} local={} every={} timeout_ms={}",
+                    "UDPVIDEO viewer peer={} accepted lane={:016x} mode={} host={} local={} every={} timeout_ms={} fec={}",
                     self.peer,
                     offer.lane_id,
                     if a.live { "live" } else { "shadow" },
                     a.host,
                     bound,
                     a.every,
-                    a.timeout.as_millis()
+                    a.timeout.as_millis(),
+                    a.fec
                 );
                 self.client = Some(client);
                 self.matcher = ShadowMatcher::default();
@@ -1197,7 +1204,7 @@ impl ViewerLane {
         if self.live.is_some() {
             let s = std::mem::take(&mut self.stats);
             log::info!(
-                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={}",
+                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={}",
                 self.peer,
                 w.span.as_secs_f64(),
                 l.frames_completed,
@@ -1231,12 +1238,16 @@ impl ViewerLane {
                 w.pongs,
                 w.acks,
                 w.recv_errors,
+                l.fec_recovered,
+                l.fec_unrecoverable,
+                l.fec_shards,
+                l.parity_received,
             );
             return;
         }
         let mut m = self.matcher.take_window();
         log::info!(
-            "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=shadow win_s={:.1} frames={} lost={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} matched={} tcp_first={} unpaired={} ahead_net_ms={} ahead_app_ms={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} rx_err={}",
+            "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=shadow win_s={:.1} frames={} lost={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} matched={} tcp_first={} unpaired={} ahead_net_ms={} ahead_app_ms={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={}",
             self.peer,
             w.span.as_secs_f64(),
             l.frames_completed,
@@ -1265,6 +1276,10 @@ impl ViewerLane {
             w.pings,
             w.pongs,
             w.recv_errors,
+            l.fec_recovered,
+            l.fec_unrecoverable,
+            l.fec_shards,
+            l.parity_received,
         );
     }
 }
@@ -1305,7 +1320,12 @@ mod latency_tests {
         let a = check_offer(&offer(), local).unwrap();
         assert_eq!(a.local, "192.168.1.9".parse::<IpAddr>().unwrap());
         assert_eq!(a.host, "192.168.1.5:40000".parse().unwrap());
-        assert_eq!((a.every, a.live, a.timeout), (2, false, DEFAULT_TIMEOUT));
+        assert_eq!((a.every, a.live, a.timeout, a.fec), (2, false, DEFAULT_TIMEOUT, 0));
+        let mut fec_offer = offer();
+        fec_offer.fec_percent = 20;
+        assert_eq!(check_offer(&fec_offer, local).unwrap().fec, 20);
+        fec_offer.fec_percent = 900;
+        assert_eq!(check_offer(&fec_offer, local).unwrap().fec, fec::MAX_PERCENT);
         let mut live = offer();
         live.mode = udp_video_offer::Mode::ModeLive.into();
         // A live offer of lane v1 (the first M20 host, no EPOCH markers) is refused.
@@ -1345,7 +1365,7 @@ mod latency_tests {
     }
 
     fn params(mode: Mode) -> Params {
-        Params::from_options(mode, "2", "", "")
+        Params::from_options(mode, "2", "", "", "")
     }
 
     /// Host and viewer ends over loopback (the LAN gate is bypassed: it refuses loopback):
@@ -1363,6 +1383,7 @@ mod latency_tests {
             every: offer.shadow_every,
             live: false,
             timeout: DEFAULT_TIMEOUT,
+            fec: offer.fec_percent,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_client, _) = UdpVideoClient::start(&a, offer.lane_id, tx).unwrap();
@@ -1410,6 +1431,7 @@ mod latency_tests {
             every: 1,
             live: true,
             timeout: DEFAULT_TIMEOUT,
+            fec: 0,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_client, _) = UdpVideoClient::start(&a, offer.lane_id, tx).unwrap();
@@ -1576,6 +1598,7 @@ mod latency_tests {
             every: 1,
             live: true,
             timeout: DEFAULT_TIMEOUT,
+            fec: 0,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut lane = ViewerLane::default();
@@ -1650,6 +1673,7 @@ mod latency_tests {
             every: 1,
             live: true,
             timeout: DEFAULT_TIMEOUT,
+            fec: 0,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut lane = ViewerLane::default();

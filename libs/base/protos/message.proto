@@ -86,8 +86,9 @@ message LoginRequest {
   string avatar = 17;
   // Fork-only (docs/UDP-VIDEO.md): the highest UDP video lane version this viewer supports,
   // 0 or absent = none, 1 = shadow mode only, 2 = live mode of the first M20 build (no EPOCH
-  // marker; offered no live lane any more), 3 = live mode with EPOCH. Stock hosts ignore it, so
-  // they never offer a lane.
+  // marker; offered no live lane any more), 3 = live mode with EPOCH, 4 = also takes FEC parity
+  // shards (M21; offered UdpVideoOffer.fec_percent). Stock hosts ignore it, so they never offer
+  // a lane.
   uint32 udp_video_version = 1001;
 }
 
@@ -920,6 +921,9 @@ message UdpVideoOffer {
   // Live mode: no authenticated datagram from the other end for this long ends the lane
   // (0 = the viewer's default).
   uint32 timeout_ms = 9;
+  // FEC (M21): Reed-Solomon parity per frame block in percent of its data shards (min 2 per
+  // block); 0 or absent = no parity datagrams. Set only for a viewer of udp_video_version >= 4.
+  uint32 fec_percent = 10;
 }
 
 // Fork-only lane control, both directions over the session stream.

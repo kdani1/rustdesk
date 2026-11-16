@@ -331,6 +331,12 @@ pub const OPTION_UDP_VIDEO_BURST: &str = "udp-video-burst";
 // many milliseconds ends the lane and video goes back to TCP (200..=10000). Empty or invalid:
 // 1000. Sent to the viewer in the offer, which uses it the same way. Read at each offer.
 pub const OPTION_UDP_VIDEO_TIMEOUT_MS: &str = "udp-video-timeout-ms";
+// Windows host, server option (roadmap M21): Reed-Solomon FEC parity of the UDP video lane, in
+// percent of each block's data shards (Sunshine style: at least 2 parity shards per block, at
+// most 4 blocks of at most 200 data shards per frame). "0" sends no parity; empty or invalid
+// (above 100): 20. Applies to live and shadow lanes, only for a viewer of lane v4 (older fork
+// viewers get lanes without parity). Read at each offer. See docs/UDP-VIDEO.md, "FEC".
+pub const OPTION_UDP_VIDEO_FEC_PERCENT: &str = "udp-video-fec-percent";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
