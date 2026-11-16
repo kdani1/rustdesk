@@ -54,6 +54,8 @@ pub struct AomEncoder {
     height: usize,
     i444: bool,
     yuvfmt: EncodeYuvFormat,
+    // The next encode is a key frame (request_keyframe).
+    force_kf: bool,
 }
 
 // https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/av1/libaom_av1_encoder.cc
@@ -245,6 +247,7 @@ impl EncoderApi for AomEncoder {
                     height: config.height as _,
                     i444,
                     yuvfmt: Self::get_yuvfmt(config.width, config.height, i444),
+                    force_kf: false,
                 })
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -303,6 +306,11 @@ impl EncoderApi for AomEncoder {
     }
 
     fn disable(&self) {}
+
+    fn request_keyframe(&mut self) -> bool {
+        self.force_kf = true;
+        true
+    }
 }
 
 impl AomEncoder {
@@ -328,13 +336,19 @@ impl AomEncoder {
         ));
         let pts = webrtc::kTimeBaseDen / 1000 * ms;
         let duration = webrtc::kTimeBaseDen / 1000;
+        let flags = if self.force_kf {
+            AOM_EFLAG_FORCE_KF as _
+        } else {
+            0
+        };
         call_aom!(aom_codec_encode(
             &mut self.ctx,
             &image,
             pts as _,
             duration as _, // Duration
-            0,             // Flags
+            flags,
         ));
+        self.force_kf = false;
 
         Ok(EncodeFrames {
             ctx: &mut self.ctx,

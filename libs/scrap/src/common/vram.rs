@@ -77,6 +77,7 @@ impl EncoderApi for VRamEncoder {
                         gop,
                     },
                 };
+                hwcodec::ffmpeg::set_nvenc_vbv_frames(crate::codec::nvenc_vbv_frames());
                 match Encoder::new(ctx.clone()) {
                     Ok(encoder) => Ok(VRamEncoder {
                         encoder,
@@ -153,6 +154,39 @@ impl EncoderApi for VRamEncoder {
         } else {
             Err(anyhow!("no valid frame"))
         }
+    }
+
+    fn request_keyframe(&mut self) -> bool {
+        self.encoder.request_keyframe().is_ok()
+    }
+
+    fn encode_last(&mut self, ms: i64) -> ResultType<VideoFrame> {
+        let frames: Vec<_> = match self.encoder.encode_last(ms) {
+            Ok(v) => v
+                .drain(..)
+                .map(|frame| EncodedVideoFrame {
+                    data: Bytes::from(frame.data),
+                    pts: frame.pts,
+                    key: frame.key == 1,
+                    ..Default::default()
+                })
+                .collect(),
+            Err(code) => bail!("encode_last produced no packet, code: {code}"),
+        };
+        if frames.is_empty() {
+            bail!("no valid frame");
+        }
+        let frames = EncodedVideoFrames {
+            frames: frames.into(),
+            ..Default::default()
+        };
+        let mut vf = VideoFrame::new();
+        match self.format {
+            DataFormat::H264 => vf.set_h264s(frames),
+            DataFormat::H265 => vf.set_h265s(frames),
+            _ => bail!("{:?} not supported", self.format),
+        }
+        Ok(vf)
     }
 
     fn yuvfmt(&self) -> EncodeYuvFormat {

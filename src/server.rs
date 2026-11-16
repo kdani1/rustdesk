@@ -76,6 +76,8 @@ pub mod display_service;
 pub mod portable_service;
 mod service;
 mod latency_stats;
+#[cfg(windows)]
+mod key_refresh;
 mod video_qos;
 pub mod video_service;
 

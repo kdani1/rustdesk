@@ -80,6 +80,19 @@ pub trait EncoderApi {
     fn is_hardware(&self) -> bool;
 
     fn disable(&self);
+
+    /// The next encode produces a key frame (an IDR for H.264/H.265), without restarting the
+    /// encoder. False: not supported, the caller has to restart the encoder instead.
+    fn request_keyframe(&mut self) -> bool {
+        false
+    }
+
+    /// Encodes the last input again without a new capture (VRAM: the kept NV12 surface), with
+    /// a pending `request_keyframe` applied. Encoders with YUV input do not implement it: their
+    /// caller keeps the YUV buffer and passes it to `encode_to_message` again.
+    fn encode_last(&mut self, _ms: i64) -> ResultType<VideoFrame> {
+        bail!("encode_last not supported")
+    }
 }
 
 pub struct Encoder {
@@ -908,6 +921,22 @@ pub fn enable_directx_capture() -> bool {
 pub fn allow_d3d_render() -> bool {
     use base::config::keys::OPTION_ALLOW_D3D_RENDER as OPTION;
     option2bool(OPTION, &hbb_common::config::LocalConfig::get_option(OPTION))
+}
+
+/// Host option `nvenc-vbv-frames` (Windows): VBV size of nvenc encoders in frames, 0 (default,
+/// also for anything unparsable) keeps FFmpeg's default VBV. Read when an encoder is created.
+pub fn nvenc_vbv_frames() -> i32 {
+    #[cfg(windows)]
+    {
+        use base::config::keys::OPTION_NVENC_VBV_FRAMES;
+        Config::get_option(OPTION_NVENC_VBV_FRAMES)
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(0)
+            .clamp(0, 60)
+    }
+    #[cfg(not(windows))]
+    0
 }
 
 pub const BR_BEST: f32 = 1.5;
