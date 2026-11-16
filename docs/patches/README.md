@@ -28,12 +28,17 @@ Fork-only API that RustDesk uses:
 |---|---|
 | `hwcodec::ffmpeg::set_nvenc_vbv_frames(frames: i32)` | `libs/scrap/src/common/hwcodec.rs`, `vram.rs` (M14 VBV) |
 | `hwcodec::ffmpeg_ram::encode::Encoder::request_keyframe(&mut self) -> Result<(), ()>` | `libs/scrap/src/common/hwcodec.rs` (M13) |
+| `hwcodec::ffmpeg_ram::encode::Encoder::set_framerate(&mut self, framerate: i32) -> Result<(), ()>` (C: `ffmpeg_ram_set_framerate`) | `libs/scrap/src/common/hwcodec.rs` (M7 virtual framerate) |
 | `hwcodec::vram::encode::Encoder::request_keyframe(&mut self) -> Result<(), i32>` | `libs/scrap/src/common/vram.rs` (M13) |
 | `hwcodec::vram::encode::Encoder::encode_last(&mut self, ms: i64) -> Result<&mut Vec<EncodeFrame>, i32>` | `libs/scrap/src/common/vram.rs` (M13 kept image, M14 static refine) |
 | `hwcodec::vram::decode::Decoder::decode_with_output(&mut self, packet: &[u8], output: bool) -> Result<Option<&mut Vec<DecodeFrame>>, i32>` | `libs/scrap/src/common/vram.rs` (M9) |
 
 The fork's C++ changes (nvenc low-latency options, forced IDR, VBV, bounded `Query` poll, open
-and decode logging) have no Rust API of their own; they are in the patch as well.
+and decode logging) have no Rust API of their own; they are in the patch as well. The VRAM
+`hwcodec::vram::encode::Encoder::set_framerate` is upstream API, but on FFmpeg nvenc the fork
+changes what it does (M7): upstream it is a stub that returns -1, in the fork it rescales the
+bitrate to bitrate × clamp(opened fps / fps, 0.5, 4) (virtual framerate) and keeps the VBV at
+N frames of that per-frame budget; AMF and QSV still return -1.
 
 Whether and where to publish the fork (and then point `libs/scrap/Cargo.toml` at it) is the
 owner's decision; until then `Cargo.toml` and `Cargo.lock` stay as they are.

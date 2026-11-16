@@ -243,6 +243,18 @@ pub const OPTION_NVENC_VBV_FRAMES: &str = "nvenc-vbv-frames";
 // only go on together); "N" turns both off, other values change nothing. Read when the capture
 // loop starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_STATIC_REFINE: &str = "enable-static-refine";
+// Windows host, server option (Config): virtual framerate of the nvenc encoders (roadmap M7). A
+// number N > 0 opens nvenc at N fps (clamped to 10-120; 60 is the intended value) and rescales
+// the bitrate to the frame rate the capture loop runs at, bitrate * clamp(N / fps, 0.5, 4), so
+// the real bitrate matches the QoS bitrate; fps changes need no restart. Empty or "0" (default)
+// keeps today's open at 30 fps without rescaling. AMF, QSV and software encoders are unchanged.
+// Read when an encoder is created. See docs/LATENCY-METRICS.md.
+pub const OPTION_NVENC_NOMINAL_FPS: &str = "nvenc-nominal-fps";
+// Windows host, server option (Config): with nvenc-nominal-fps > 0, "Y" takes the running frame
+// rate from the frames encoded in the last second instead of the QoS fps cap, kept between half
+// the cap and the cap: a sparse desktop (typing) keeps today's bits per frame, full motion gets
+// the QoS bitrate. Other values (default): the QoS fps cap. Read when the capture loop starts.
+pub const OPTION_NVENC_FPS_FROM_SEND_RATE: &str = "nvenc-fps-from-send-rate";
 // Viewer, local option: present pacing, "always show the newest frame". Every frame is still
 // decoded, but a stale one is not handed to the UI while a newer one waits; the soft renderer
 // replaces a buffer Flutter has not fetched yet instead of dropping the newer frame. On by

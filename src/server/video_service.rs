@@ -805,6 +805,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     if static_refine.enabled() {
         log::info!("static refine on");
     }
+    // M7: an nvenc encoder opened at `nvenc-nominal-fps` gets its bitrate rescaled to the frame
+    // rate the loop runs at (check_qos).
+    #[cfg(windows)]
+    let mut virtual_fps = encoder.virtual_fps().then(|| {
+        super::virtual_fps::VirtualFps::new(
+            Config::get_option(base::config::keys::OPTION_NVENC_FPS_FROM_SEND_RATE) == "Y",
+        )
+    });
     // Absolute frame deadlines instead of sleeping for the rest of each period (Windows only).
     #[cfg(windows)]
     let deadline_pacing =
@@ -829,6 +837,9 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut send_counter,
             &mut second_instant,
             &sp.name(),
+            #[cfg(windows)]
+            &mut virtual_fps,
+            &mut latency_stats,
         )?;
         if quality != quality_before && encoder.support_changing_quality() {
             latency_stats.on_quality(encoder.bitrate());
@@ -1839,9 +1850,13 @@ fn check_qos(
     send_counter: &mut usize,
     second_instant: &mut Instant,
     name: &str,
+    #[cfg(windows)] virtual_fps: &mut Option<super::virtual_fps::VirtualFps>,
+    latency_stats: &mut super::latency_stats::LatencyStats,
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     *spf = video_qos.spf();
+    let fps_cap = video_qos.fps();
+    let mut measured_fps = None;
     if *ratio != video_qos.ratio() {
         *ratio = video_qos.ratio();
         if encoder.support_changing_quality() {
@@ -1859,12 +1874,34 @@ fn check_qos(
         log::info!("switch due to record changed");
         bail_switch!("record");
     }
-    if second_instant.elapsed() > Duration::from_secs(1) {
+    let window = second_instant.elapsed();
+    if window > Duration::from_secs(1) {
+        measured_fps = Some(*send_counter as f64 / window.as_secs_f64());
         *second_instant = Instant::now();
         video_qos.update_display_data(&name, *send_counter);
         *send_counter = 0;
     }
     drop(video_qos);
+    // Virtual framerate, after the lock: the NVENC SDK driver reconfigures the encoder here.
+    #[cfg(windows)]
+    if let Some(vf) = virtual_fps.as_mut() {
+        if let Some(fps) = vf.next(fps_cap, measured_fps) {
+            let first = vf.applied() == 0;
+            if encoder.set_fps(fps) {
+                vf.on_applied(fps);
+                latency_stats.on_virtual_fps(fps);
+                if first {
+                    log::info!("virtual fps: {name} encoder runs at {fps} fps (cap {fps_cap})");
+                }
+            } else {
+                log::warn!("virtual fps: {name} encoder refused {fps} fps, off until restart");
+                latency_stats.on_virtual_fps(0);
+                *virtual_fps = None;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (fps_cap, measured_fps, latency_stats);
     Ok(())
 }
 

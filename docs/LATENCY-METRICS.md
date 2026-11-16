@@ -47,7 +47,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 vfps=0 vfchg=0
 ```
 
 | Field | Meaning |
@@ -64,7 +64,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `idle` | iterations where the capturer had no new image within its wait (`spf`, or for DXGI with `pacing=deadline` ceil(`spf`) + 2 ms): static screen. On moving content it must stay about 0. |
 | `age` | Windows DXGI capture only: how old the image was when `AcquireNextFrame` returned it, QPC now minus the frame's `LastPresentTime` (the time DWM presented it), p50/p95/max ms over the frames in `sent`/`skipped`. A sawtooth (p50 low, p95/max close to `spf`) means the loop samples the desktop out of phase with presents. `n/a` with GDI, magnifier, portable-service and camera capture, and on other platforms (no present time). |
 | `kbps` | encoder output: bytes of all encoded frames of the window × 8 / window length. Repeat encodes and frames no connection took (`skipped`) are counted too: it is what the encoder produced, compare it with `set_kbps`. |
-| `set_kbps` | the bitrate the encoder was last set to (`encoder.bitrate()`, kbps; at capture start and after each `set_quality`). With NVENC opened at 30 fps and run at 60 fps, `kbps` ≈ 2 × `set_kbps` is expected (`vram.rs`, framerate 30). |
+| `set_kbps` | the bitrate the encoder was last set to (`encoder.bitrate()`, kbps; at capture start and after each `set_quality`): the QoS bitrate. With NVENC opened at 30 fps and run at 60 fps, `kbps` ≈ 2 × `set_kbps` is expected (`vram.rs`, framerate 30). With the virtual framerate (`vfps` > 0) NVENC itself runs at `set_kbps` × clamp(nominal / `vfps`, 0.5, 4), and `kbps` ≈ `set_kbps` is expected under full motion. |
 | `maxf` | largest encoded frame of the window, bytes |
 | `key` | key frames encoded in the window |
 | `keymax` | largest key frame of the window, bytes (0 when none) |
@@ -78,9 +78,12 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
 
+| `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused it). |
+| `vfchg` | how often `vfps` changed in the window (each one is an IDR-free nvenc reconfigure with the next frame) |
+
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
-`rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
-kept always.
+`rmerge`, `refine` and `vfchg` are only counted while logging is on, like the other fields;
+`set_kbps` and `vfps` are kept always.
 
 Not covered: the re-encode of the last image that non-latency-free encoders
 (mediacodec, videotoolbox) do on idle iterations.
@@ -121,8 +124,10 @@ three are off by default in this build.
   created). nvenc `rc_buffer_size` = N × bitrate / encoder frame rate, at open and after every
   bitrate change (FFmpeg's nvenc reconfigure re-applies it; patch 0009 keeps that free of an
   IDR). The encoder frame rate is the one NVENC was opened with: 30 on the VRAM and RAM paths
-  today, while the loop runs at up to 60, so N = 1 is one NVENC frame budget, about two real
-  frames at 60 fps (until the encoder is opened at the real frame rate). `ldkfs` is left at
+  with `nvenc-nominal-fps` at 0, while the loop runs at up to 60, so N = 1 is one NVENC frame
+  budget, about two real frames at 60 fps. With the virtual framerate (`nvenc-nominal-fps` > 0)
+  the bitrate in that formula is the rescaled one and the frame rate the nominal one, so N = 1
+  is one real frame of the QoS bitrate at `vfps` (inside the 0.5-4 clamp). `ldkfs` is left at
   NVENC's default (1 with `tune=ull`). Turns static refine on for FFmpeg nvenc encoders: the two
   only go on together (roadmap M14); another encoder (VP9/AV1, AMF, QSV, the NVENC SDK driver)
   gets neither.
@@ -130,6 +135,36 @@ three are off by default in this build.
   `nvenc-vbv-frames` is then ignored; any other value changes nothing, refine is on exactly when
   the running encoder got the VBV of `nvenc-vbv-frames` > 0; read when an encoder is created):
   see `refine` above.
+
+### Host: virtual framerate (roadmap M7)
+
+Windows host, server options, off by default in this build.
+
+- **`nvenc-nominal-fps`** (number; empty or `0` = today: nvenc opens at 30 fps and its bitrate
+  is not rescaled; other values are clamped to 10-120, `60` is the intended one; read when an
+  encoder is created). FFmpeg nvenc (VRAM and RAM paths) and the NVENC SDK driver open at this
+  frame rate. NVENC's CBR budgets bitrate / frame rate per frame, so the capture loop tells the
+  encoder the frame rate it runs at (`vfps`) and FFmpeg nvenc sets its bitrate to the QoS
+  bitrate × clamp(nominal / `vfps`, 0.5, 4): the per-frame budget is QoS bitrate / `vfps` and
+  the real bitrate follows the QoS bitrate. FFmpeg's nvenc reconfigure applies it with the next
+  frame, free of an IDR with patch 0009 (so an fps change needs no restart; `vfchg` counts them).
+  The NVENC SDK driver reconfigures its real frame rate instead. The 4× clamp keeps a reconfigure
+  within 4× of the opened bitrate (HEVC level limits); below nominal / 4 fps the stream stays
+  under the QoS bitrate. AMF, QSV, VP8/VP9/AV1 are unchanged. The price: at 60 fps a frame gets
+  half the bits it gets today at the same quality setting, so text after typing or scrolling is
+  softer (check `maxf` and the picture).
+- **`nvenc-fps-from-send-rate`** (`Y`; read when the capture loop starts; only with
+  `nvenc-nominal-fps` > 0). `vfps` is the number of frames encoded in the last second (the
+  `check_qos` window, refines and kept-image key frames included) instead of the QoS fps cap,
+  kept between half the cap and the cap. It rises with the next window, falls only after two
+  windows in a row, and changes under 10 % or of 1 fps are ignored; a cap change applies at once.
+  A sparse desktop (typing) then keeps today's bits per frame at a 60 fps cap (`vfps` 30), full
+  motion gets the QoS bitrate, and the first second of motion after an idle screen is at most 2×
+  the QoS bitrate (today's steady state at 60 fps).
+
+Gate for turning it on (roadmap M7): `kbps` / `set_kbps` about 1.0 at 60 fps under motion, no
+`LATENCY switch` on an fps change, text sharpness and `maxf` while typing and scrolling, Wi-Fi
+`wait` p95 compared with option 0, and `new encoder:` still showing the VRAM encoder.
 
 Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL]`, `[FFMPEG_VRAM_ENC]` or `[FFMPEG_RAM_ENC]`):
 
@@ -140,6 +175,9 @@ Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL
 | `forced IDR gave no key frame, forced keyframes off` | a forced key frame came out without the key flag (`refresh_no_key` follows): forced key frames are reported unsupported for encoders of that name until the host process restarts, so this line comes at most once per process and name, and later refreshes restart at once (`refresh_unsupported`) |
 | `[FFMPEG] avg bitrate change: a -> b` / `[FFMPEG] vbv buffer size change: a -> b` | with `nvenc-vbv-frames` > 0, FFmpeg's own nvenc reconfigure lines for the first 8 such messages in the process: the proof that a bitrate change re-applies the VBV |
 | `static refine on` | the capture loop starts with static refine |
+| `[FFMPEG_VRAM_ENC] hevc_nvenc virtual framerate: opened at 60 fps, runs at 30, bit_rate … for … kbps` (or `[FFMPEG_RAM_ENC]`) | once per nvenc encoder, the first virtual-framerate rescale: the opened frame rate, the running one, the bitrate set in bit/s and the QoS bitrate. Also turns on FFmpeg's `avg bitrate change` lines (above) for the next 8 reconfigures |
+| `virtual fps: <service> encoder runs at N fps (cap C)` | the capture loop applied the virtual framerate the first time after an encoder was created |
+| `virtual fps: <service> encoder refused N fps, off until restart` | `set_fps` failed (should not happen with FFmpeg nvenc; the NVENC SDK driver's reconfigure can fail); the encoder keeps the bitrate it had, `vfps` becomes 0 |
 | `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |
 
 ### Host: capture restarts, connection loop, transport
