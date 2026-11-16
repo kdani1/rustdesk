@@ -12,7 +12,9 @@
 //! each holds a copy of the key state and uses its own counter), the same messages. Each source
 //! stays in order: control (replies, the rx service channel), video (frames and SwitchDisplay),
 //! bulk (CM raw messages, file-clipboard messages, file read jobs, and rx messages over
-//! [`DEMOTE_BYTES`]).
+//! [`DEMOTE_BYTES`]). The rx channel keeps its order across the two queues: once an rx message
+//! went to bulk, the rx messages after it follow it there until the writer has taken the last
+//! of them.
 //!
 //! WebSocket (private fields in hbb_common) and WebRTC stay whole.
 
@@ -55,7 +57,8 @@ const BULK_ROOM: usize = 512 * 1024;
 /// The reader pauses while control and bulk hold this much: the backpressure an inline write
 /// gave before (a reply waited for the socket, and nothing was read meanwhile).
 const READ_CAP: usize = 16 * 1024 * 1024;
-/// rx messages larger than this (a clipboard image) go to bulk instead of control.
+/// rx messages larger than this (a clipboard image) go to bulk instead of control, and the rx
+/// messages after them follow while one is still queued there (rx order is kept).
 pub const DEMOTE_BYTES: usize = 256 * 1024;
 /// Audio older than this when the writer takes it is dropped, as the loop did before.
 const AUDIO_MAX_AGE: Duration = Duration::from_millis(1000);
@@ -102,11 +105,16 @@ enum Out {
 
 struct Item {
     out: Out,
+    // When the message was made or queued at its source (the rx channel): the audio age.
     at: Instant,
+    // When it entered the writer's queue: the `ctrlq` wait.
+    enq_at: Instant,
     bytes: usize,
     // Control items are numbered for `flush`; bulk items are 0.
     seq: u64,
     bulk: bool,
+    // From the rx service channel.
+    rx: bool,
 }
 
 impl Item {
@@ -147,6 +155,8 @@ pub struct Shared {
     queued_bytes: AtomicUsize,
     queued_max: AtomicUsize,
     bulk_bytes: AtomicUsize,
+    // rx messages queued in bulk: while any is, later rx messages go to bulk too.
+    rx_in_bulk: AtomicUsize,
     queued_items: AtomicUsize,
     ctrl_done: AtomicU64,
     // Since `epoch`: the last dequeue or write completion.
@@ -166,6 +176,7 @@ impl Shared {
             queued_bytes: AtomicUsize::new(0),
             queued_max: AtomicUsize::new(0),
             bulk_bytes: AtomicUsize::new(0),
+            rx_in_bulk: AtomicUsize::new(0),
             queued_items: AtomicUsize::new(0),
             ctrl_done: AtomicU64::new(0),
             progress_us: AtomicU64::new(0),
@@ -185,6 +196,9 @@ impl Shared {
         self.queued_bytes.fetch_sub(item.bytes, Ordering::Relaxed);
         if item.bulk {
             self.bulk_bytes.fetch_sub(item.bytes, Ordering::Relaxed);
+            if item.rx {
+                self.rx_in_bulk.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         self.queued_items.fetch_sub(1, Ordering::Relaxed);
         self.mark_progress();
@@ -281,6 +295,18 @@ impl Writer {
     }
 }
 
+// A bulk item: stale audio (rx order sent it here) is dropped as in control.
+async fn write_bulk(w: &mut Writer, shared: &Shared, item: Item) -> Result<(), String> {
+    shared.dequeued(&item);
+    if item.at.elapsed() > AUDIO_MAX_AGE && item.is_audio() {
+        shared.with_window(|win| win.audio_dropped += 1);
+        return Ok(());
+    }
+    shared.with_window(|win| win.bulk_writes += 1);
+    let bytes = item.into_bytes().map_err(|e| e.to_string())?;
+    w.write(bytes).await.map_err(|e| e.to_string())
+}
+
 async fn run_writer(
     mut w: Writer,
     mut ctrl: mpsc::UnboundedReceiver<Item>,
@@ -297,11 +323,7 @@ async fn run_writer(
         if video_run >= BULK_EVERY {
             if let Ok(item) = bulk.try_recv() {
                 video_run = 0;
-                shared.dequeued(&item);
-                shared.with_window(|win| win.bulk_writes += 1);
-                w.write(item.into_bytes().map_err(|e| e.to_string())?)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                write_bulk(&mut w, &shared, item).await?;
                 continue;
             }
         }
@@ -312,12 +334,13 @@ async fn run_writer(
                 let Some(item) = item else { return Ok(()) };
                 shared.dequeued(&item);
                 let seq = item.seq;
-                let waited = item.at.elapsed();
-                if waited > AUDIO_MAX_AGE && item.is_audio() {
+                if item.at.elapsed() > AUDIO_MAX_AGE && item.is_audio() {
                     shared.with_window(|win| win.audio_dropped += 1);
                     shared.ctrl_done(seq);
                     continue;
                 }
+                // The wait in this queue only, not the rx channel's before it.
+                let waited = item.enq_at.elapsed();
                 shared.with_window(|win| {
                     win.ctrlq.push(waited);
                     win.ctrlq_max = win.ctrlq_max.max(waited);
@@ -339,11 +362,7 @@ async fn run_writer(
             }
             Some(item) = bulk.recv() => {
                 video_run = 0;
-                shared.dequeued(&item);
-                shared.with_window(|win| win.bulk_writes += 1);
-                w.write(item.into_bytes().map_err(|e| e.to_string())?)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                write_bulk(&mut w, &shared, item).await?;
             }
         }
     }
@@ -405,7 +424,14 @@ impl SessionIo {
         }
     }
 
-    fn enqueue(&mut self, bulk: bool, out: Out, at: Instant, bytes: usize) -> ResultType<()> {
+    fn enqueue(
+        &mut self,
+        bulk: bool,
+        rx: bool,
+        out: Out,
+        at: Instant,
+        bytes: usize,
+    ) -> ResultType<()> {
         let Self::Split(s) = self else {
             bail!("session stream is not split");
         };
@@ -424,14 +450,19 @@ impl SessionIo {
         sh.queued_max.fetch_max(total, Ordering::Relaxed);
         if bulk {
             sh.bulk_bytes.fetch_add(bytes, Ordering::Relaxed);
+            if rx {
+                sh.rx_in_bulk.fetch_add(1, Ordering::Relaxed);
+            }
         }
         sh.queued_items.fetch_add(1, Ordering::Relaxed);
         tx.send(Item {
             out,
             at,
+            enq_at: Instant::now(),
             bytes,
             seq,
             bulk,
+            rx,
         })
         .map_err(|_| anyhow!("session writer gone"))
     }
@@ -443,7 +474,7 @@ impl SessionIo {
             Self::Split(_) => {
                 let bytes = msg.write_to_bytes()?;
                 let n = bytes.len();
-                self.enqueue(false, Out::Raw(bytes), Instant::now(), n)
+                self.enqueue(false, false, Out::Raw(bytes), Instant::now(), n)
             }
         }
     }
@@ -454,19 +485,21 @@ impl SessionIo {
             Self::Whole(s) => s.send(&msg).await,
             Self::Split(_) => {
                 let n = msg.compute_size() as usize;
-                self.enqueue(false, Out::Owned(msg), Instant::now(), n)
+                self.enqueue(false, false, Out::Owned(msg), Instant::now(), n)
             }
         }
     }
 
     /// A message from the rx service channel, with the time it was queued there (the writer
-    /// drops audio older than 1 s by it). Very large ones go to bulk.
+    /// drops audio older than 1 s by it). Very large ones go to bulk, and the rx messages after
+    /// them follow while one is still queued there, so the rx order holds.
     pub async fn send_shared(&mut self, at: Instant, msg: Arc<Message>) -> ResultType<()> {
         match self {
             Self::Whole(s) => s.send(msg.as_ref()).await,
-            Self::Split(_) => {
+            Self::Split(s) => {
                 let n = msg.compute_size() as usize;
-                self.enqueue(n > DEMOTE_BYTES, Out::Shared(msg), at, n)
+                let bulk = n > DEMOTE_BYTES || s.shared.rx_in_bulk.load(Ordering::Relaxed) > 0;
+                self.enqueue(bulk, true, Out::Shared(msg), at, n)
             }
         }
     }
@@ -478,7 +511,7 @@ impl SessionIo {
             Self::Split(_) => {
                 let bytes = msg.write_to_bytes()?;
                 let n = bytes.len();
-                self.enqueue(true, Out::Raw(bytes), Instant::now(), n)
+                self.enqueue(true, false, Out::Raw(bytes), Instant::now(), n)
             }
         }
     }
@@ -489,7 +522,7 @@ impl SessionIo {
             Self::Whole(s) => s.send_raw(bytes).await,
             Self::Split(_) => {
                 let n = bytes.len();
-                self.enqueue(true, Out::Raw(bytes), Instant::now(), n)
+                self.enqueue(true, false, Out::Raw(bytes), Instant::now(), n)
             }
         }
     }
@@ -647,17 +680,36 @@ impl SessionIo {
         };
         let target = s.ctrl_seq;
         let sh = s.shared.clone();
+        let Some(tx) = s.ctrl.clone() else {
+            return;
+        };
         let deadline = Instant::now() + timeout;
         loop {
             let notified = sh.ctrl_progress.notified();
             if sh.ctrl_done.load(Ordering::Relaxed) >= target {
                 return;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                log::warn!("session writer did not flush in {:?}", timeout);
-                return;
+            tokio::select! {
+                _ = notified => {}
+                // The writer ended (write error, send timeout): nothing more will be written.
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep_until(deadline) => {
+                    log::warn!("session writer did not flush in {:?}", timeout);
+                    return;
+                }
             }
         }
+    }
+
+    /// How long an explicit close waits for its reason to be written: the frame in flight and
+    /// then the reason, each bounded by the writer's send timeout, as the inline send was.
+    /// Never less than [`FINISH_TIMEOUT`]. Zero when whole (nothing to flush).
+    pub fn close_flush_timeout(&self) -> Duration {
+        let Self::Split(s) = self else {
+            return Duration::ZERO;
+        };
+        let send = Duration::from_millis(s.shared.send_timeout_ms.load(Ordering::Relaxed));
+        (send * 2).max(FINISH_TIMEOUT)
     }
 
     /// Ends a split session: no more sends, the writer writes what control holds (the close
@@ -981,6 +1033,35 @@ mod tests {
         let window = host.shared().unwrap().take_window();
         assert_eq!(window.audio_dropped, 1);
         assert_eq!(window.bulk_writes, 2);
+        host.finish(Some(writer), FINISH_TIMEOUT).await.unwrap();
+    }
+
+    // An rx message over DEMOTE_BYTES goes to bulk; the small rx message after it follows it
+    // there instead of overtaking it through control (a big clipboard, then a small one).
+    #[tokio::test]
+    async fn latency_split_rx_order_across_demotion() {
+        let (host, mut peer) = tcp_pair().await;
+        let mut host = SessionIo::new(host);
+        let (_video_tx, video_rx) = mpsc::unbounded_channel();
+        let (h, _) = hooks();
+        let writer = host.split(video_rx, h).map_err(|(_, why)| why).unwrap();
+        let mut misc = Misc::new();
+        misc.set_chat_message(ChatMessage {
+            text: format!("1:{}", "x".repeat(DEMOTE_BYTES + 1)),
+            ..Default::default()
+        });
+        let mut big = Message::new();
+        big.set_misc(misc);
+        // Queued before the writer runs (current-thread runtime: it runs at the next await).
+        host.send_shared(Instant::now(), Arc::new(big)).await.unwrap();
+        host.send_shared(Instant::now(), Arc::new(msg(2))).await.unwrap();
+        assert_eq!(next_time(&mut peer).await, 1);
+        assert_eq!(next_time(&mut peer).await, 2, "rx order kept");
+        let sh = host.shared().unwrap();
+        assert_eq!(sh.rx_in_bulk.load(Ordering::Relaxed), 0);
+        host.send_shared(Instant::now(), Arc::new(msg(3))).await.unwrap();
+        assert_eq!(next_time(&mut peer).await, 3);
+        assert_eq!(sh.take_window().bulk_writes, 2, "small rx back in control once drained");
         host.finish(Some(writer), FINISH_TIMEOUT).await.unwrap();
     }
 

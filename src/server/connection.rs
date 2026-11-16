@@ -528,11 +528,15 @@ async fn wait_room(shared: &Option<Arc<crate::session_io::Shared>>) {
     }
 }
 
-// Closes that the user or the connection manager asked for: not held against split.
+// Closes that the user or the connection manager asked for: not held against split. Empty:
+// `on_message` ended the session without `on_close` (the viewer picked another Windows
+// session); transport and writer failures always set a reason.
 fn is_user_close(reason: &str) -> bool {
     matches!(
         reason,
-        "Peer close"
+        ""
+            | "Peer close"
+            | "switch sides"
             | "connection manager"
             | "connection manager window closed"
             | "web console"
@@ -5602,10 +5606,10 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(msg_out).await;
-        // Split: on the wire before `on_close` (which may lock the screen), as it was inline.
-        self.stream
-            .flush(crate::session_io::FINISH_TIMEOUT)
-            .await;
+        // Split: on the wire before `on_close` (which may lock the screen), as it was inline:
+        // bounded by the send timeout, not cut short behind a slow frame write.
+        let flush_timeout = self.stream.close_flush_timeout();
+        self.stream.flush(flush_timeout).await;
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
     }
 

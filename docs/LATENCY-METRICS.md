@@ -109,7 +109,7 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 | `send_slow` | this connection's video frame writes over 16 ms |
 | `frames` | video frames this connection wrote in the window |
 | `io` | `whole`: the select loop writes everything itself (today's path). `split`: the session stream is split (`enable-split-session-io`, see "Host: split session I/O" below). Split, the loop has no `video` branch: `busy` no longer contains video writes, and `send`/`send_slow`/`frames` come from the writer task (same start and end points: serialization, encryption, the write). |
-| `ctrlq` | split only: how long control messages (replies, TestDelay, audio, cursor, clipboard, PeerInfo) waited in the writer's queue before their write started, p50/p95/max ms. This is the head-of-line wait behind an in-flight frame that remains on the host. `n/a` when whole. |
+| `ctrlq` | split only: how long control messages (replies, TestDelay, audio, cursor, clipboard, PeerInfo) waited in the writer's control queue before their write started (from entering that queue, not from the rx service channel), p50/p95/max ms. This is the head-of-line wait behind an in-flight frame that remains on the host. `n/a` when whole. |
 | `qmax_kb` | split only: the most bytes control and bulk held at once in the window |
 | `adrop` | split only: audio frames the writer dropped because they were older than 1 s when it took them (whole: the loop drops them, uncounted) |
 | `bulk_n` | split only: bulk writes in the window (CM raw messages, file-clipboard messages, file read-job blocks, rx messages over 256 KB) |
@@ -192,14 +192,15 @@ The writer takes, in this order: the control queue (every reply, the whole rx se
 audio, cursor, clipboard, PeerInfo; TestDelay; the close reason), the video channel (frames and
 SwitchDisplay, "fetched" at dequeue as before, unless the web client acks frames), then the
 bulk queue (CM raw messages, file-clipboard messages, file read-job blocks, rx messages over
-256 KB). Bulk gets a write at least after every 4 video writes. Audio older than 1 s when the
-writer takes it is dropped. File reads pause while bulk holds 512 KB, and the reader pauses
+256 KB; the rx messages after one follow it to bulk while it is queued, so rx order holds). Bulk gets a write at least after every 4 video writes. Audio older than 1 s when the
+writer takes it is dropped (from control or bulk). File reads pause while bulk holds 512 KB, and the reader pauses
 while control and bulk hold 16 MB (the backpressure the inline write gave); the writer wakes
 the loop when it takes something off. The send timeout is the writer's. When the writer ends
 for any reason (write error, send timeout, panic) the session closes, and the capture loop is
 told not to wait for this connection's fetch. A writer with work and no progress for the
 send timeout + 5 s is closed by a watchdog. A close reason is on the wire before `on_close`
-(flush, at most 1.5 s), and at the end the writer drains control (1.5 s, then aborted).
+(flush, at most twice the send timeout: the frame in flight, then the reason; it stops early
+when the writer ends), and at the end the writer drains control (1.5 s, then aborted).
 
 ```
 SPLIT host conn=5 via=Intranet carried=1
@@ -215,8 +216,9 @@ SPLIT host: 2 split sessions ended early, enable-split-session-io is off until t
 | `ended` | `lived`: time since the split; `reason`: the first close reason; `failure`: writer panic or watchdog; `aborted`: the writer did not drain in 1.5 s; `counted`: held against split |
 
 Sticky fallback: a split session counts when it ends in under 60 s for any reason other than
-the user or the CM closing it (`Peer close`, `connection manager`, `web console`,
-`auto disconnect`, `stop service`), and always on a writer panic or a watchdog trip. Two counts
+the user or the CM closing it (`Peer close`, `switch sides`, `connection manager`,
+`web console`, `auto disconnect`, `stop service`, or an empty reason: the viewer picked another
+Windows session), and always on a writer panic or a watchdog trip. Two counts
 turn split off until the service restarts; a split session that lasted over 5 minutes clears
 the count. The way back without a working remote session: a terminal or file-transfer session
 (never split) running `rustdesk.exe --option enable-split-session-io N`.
