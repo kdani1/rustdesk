@@ -60,6 +60,9 @@ pub(super) struct KeyRefresh {
     // no new image since. A further refresh then restarts capture: the viewer's Refresh is also
     // how a user recovers a stalled capturer, which the kept image cannot show.
     kept_served: Option<Instant>,
+    // The requested key frame is for connections dropping to one (primary viewer rule, roadmap
+    // M18), not for a viewer's refresh: it does not count toward escalation.
+    lag_only: bool,
 }
 
 impl KeyRefresh {
@@ -84,6 +87,8 @@ impl KeyRefresh {
             }
         }
         if self.requested.is_some() || self.deferred {
+            // A viewer's refresh served by this key frame counts as one.
+            self.lag_only = false;
             return RefreshAction::Merged;
         }
         if let Some(last) = self.last_key.filter(|_| self.supported) {
@@ -114,6 +119,26 @@ impl KeyRefresh {
     pub(super) fn on_requested(&mut self, now: Instant) {
         self.requested = Some(now);
         self.supported = true;
+        self.lag_only = false;
+    }
+
+    /// Primary viewer rule (roadmap M18): connections drop frames until a key frame. Whether to
+    /// ask the encoder for one now: not while one is requested or deferred, nor within the
+    /// minimum key interval after the last one (the caller asks again later).
+    pub(super) fn on_lag_key(&self, now: Instant) -> bool {
+        if self.requested.is_some() || self.deferred {
+            return false;
+        }
+        !self
+            .last_key
+            .is_some_and(|last| now.saturating_duration_since(last) < MIN_KEY_INTERVAL)
+    }
+
+    /// The encoder accepted the key frame request of `on_lag_key`.
+    pub(super) fn on_lag_requested(&mut self, now: Instant) {
+        self.requested = Some(now);
+        self.supported = true;
+        self.lag_only = true;
     }
 
     pub(super) fn pending(&self) -> bool {
@@ -122,7 +147,8 @@ impl KeyRefresh {
 
     /// An encoded message (`kept`: encoded from the kept image, not from a captured one). While
     /// a key frame is requested it has to be one: Err with the `SWITCH` reason otherwise.
-    /// Ok(true): this message is the requested key frame.
+    /// Ok(true): this message is the requested key frame of a viewer's refresh (Ok(false) for
+    /// one requested only by `on_lag_requested`).
     pub(super) fn on_encoded(
         &mut self,
         encoded: Encoded,
@@ -143,6 +169,10 @@ impl KeyRefresh {
             return Err("refresh_no_key");
         }
         self.requested = None;
+        if std::mem::take(&mut self.lag_only) {
+            // Not a refresh: not counted as one served.
+            return Ok(false);
+        }
         self.served.push_back(now);
         if kept {
             self.kept_served = Some(now);
@@ -259,6 +289,37 @@ impl StaticRefine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_primary_lag_key_does_not_count_as_refresh() {
+        let t = Instant::now();
+        let mut r = KeyRefresh::default();
+        assert!(r.on_lag_key(t));
+        r.on_lag_requested(t);
+        assert!(r.pending());
+        // While it is requested no other lag key is asked for.
+        assert!(!r.on_lag_key(ms(t, 5)));
+        assert_eq!(r.on_encoded(KEY, ms(t, 16), false), Ok(false));
+        // Right after a key frame: wait for the minimum interval.
+        assert!(!r.on_lag_key(ms(t, 100)));
+        assert!(r.on_lag_key(ms(t, 300)));
+        // Lag keys never escalate a later refresh.
+        for i in 0..ESCALATE_COUNT as u64 {
+            let at = ms(t, 400 + i * 300);
+            r.on_lag_requested(at);
+            assert_eq!(r.on_encoded(KEY, ms(at, 16), true), Ok(false));
+        }
+        assert_eq!(r.on_refresh(ms(t, 1500)), RefreshAction::Request);
+    }
+
+    #[test]
+    fn latency_primary_refresh_merged_into_lag_key_counts() {
+        let t = Instant::now();
+        let mut r = KeyRefresh::default();
+        r.on_lag_requested(t);
+        assert_eq!(r.on_refresh(ms(t, 2)), RefreshAction::Merged);
+        assert_eq!(r.on_encoded(KEY, ms(t, 16), false), Ok(true));
+    }
 
     const KEY: Encoded = Encoded {
         key: true,

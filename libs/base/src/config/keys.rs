@@ -346,6 +346,17 @@ pub const OPTION_ENABLE_FAST_ABR_SHADOW: &str = "enable-fast-abr-shadow";
 // nothing. Read every second; "N" or empty hands the bitrate back within a second. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_FAST_ABR: &str = "enable-fast-abr";
+// Windows host, server option (Config): the "primary viewer" rule for several viewers of one
+// stream (roadmap M18). "Y" turns it on; anything else (default) keeps the minimum over all
+// viewers. Primary viewers are those with control (keyboard permission on a remote-control
+// session) and input within the last 30 s, or all viewers when none has. Only they set the
+// stream's fps, bitrate and quality; a lowered custom_fps (stock viewers halve it under load)
+// counts as at least min(the viewer's login custom_fps, 24). A non-primary viewer that keeps
+// falling behind (2 s; 5 s clean to leave) is LAGGING: the capture loop waits at most one frame
+// period for it, and with 3 frames unwritten its frames are dropped up to the next key frame,
+// which is forced at most once per 3 s per display (M13 forced key frames). Stock viewers need
+// nothing. Read every second. See docs/LATENCY-METRICS.md ("PRIMARY").
+pub const OPTION_ENABLE_PRIMARY_VIEWER_RULE: &str = "enable-primary-viewer-rule";
 // Host and viewer, server option (Config), empty by default: KCP send window in segments
 // (32..1024; KCP's turbo profile uses 1024). Bounds the queue KCP keeps in front of the link to
 // about 2 x N segments (the endpoint stops taking data above that) instead of about 2048. Applies

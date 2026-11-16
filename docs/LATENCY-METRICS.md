@@ -556,8 +556,8 @@ What changes with `Y` (`src/server/video_qos.rs` `on_fast`, `src/server/video_qo
   full-rate seconds), so the estimator still converts in measured units, only slower after an
   fps change.
 - **Several viewers.** Each connection runs its own estimator; the stream takes the lowest
-  target ("min"). The "primary" policy (a slow non-controlling viewer does not hold the
-  stream) is roadmap M18.
+  target ("min"). With `enable-primary-viewer-rule=Y` only the primary viewers' targets count
+  (refused `secondary`); see "Host: several viewers, primary viewer rule (roadmap M18)".
 
 Cost: a report locks `VIDEO_QOS` once per decision (at most every 50 ms per connection, in
 practice a few per second) and once per second; nothing per frame.
@@ -573,7 +573,7 @@ LATENCY fast conn=5 mode=live live=on elig=yes state=N … stream_kbps=6801 … 
 | Line / field | Meaning |
 |---|---|
 | `FASTABR live conn= mode` / `FASTABR shadow conn= mode` | the option changed between shadow and live for this connection |
-| `FASTABR live kind=… ratio=a->b` | the decision line (same fields as in shadow, same 2 s limit) with what the stream did: `ratio=` the ratio before and after, `refused=` why nothing changed (`lower`, `floor`, `min`, `spacing`, `delay`, `epoch`, `displays`, `vbr`, `br`, `user`) |
+| `FASTABR live kind=… ratio=a->b` | the decision line (same fields as in shadow, same 2 s limit) with what the stream did: `ratio=` the ratio before and after, `refused=` why nothing changed (`lower`, `floor`, `min`, `spacing`, `delay`, `epoch`, `displays`, `vbr`, `br`, `user`, `secondary`: not a primary viewer, M18) |
 | `FASTABR applied` | `check_qos` gave a fast cut to the encoder: `ratio`, the encoder's `kbps`, `reaction_ms` from the queue first passing `T_hi` (as `react_ms`) to here, the roadmap's reaction time (gate: 120-200 ms). At most one line per second; `unlogged` counts the cuts since the last line |
 | `FASTABR backstop cut` | the TestDelay loop cut while a connection is fast (outside the 2 s after a fast cut) |
 | `mode` | `live` or `shadow` (in the `LATENCY fast` line) |
@@ -596,6 +596,106 @@ session: `reaction_ms`, peak `wait`/`send` and recovery time improve; on Wi-Fi, 
 no more than in shadow mode.
 
 Rollback: `enable-fast-abr` empty or `N` (shadow again), or also `enable-fast-abr-shadow N`.
+
+### Host: several viewers, primary viewer rule (roadmap M18)
+
+Server option `enable-primary-viewer-rule`: Windows hosts, off unless `Y` (other platforms
+ignore it). Read once per second by the QoS tick (`VideoQoS::tick_primary`, run from each
+capture loop's per-second `update_display_data`); `N` or empty restores the "min over all
+viewers" rule within a second. Stock viewers need nothing: the rule uses only what the host
+already sees (their input, their writes, their TestDelay replies). Code:
+`src/server/video_qos/primary.rs` (gate, policy), `src/server/video_qos.rs` (`apply_primary`
+and the filters below), `src/server/video_service.rs` (wait, key frames),
+`src/server/key_refresh.rs` (`on_lag_key`), `src/server/connection.rs` (gate, input, control).
+
+- **Primary set**, every second: the connections with control (keyboard permission on a
+  remote-control session: not view-only, not camera) whose viewer sent mouse, key or touch
+  input the host took within the last 30 s. When none qualifies, every connection is primary
+  and the rule changes nothing but the fps floor below. A new connection is not primary while
+  another one is primary by input (its first second's start-up guard does not hold the
+  stream at 15 fps).
+- **What only primary viewers steer:** the stream's fps (the minimum of their delay-driven fps,
+  their start-up guard) and fps cap (their `custom_fps` / `auto_adjust_fps`); the TestDelay
+  ratio loop (their delay and confirmed reductions; a secondary viewer's reply never triggers
+  a cut); fast mode (M16) cuts and increases (a secondary viewer's estimator is refused
+  `secondary`, and its target does not bound increases); the quality: the latest image-quality
+  choice among the primary viewers (a secondary viewer's choice applies only when no primary
+  viewer made one; when the primary set changes the quality, the ratio jumps to it as on a
+  quality choice). A secondary viewer's own fps cap is not enforced per connection: it gets
+  the stream's frames, bounded by the LAGGING queue below.
+- **Fps floor for viewer requests** (roadmap open question 5; the same floor as the viewer's
+  gentle fps control, M5): while the rule is on, a `custom_fps` lower than the one the viewer
+  logged in with (stock viewers halve it under decode load) counts as at least min(login
+  value, 24). This protects the other viewers from a loaded stock viewer even when it is
+  primary, at the cost of sending that viewer more frames than it decodes. A user who lowers
+  the fps on a stock viewer mid-session gets the same floor. `auto_adjust_fps` (a fork
+  viewer's decode limit with `enable-fps-cap-split`) is taken as it is.
+- **LAGGING**, only while someone is primary by input, only for secondary connections: a
+  second counts as behind when the connection's video queue reached 3 unwritten frames of a
+  display at some enqueue, it dropped frames, its TestDelay probe has been out past 2 s, its
+  replies confirm a queue (the same confirmation that cuts the bitrate for a primary viewer),
+  or its fast estimator's target is below 0.6 x the stream's. 2 behind seconds in a row make
+  it LAGGING; 5 clean seconds in a row end it.
+- **Left behind.** The capture loop waits for a LAGGING connection's fetch of a frame at most
+  one frame period (`wait_done`: it waits as before for everyone else, then gives the LAGGING
+  ones the rest of `spf`), so one slow viewer no longer holds capture for up to 3 s.
+- **Bounded queue, drop to key frame** (`VideoGate::on_enqueue`, on the capture thread): when a
+  frame of a display is enqueued for a LAGGING connection that still has 3 unwritten frames of
+  that display, that frame and every following delta frame of the display are dropped for
+  this connection until a key frame, which passes and ends the run. A dropped frame counts as
+  fetched at once. Works with and without split session I/O (M12): the count drops when the
+  frame is written, by the connection loop or the writer task.
+- **Key frames.** While any connection drops to a key frame of a display, its capture loop
+  forces one (M13 forced key frame, kept image on a static screen) at most once per 3 s
+  (`LAG_KEY_INTERVAL`), and not within 200 ms after another key frame or while one is
+  requested. This works without `enable-refresh-keyframe` (which governs viewer refreshes
+  only); these key frames do not count toward that option's escalation to `SWITCH`, nor as
+  refresh key frames in the `LATENCY` counters. An encoder that refuses a forced key frame is
+  restarted once (`SWITCH` reason `lag_key_unsupported`; its first frame is a key frame) and
+  that display stops dropping and leaving LAGGING connections behind until the host process
+  restarts. The shared encoder means every viewer of the display gets these key frames.
+- **Displays.** A gate tracks displays 0-7; frames of higher display indexes are never dropped
+  and their LAGGING connections are waited for as before.
+
+Cost with the rule off: per video frame and connection one atomic flag test plus one atomic
+add and max (queue count) on the capture thread and one atomic subtract after the write; per
+input event one `Instant::now` and an atomic store; once a second a `Config` read. With the
+rule on, also once a second a lock of the gate registry; per frame a check of the LAGGING set
+(a copy is refreshed only when it changes). The key flag of a frame is only looked at for a
+LAGGING or dropping connection.
+
+```
+PRIMARY rule=on primary=[5] secondary=[7] lagging=[] fps=60 ratio=0.670 quality=Balanced
+PRIMARY rule=on primary=[5] secondary=[7] lagging=[7] fps=60 ratio=0.670 quality=Balanced
+PRIMARY key display=0 dropping=1
+PRIMARY drops conn=7 frames=212 runs=4 peak_queue=3 lagging=true
+PRIMARY rule=off fps=30 ratio=0.670 quality=Balanced
+PRIMARY display=0 encoder has no forced key frame: lagging viewers are no longer dropped to key frames
+```
+
+| Line / field | Meaning |
+|---|---|
+| `PRIMARY rule=` | logged when the rule, the primary set or the LAGGING set changes (always, not gated by `enable-latency-log`) |
+| `primary=` / `secondary=` | connection ids that steer the stream / that do not |
+| `lagging=` | the LAGGING connections (left behind by the capture loop, dropped to key frames) |
+| `fps` / `ratio` / `quality` | the stream's fps, bitrate ratio and quality after the change |
+| `PRIMARY key display= dropping=` | the capture loop forced a key frame for connections dropping to one; `dropping` how many wait for it (at most one line per 3 s per display) |
+| `PRIMARY drops conn=` | at most every 10 s, per secondary connection that dropped frames since the last line: `frames` dropped, `runs` drop-to-key runs started, `peak_queue` the highest number of unwritten frames seen at an enqueue, `lagging` its state now |
+| `PRIMARY display= encoder has no forced key frame` | warning, once per display: no drop-to-key there any more |
+
+Tests (`cargo test latency_primary`): the gate (drop run to the next key frame, key frames pass
+a full queue, no drop unless LAGGING, counts released when a connection goes, no underflow),
+the primary set, the wait's one-frame grace, LAGGING hysteresis, the fps floor; `VideoQoS`
+with a primary and a secondary viewer (the secondary's delay and cap do not lower the fps, its
+delay does not cut the ratio, its quality choice waits, its fast cut is refused, a new viewer
+is not primary, rule off keeps the minimum); lag key frames never escalate a refresh.
+
+Gate (roadmap M18): Dell (fork, controlling) and Quest (stock) at the same time, only the
+Quest's path throttled (`New-NetQosPolicy ... -IPDstPrefixMatchCondition <Quest IP>`): the
+Dell's fps and `total_to_ui` must not change with the rule on; the Quest's key frames at most
+one per 3 s (`PRIMARY key` lines, Quest `LATENCY` key counts).
+
+Rollback: `enable-primary-viewer-rule` empty or `N`.
 
 ### Host and viewer: KCP send window (roadmap M15)
 

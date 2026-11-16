@@ -828,6 +828,12 @@ fn run(vs: VideoService) -> ResultType<()> {
     let dxgi_wait_margin =
         deadline_pacing && vs.source.is_monitor() && !last_portable_service_running;
     let mut next_tick = Instant::now();
+    // Primary viewer rule (roadmap M18): the LAGGING connections, and when this run last forced a
+    // key frame for connections dropping to one (the run's first frame is a key frame).
+    let mut lag_cache = super::video_qos::primary::LagCache::default();
+    let no_lagging = HashSet::new();
+    #[cfg(windows)]
+    let mut lag_key_at = Instant::now();
 
     while sp.ok() {
         #[cfg(windows)]
@@ -895,6 +901,26 @@ fn run(vs: VideoService) -> ResultType<()> {
             let now = Instant::now();
             if key_refresh.take_due(now) {
                 request_refresh_key(&mut encoder, &mut key_refresh)?;
+            }
+            // Primary viewer rule: connections dropping to a key frame get one, at most once per
+            // LAG_KEY_INTERVAL; never counted as a viewer's refresh.
+            if super::video_qos::primary::key_wanted(display_idx)
+                && now.saturating_duration_since(lag_key_at)
+                    >= super::video_qos::primary::LAG_KEY_INTERVAL
+                && key_refresh.on_lag_key(now)
+            {
+                lag_key_at = now;
+                if encoder.request_keyframe() {
+                    key_refresh.on_lag_requested(now);
+                    log::info!(
+                        "PRIMARY key display={} dropping={}",
+                        display_idx,
+                        super::video_qos::primary::dropping(display_idx)
+                    );
+                } else {
+                    super::video_qos::primary::set_key_unsupported(display_idx);
+                    bail_switch!("lag_key_unsupported");
+                }
             }
             if key_refresh.timed_out(now) {
                 log::warn!(
@@ -1159,9 +1185,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                             }
                         };
                         match key_refresh.on_encoded(encoded, now, true) {
-                            Ok(_) => {
+                            Ok(served) => {
                                 static_refine.on_kept_key();
-                                if !send_conn_ids.is_empty() {
+                                if served && !send_conn_ids.is_empty() {
                                     latency_stats.on_refresh_key_sent(true);
                                 }
                             }
@@ -1275,16 +1301,34 @@ fn run(vs: VideoService) -> ResultType<()> {
         let stall_slice = super::video_qos::fast::stall_slice(spf);
         let stall_after = super::video_qos::fast::stall_threshold(spf);
         let slice_millis = stall_slice.map_or(300, |d| d.as_millis() as u64);
+        // Primary viewer rule: LAGGING connections are waited for one frame period at most,
+        // where their frames can be dropped to a key frame.
+        let lagging = if super::video_qos::primary::key_on_demand(display_idx) {
+            lag_cache.get()
+        } else {
+            &no_lagging
+        };
+        let mut next_slice = slice_millis;
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, slice_millis);
+            frame_controller.try_wait_next(&mut fetched_conn_ids, next_slice);
             // break if all connections have received current frame
-            if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
+            let (done, grace_left) = super::video_qos::primary::wait_done(
+                &frame_controller.send_conn_ids,
+                &fetched_conn_ids,
+                lagging,
+                wait_begin.elapsed(),
+                spf,
+            );
+            if done {
                 break;
             }
+            next_slice = grace_left.map_or(slice_millis, |d| {
+                (d.as_millis() as u64).clamp(1, slice_millis)
+            });
             if stall_slice.is_some() {
                 let waited = wait_begin.elapsed();
                 if waited >= stall_after {

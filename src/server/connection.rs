@@ -242,6 +242,9 @@ pub struct ConnInner {
     id: i32,
     tx: Option<Sender>,
     tx_video: Option<Sender>,
+    // Primary viewer rule (roadmap M18): the queue and input state the capture thread, the
+    // video writer and the policy share; None for the viewer side's audio inner.
+    video_gate: Option<Arc<super::video_qos::primary::VideoGate>>,
 }
 
 struct InputMouse {
@@ -478,6 +481,8 @@ struct SplitHooks {
     // Fast bitrate estimator (enable-fast-abr-shadow / enable-fast-abr), fed by the writer's
     // video writes.
     fast_abr: Option<Arc<super::video_qos::fast::ConnFastAbr>>,
+    // Primary viewer rule: the connection's video queue count.
+    video_gate: Option<Arc<super::video_qos::primary::VideoGate>>,
 }
 
 impl crate::session_io::WriterHooks for SplitHooks {
@@ -498,6 +503,7 @@ impl crate::session_io::WriterHooks for SplitHooks {
     }
 
     fn video_sent(&mut self, msg: &Message, send: Duration) {
+        on_video_written(self.video_gate.as_ref(), msg);
         if let Some(f) = self.fast_abr.as_ref() {
             f.on_sent(msg);
         }
@@ -556,7 +562,38 @@ fn is_user_close(reason: &str) -> bool {
 
 impl ConnInner {
     pub fn new(id: i32, tx: Option<Sender>, tx_video: Option<Sender>) -> Self {
-        Self { id, tx, tx_video }
+        Self {
+            id,
+            tx,
+            tx_video,
+            video_gate: None,
+        }
+    }
+
+    // Primary viewer rule: input the host takes from this connection's viewer.
+    #[inline]
+    fn on_input(&self) {
+        if let Some(gate) = self.video_gate.as_ref() {
+            gate.on_input();
+        }
+    }
+
+    // A video frame left this connection's queue (written).
+    #[inline]
+    fn on_video_written(&self, msg: &Message) {
+        on_video_written(self.video_gate.as_ref(), msg);
+    }
+}
+
+#[inline]
+fn on_video_written(
+    gate: Option<&Arc<super::video_qos::primary::VideoGate>>,
+    msg: &Message,
+) {
+    if let Some(gate) = gate {
+        if let Some(display) = super::video_qos::primary::video_display(msg) {
+            gate.on_written(display);
+        }
     }
 }
 
@@ -577,6 +614,19 @@ impl Subscriber for ConnInner {
             },
             _ => false,
         };
+        if tx_by_video {
+            if let (Some(gate), Some(display)) = (
+                self.video_gate.as_ref(),
+                super::video_qos::primary::video_display(&msg),
+            ) {
+                // Primary viewer rule: a lagging connection's frames are dropped to a key frame.
+                if !gate.on_enqueue(display, || super::video_qos::primary::is_key(&msg)) {
+                    // Never queued: the capture loop must not wait for its fetch.
+                    video_service::notify_video_frame_fetched(display, self.id, None);
+                    return;
+                }
+            }
+        }
         let tx = if tx_by_video {
             self.tx_video.as_mut()
         } else {
@@ -659,6 +709,7 @@ impl Connection {
                 id,
                 tx: Some(tx),
                 tx_video: Some(tx_video),
+                video_gate: Some(super::video_qos::primary::register(id)),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             awaiting_2fa: false,
@@ -893,6 +944,7 @@ impl Connection {
                                 video_ack_required: conn.video_ack_required,
                                 sends: sends.clone(),
                                 fast_abr: fast_abr.clone(),
+                                video_gate: conn.inner.video_gate.clone(),
                             });
                             match conn.stream.split(video, hooks) {
                                 Ok(handle) => {
@@ -1300,6 +1352,7 @@ impl Connection {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
+                    conn.inner.on_video_written(&value);
                     let send = send_begin.elapsed();
                     if let Some(f) = fast_abr.as_ref() {
                         f.on_sent(&value);
@@ -1394,6 +1447,11 @@ impl Connection {
                     conn_stats.tick(conn.authorized);
                     if let Some(f) = fast_abr.as_ref() {
                         f.on_second();
+                    }
+                    // Primary viewer rule: control is keyboard permission on a remote-control
+                    // session (not view-only, not camera).
+                    if let Some(gate) = conn.inner.video_gate.as_ref() {
+                        gate.set_control(conn.is_authed_remote_conn() && conn.peer_keyboard_enabled());
                     }
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
@@ -3417,6 +3475,16 @@ impl Connection {
         } else if self.authorized {
             if self.port_forward_socket.is_some() {
                 return true;
+            }
+            // Primary viewer rule: input from a viewer with control marks it primary.
+            if matches!(
+                msg.union,
+                Some(message::Union::MouseEvent(_))
+                    | Some(message::Union::PointerDeviceEvent(_))
+                    | Some(message::Union::KeyEvent(_))
+            ) && self.peer_keyboard_enabled()
+            {
+                self.inner.on_input();
             }
             match msg.union {
                 #[allow(unused_mut)]
