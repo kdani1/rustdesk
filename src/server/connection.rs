@@ -6160,9 +6160,8 @@ impl Connection {
         };
         match lane.on_feedback(f) {
             Ok(Some(Repair::KeyFrame(display))) => self.refresh_video_display(Some(display)),
-            Ok(Some(Repair::Rfi { display, from_pts })) => {
-                crate::udp_video::rfi::request(display, from_pts)
-            }
+            // The lane already asked the capture loop (`rfi::request`).
+            Ok(Some(Repair::Rfi { .. })) => {}
             Ok(None) => {}
             Err(why) => self.udp_video_stop(&why, true).await,
         }

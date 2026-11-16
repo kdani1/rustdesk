@@ -82,9 +82,10 @@ pub struct VRamEncoder {
     same_bad_len_counter: usize,
     // Opened as FFmpeg nvenc with `nvenc-vbv-frames` > 0 (`small_vbv`).
     small_vbv: bool,
-    // M22: opened as the NV SDK driver for reference frame invalidation.
+    // M22: opened as the NV SDK driver with reference frame invalidation (`set_nv_rfi(true)`).
     nv_rfi: bool,
-    // M22: FFmpeg nvenc HEVC opened with `enable-nvenc-rfi=Y`: the NV SDK driver could replace it.
+    // M22: HEVC on NVIDIA opened without RFI with `enable-nvenc-rfi=Y`: a lane that wants RFI
+    // reopens it (`wants_rfi_encoder`).
     rfi_upgradable: bool,
     // The last encode gave a recovery point (`take_recovery_point`).
     recovery: bool,
@@ -117,17 +118,19 @@ impl EncoderApi for VRamEncoder {
                 };
                 let vbv_frames = crate::codec::nvenc_vbv_frames();
                 hwcodec::ffmpeg::set_nvenc_vbv_frames(vbv_frames);
-                // M22: NV SDK driver encoders keep their input and, for HEVC, have RFI.
-                let rfi_option = crate::codec::enable_nvenc_rfi();
-                hwcodec::vram::encode::set_nv_rfi(rfi_option);
-                let rfi_upgradable = rfi_option
-                    && config.feature.driver == Driver::FFMPEG
+                // M22: HEVC on NVIDIA with `enable-nvenc-rfi=Y`. While a lane wants RFI it opens as
+                // the NV SDK driver with RFI (`set_nv_rfi`: keeps its input, HEVC RFI): FFmpeg
+                // nvenc is replaced by it, an NV SDK driver encoder hwcodec picked itself gets it
+                // too. Without a lane every encoder opens as upstream.
+                let nv_hevc = crate::codec::enable_nvenc_rfi()
                     && config.feature.vendor == Driver::NV
                     && config.feature.data_format == DataFormat::H265;
+                let rfi_on = nv_hevc && rfi_wanted();
+                hwcodec::vram::encode::set_nv_rfi(rfi_on);
                 let mut ctx = ctx;
                 let mut nv_rfi = false;
                 let mut opened = None;
-                if rfi_upgradable && rfi_wanted() {
+                if rfi_on {
                     let mut nv_ctx = ctx.clone();
                     nv_ctx.f.driver = Driver::NV;
                     match Encoder::new(nv_ctx.clone()) {
@@ -142,8 +145,9 @@ impl EncoderApi for VRamEncoder {
                         }
                         Err(_) => {
                             NV_RFI_FAILED.store(true, Ordering::Relaxed);
+                            hwcodec::vram::encode::set_nv_rfi(false);
                             log::warn!(
-                                "vram encoder: the NV SDK driver failed to open, FFmpeg nvenc stays (no RFI in this process)"
+                                "vram encoder: the NV SDK driver failed to open with RFI, opened as before (no RFI in this process)"
                             );
                         }
                     }
@@ -166,7 +170,7 @@ impl EncoderApi for VRamEncoder {
                         same_bad_len_counter: 0,
                         small_vbv,
                         nv_rfi,
-                        rfi_upgradable: rfi_upgradable && !nv_rfi,
+                        rfi_upgradable: nv_hevc && !nv_rfi,
                         recovery: false,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
@@ -332,9 +336,10 @@ impl EncoderApi for VRamEncoder {
 
     fn disable(&self) {
         if self.nv_rfi {
-            // The NV SDK driver failed: back to FFmpeg nvenc for this process, hardware stays.
+            // The NV SDK driver with RFI failed: opened as before (FFmpeg nvenc or the NV SDK
+            // driver without RFI) for this process, hardware stays.
             NV_RFI_FAILED.store(true, Ordering::Relaxed);
-            log::warn!("vram encoder: the NV SDK driver failed, FFmpeg nvenc from the next start");
+            log::warn!("vram encoder: the NV SDK driver with RFI failed, no RFI from the next start");
             return;
         }
         HwCodecConfig::clear(true, true);

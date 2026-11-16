@@ -266,8 +266,8 @@ impl Drop for Fetched {
 pub enum Repair {
     /// A key frame (the refresh path: M13 forced key frame or a capture restart).
     KeyFrame(usize),
-    /// Reference frame invalidation from the frame with this pts on (M22); the capture loop
-    /// falls back to a key frame when its encoder cannot.
+    /// Reference frame invalidation from the frame with this pts on (M22), already asked of the
+    /// capture loop (`rfi::request`); it falls back to a key frame when its encoder cannot.
     Rfi { display: usize, from_pts: i64 },
 }
 
@@ -547,8 +547,9 @@ enum TapMode {
 
 /// M22, per live lane: the pts of the recent lane frames, and per display the pts of the first
 /// frame its viewer lost while it still waits for a key frame or a recovery point.
-#[derive(Default)]
 struct RfiTap {
+    /// This lane's id for its requests to the capture loops.
+    lane: u64,
     /// (display, lane frame id, pts), oldest first, at most `RFI_IDS`.
     sent: VecDeque<(u8, u32, i64)>,
     /// (display, pts of the first lost frame).
@@ -556,6 +557,14 @@ struct RfiTap {
 }
 
 impl RfiTap {
+    fn new() -> Self {
+        Self {
+            lane: rfi::new_lane(),
+            sent: VecDeque::new(),
+            pending: Vec::new(),
+        }
+    }
+
     /// A frame given to the lane. A key frame repairs every earlier loss of its display, so the
     /// frames before it are forgotten (also the pts of an earlier capture loop, which restarts
     /// with a key frame and pts from 0).
@@ -569,7 +578,9 @@ impl RfiTap {
         }
     }
 
-    /// The viewer lost frames of `display` from `frame_id` on: that frame's pts, now pending.
+    /// The viewer lost frames of `display` from `frame_id` on: that frame's pts, now pending and
+    /// asked of the capture loop (under the tap's lock, so `route` withdraws it when the wait
+    /// ends before the loop took it).
     fn on_loss(&mut self, display: u8, frame_id: u32) -> Option<i64> {
         let pts = self
             .sent
@@ -581,6 +592,7 @@ impl RfiTap {
             Some((_, p)) => *p = (*p).min(pts),
             None => self.pending.push((display, pts)),
         }
+        rfi::request(display as usize, self.lane, pts);
         Some(pts)
     }
 
@@ -594,7 +606,9 @@ impl RfiTap {
     /// pts it ended, to restore if the frame is not sent).
     fn route(&mut self, display: u8, pts: i64, key: bool) -> (u8, Option<i64>) {
         if key {
-            self.take_pending(display);
+            if self.take_pending(display).is_some() {
+                rfi::withdraw(display as usize, self.lane);
+            }
             return (FLAG_KEY, None);
         }
         let Some(first_lost) = self
@@ -608,15 +622,18 @@ impl RfiTap {
         match rfi::recovery_bound(display as usize, pts) {
             Some(bound) if bound <= first_lost => {
                 self.take_pending(display);
+                rfi::withdraw(display as usize, self.lane);
                 (FLAG_RECOVERY_POINT, Some(first_lost))
             }
             _ => (0, None),
         }
     }
 
+    /// A flagged frame was not sent: the wait goes on, and so does the request.
     fn restore(&mut self, display: u8, pts: i64) {
         if !self.pending.iter().any(|(d, _)| *d == display) {
             self.pending.push((display, pts));
+            rfi::request(display as usize, self.lane, pts);
         }
     }
 }
@@ -876,7 +893,7 @@ impl VideoTap {
                 lane_id,
                 ids: Vec::new(),
                 announced: false,
-                rfi: rfi.then(RfiTap::default),
+                rfi: rfi.then(RfiTap::new),
             };
             self.update_busy(&t);
         }
@@ -2249,9 +2266,10 @@ pub(crate) mod latency_tests {
         // A recovery frame of another lane's later loss (bound 104 > 103) is not ours.
         rfi::register(7, 105, 104);
         tap.route(&video(7, 105, false), now);
-        // Ours: references nothing from 103 on.
+        // Ours: references nothing from 103 on; the lane's request, not taken yet, is withdrawn.
         rfi::register(7, 106, 103);
         tap.route(&video(7, 106, false), now);
+        assert_eq!(rfi::take_request(7), None);
         // Only once: the wait has ended.
         rfi::register(7, 107, 100);
         tap.route(&video(7, 107, false), now);
@@ -2263,6 +2281,7 @@ pub(crate) mod latency_tests {
         // Frames before a key frame are forgotten: a loss among them gets a key frame.
         assert_eq!(tap.rfi_loss(7, 7), None);
         assert_eq!(tap.rfi_loss(7, 9), Some(109));
+        assert_eq!(rfi::take_request(7), Some(109));
         let flags: Vec<(Option<u32>, u8)> = rx.try_iter().map(|j| (j.frame_id, j.flags)).collect();
         assert_eq!(
             flags,

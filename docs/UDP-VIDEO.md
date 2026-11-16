@@ -664,8 +664,8 @@ a full vcpkg rebuild, roadmap "dropped"), so RFI runs on hwcodec's own NVENC SDK
 nv-codec-headers n12.1.14.0, which declares `nvEncInvalidateRefFrames` and
 `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`). Fork changes (docs/patches/README.md):
 
-- `nv_set_rfi(on)` before an encoder is opened (RustDesk sets it from the option at every
-  encoder creation): the encoder runs with preset P2 and ultra-low-latency tuning (FFmpeg
+- `nv_set_rfi(on)` before an encoder is opened (RustDesk sets it at every encoder creation:
+  on for HEVC on NVIDIA with the option while a lane wants RFI, else off): the encoder runs with preset P2 and ultra-low-latency tuning (FFmpeg
   nvenc's settings in RustDesk), logs the caps `SUPPORT_REF_PIC_INVALIDATION`,
   `SUPPORT_INTRA_REFRESH`, `SINGLE_SLICE_INTRA_REFRESH` and `SUPPORT_MULTIPLE_REF_FRAMES` of
   both codecs, and offers forced IDRs and `encode_last` (the single input buffer, zero output
@@ -685,14 +685,16 @@ nv-codec-headers n12.1.14.0, which declares `nvEncInvalidateRefFrames` and
   its references explicitly (RPS) and a decoder never misses the skipped pictures. H.264
   sessions keep key frames.
 
-RustDesk side (`libs/scrap/src/common/vram.rs`): an HEVC encoder that would be FFmpeg nvenc on
-an NVIDIA adapter is opened with the NV driver (same LUID) while a connection holds
-`RfiEncoderWanted` (from the offer of a lane with `rfi` until the lane ends). If the running
-encoder is FFmpeg nvenc when a lane starts wanting RFI, the capture loop restarts once
-(`reason=nv_rfi`). The NV driver is not taken from `HwCodecConfig` (the check process tests it
+RustDesk side (`libs/scrap/src/common/vram.rs`): an HEVC encoder on an NVIDIA adapter is
+opened with the NV driver and `nv_set_rfi(true)` (same LUID) while a connection holds
+`RfiEncoderWanted` (from the offer of a lane with `rfi` until the lane ends), whether
+`HwCodecConfig` picked FFmpeg nvenc or (FFmpeg failed for that adapter) the NV driver itself.
+Without such a lane every encoder opens as upstream, `nv_set_rfi(false)`. If the running
+HEVC encoder on NVIDIA was opened without RFI when a lane starts wanting it, the capture loop
+restarts once (`reason=nv_rfi`). The NV driver is not taken from `HwCodecConfig` (the check process tests it
 only when FFmpeg fails for that adapter), so its first open happens in the host process: a
-failing open or failing encodes (`disable`) set a process-wide flag and FFmpeg nvenc stays;
-hardware encoding is not disabled for it. The encoder stays NV after the lane ends until the
+failing open or failing encodes (`disable`) set a process-wide flag and the encoder opens as
+before (FFmpeg nvenc, or the NV driver without RFI); hardware encoding is not disabled for it. The encoder stays NV after the lane ends until the
 next encoder start. Not applied on the NV path: `nvenc-vbv-frames` and static refine (FFmpeg
 only); the M13 forced key frame and its kept-image path work (`request_keyframe` and
 `encode_last` are now supported by this driver when `nv_set_rfi` was on).
@@ -704,10 +706,13 @@ only); the M13 forced key frame and its kept-image path work (`request_keyframe`
 2. A lane with `rfi` maps `lost_from` (lane frame id) to the frame's pts: the tap remembers
    (display, id, pts) of the last 128 frames and forgets a display's frames before its newest
    key frame. Found: that pts becomes the display's pending first lost pts on this lane (the
-   minimum if one is pending) and the connection calls `rfi::request(display, pts)`. Not found:
-   a key frame through the refresh path as before.
+   minimum if one is pending) and the lane, under its tap's lock, calls
+   `rfi::request(display, lane, pts)`. Not found: a key frame through the refresh path as
+   before.
 3. The capture loop of that display takes the request (requests of several lanes merge to the
-   oldest pts; one atomic load per iteration when there is none) and calls
+   oldest pts; one atomic load per iteration when there is none; a request not taken within
+   1 s is dropped, e.g. when the viewer switched away and that display's capture loop stopped:
+   the viewer's repeated report asks again while it still waits) and calls
    `invalidate_refs(pts)`. Done: it remembers the bound (the oldest pts invalidated since the
    last recovery frame). Unsupported or too late: `OPTION_REFRESH`, i.e. the M13 forced key
    frame, or a capture restart without M13, exactly as a key frame request (`rfi_idr`).
@@ -720,7 +725,12 @@ only); the M13 forced key frame and its kept-image path work (`request_keyframe`
    F, all of which this viewer decoded (any frame it skipped before was either invalidated
    when it was repaired, or before an IDR). A recovery frame made for another viewer's later
    loss is not a recovery point here; this viewer waits for its own. A key frame clears the
-   pending pts too. A flagged frame dropped from the full queue puts the pending pts back.
+   pending pts too. A wait that ends this way withdraws the lane's request if the capture loop
+   has not taken it yet (`rfi::withdraw`): when two viewers lose the same burst, the first
+   one's recovery frame usually repairs the second's later lost frame too, and invalidating
+   again from that frame would find no valid reference left and force a key frame for every
+   viewer. If the capture loop took the second request first, that key frame still follows. A
+   flagged frame dropped from the full queue puts the pending pts and the request back.
 6. The viewer's receive thread already lifted its loss gate on `RECOVERY_POINT` (M19 wire
    format); since lane v5 the io_loop also resumes a broken display at such a frame (`rp`,
    `fix_ms`). The frame is a P frame: `EncodedVideoFrame.key` stays false, nothing changes on

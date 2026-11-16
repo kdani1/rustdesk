@@ -1259,6 +1259,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 log::warn!(
                                     "rfi: no recovery frame from the kept image ({e}), key frame instead"
                                 );
+                                latency_stats.on_rfi(false);
                                 rfi.clear();
                                 super::latency_stats::on_refresh_request(vs.source, display_idx);
                                 sp.set_option_bool(OPTION_REFRESH, true);

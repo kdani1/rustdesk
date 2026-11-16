@@ -364,9 +364,11 @@ pub const OPTION_UDP_VIDEO_FEC_ADAPTIVE: &str = "udp-video-fec-adaptive";
 // not possible (more than 4 frames since the loss, H.264, no NVENC support) a key frame repairs
 // it as before. Needs an NVIDIA GPU with the HEVC codec and a viewer of lane v5: while such a
 // lane is offered, HEVC on NVIDIA is encoded by the NV SDK driver of hwcodec (DPB 5, one
-// reference, forced IDRs and encode_last) instead of FFmpeg nvenc, switched at the next encoder
-// start or by a capture restart; a failing NV SDK driver goes back to FFmpeg for the process.
-// Read at each offer and when an encoder is created.
+// reference, forced IDRs and encode_last) instead of FFmpeg nvenc (an NV SDK driver encoder that
+// hwcodec picked itself gets the same settings), switched at the next encoder start or by a
+// capture restart; a failing NV SDK driver with RFI goes back to the encoder as before for the
+// process. Without such a lane every encoder opens as upstream. Read at each offer and when an
+// encoder is created.
 pub const OPTION_ENABLE_NVENC_RFI: &str = "enable-nvenc-rfi";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
