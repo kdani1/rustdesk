@@ -338,8 +338,8 @@ the pairing of the same 5 s):
 | Field | Meaning |
 |---|---|
 | `frames` | shadow frames completed |
-| `lost`, `frag_miss` | frames declared lost (a later frame completed 5 ms earlier, or 50 ms since its first fragment), and their missing fragments |
-| `dgrams` | datagrams received / expected from the lane seq span (pongs and HELLO_ACK share the seq, so a lost pong counts too) |
+| `lost`, `frag_miss` | frames declared lost (a later frame completed 5 ms earlier, or 500 ms since its first fragment: shadow frames are unpaced and share the link with the TCP copy, so a slow but complete frame is delivered and paired, not lost), and their missing fragments |
+| `dgrams` | datagrams received / expected from the lane seq span (pongs and HELLO_ACK share the seq, so a lost pong counts too; the host sends each datagram under the seal lock, so a pong never overtakes the frame it interrupts) |
 | `loss_pct` | `1 - received/expected`, in % |
 | `reorder` | datagrams that arrived after a higher seq / largest seq distance |
 | `dup`, `late`, `bad` | duplicate fragments, fragments of a frame already complete or lost, inconsistent fragments |
@@ -347,9 +347,9 @@ the pairing of the same 5 s):
 | `matched` | frames whose UDP and TCP copies met (by display and pts) |
 | `tcp_first` | of those, how many times TCP handled its copy before UDP completed its own |
 | `unpaired` | UDP copies that found no TCP copy within 2 s |
-| `ahead_net_ms` | p50/p95/max/min of t(TCP copy handled in the io_loop) - t(UDP copy complete on the receive thread). Positive: UDP first. Upper bound: it credits UDP with the io_loop's scheduling delay |
-| `ahead_app_ms` | the same against the time the io_loop's UDP branch handled the copy: both copies pay the loop's delay. The number the M20 decision uses |
-| `owd_var_ms` | p50/p95/max of the one-way delay above the window's minimum (receive time on the viewer's lane clock minus `send_us` of the host's lane clock; the clock offset cancels) |
+| `ahead_net_ms` | p50/p95/max/min of t(TCP copy returned by `peer.next()` in the io_loop, before its parse) - t(UDP copy complete on the receive thread). Positive: UDP first. Upper bound: it credits UDP with the io_loop's scheduling delay |
+| `ahead_app_ms` | the same against the entry of the io_loop's UDP branch for the copy: both copies pay the loop's delay and neither stamp includes a parse (the UDP copy is parsed for display and pts on the receive thread, so the io_loop does no full-frame parse for it). The number the M20 decision uses |
+| `owd_var_ms` | p50/p95/max of the one-way delay above the window's minimum: arrival of a frame's first fragment on the viewer's lane clock minus `send_us`, which the host stamps after serializing the frame, right before it seals and sends the first datagram (host lane clock; the clock offset cancels). One datagram's delay, independent of frame size; the burst of a big frame shows in `asm_ms` |
 | `asm_ms` | p50/p95/max first to last fragment of a frame |
 | `rtt_ms` | p50/p95/max of PING to PONG over the lane (200 ms interval) |
 | `pings` | sent / answered |

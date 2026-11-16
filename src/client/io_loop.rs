@@ -326,6 +326,9 @@ impl<T: InvokeUiSession> Remote<T> {
                                     }
                                     Ok(ref bytes) => {
                                         last_recv_time = Instant::now();
+                                        // The UDP lane stamps a TCP video copy here, before it
+                                        // is parsed, as it stamps a UDP copy before any parse.
+                                        self.udp_video.note_tcp_rx(last_recv_time.into_std());
                                         if !received {
                                             received = true;
                                             self.handler.update_received(true);

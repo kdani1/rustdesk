@@ -6,10 +6,14 @@
 //!   a socket bound to the session's own local TCP address (never the wildcard), connected to
 //!   the host's offered address, and one receive thread. The thread sends HELLO every 20 ms for
 //!   up to 1 s; on HELLO_ACK the io_loop sends READY over TCP. Then it pings every 200 ms,
-//!   reassembles shadow frames, and hands each complete one, stamped on the thread, through a
-//!   tokio mpsc to a `select!` branch of the io_loop, the path the live lane (M20) will use.
+//!   reassembles shadow frames, parses each complete one for its display and pts (on the
+//!   thread, so the io_loop does no full-frame parse for a copy it never shows) and hands it,
+//!   stamped, through a tokio mpsc to a `select!` branch of the io_loop, the path the live lane
+//!   (M20) will use.
 //! - The io_loop pairs UDP and TCP copies by pts ([`super::shadow::ShadowMatcher`]) and logs a
-//!   `UDPVIDEO viewer` line every 5 s. UDP copies are never decoded or shown.
+//!   `UDPVIDEO viewer` line every 5 s. UDP copies are never decoded or shown. Both copies are
+//!   stamped before any parse in the io_loop: the TCP copy when `peer.next()` returns it
+//!   ([`ViewerLane::note_tcp_rx`]), the UDP copy at the entry of its branch.
 //!
 //! Dropping the client (STOP from the host, a refused handshake, the end of the io_loop round)
 //! stops the thread within 100 ms and closes the socket.
@@ -47,6 +51,10 @@ const HELLO_FOR: Duration = Duration::from_secs(1);
 const PING_EVERY: Duration = Duration::from_millis(200);
 const WINDOW: Duration = Duration::from_secs(5);
 const RECV_BUF: usize = 2048;
+/// Shadow frames are unpaced and share the link with the full TCP copy, so a big frame can
+/// take well over the live lane's 50 ms to arrive whole. A slow but complete frame must still
+/// be delivered and paired (a late one shows as a negative ahead sample), not counted as lost.
+const SHADOW_FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The lane version to advertise in the login request, 0 for none.
 pub fn advertised_version(conn_type: ConnType) -> u32 {
@@ -62,9 +70,11 @@ pub fn enabled() -> bool {
     LocalConfig::get_option(keys::OPTION_ENABLE_UDP_VIDEO) != "N"
 }
 
-/// A complete shadow frame, stamped by the receive thread.
+/// A complete shadow frame, stamped and parsed by the receive thread.
 pub struct ShadowFrame {
     pub data: Vec<u8>,
+    /// (display, pts) of the video frame inside, if it parsed and has a pts.
+    pub key: Option<(i32, i64)>,
     pub completed_at: Instant,
 }
 
@@ -75,8 +85,10 @@ pub struct RecvWindow {
     pub loss: LossStats,
     pub drops: DropStats,
     pub rtt: Samples,
-    /// Receive time minus host send time of each frame's last fragment, both lane clocks: an
-    /// unknown constant plus the one-way delay. Only its variation is reported.
+    /// Arrival of each frame's first fragment minus the host's `send_us`, stamped right before
+    /// it sealed and sent the frame's first datagram, both lane clocks: an unknown constant
+    /// plus the one-way delay of one datagram, independent of frame size. Only its variation
+    /// is reported.
     pub transit: Samples,
     /// First to last fragment of a frame.
     pub assembly: Samples,
@@ -185,9 +197,10 @@ fn recv_loop(
     let _boost = crate::platform::windows::viewer_thread_boost("udp_video", None);
     let mut lane_tx = LaneSender::new(&secret, lane_id, Role::Viewer, PathClass::Lan);
     // Shadow frames are measured, never decoded: no gate after a loss, every complete frame
-    // counts.
+    // counts, also a slow one.
     let config = ReassemblyConfig {
         gate_after_loss: false,
+        frame_timeout: SHADOW_FRAME_TIMEOUT,
         ..Default::default()
     };
     let mut lane_rx = LaneReceiver::new(&secret, lane_id, Role::Viewer, config);
@@ -277,11 +290,15 @@ fn recv_loop(
         for ev in lane_rx.poll(Instant::now()) {
             if let Event::Frame(f) = ev {
                 win.transit
-                    .push(net::us_diff(clock.us(f.completed_at), f.send_us));
+                    .push(net::us_diff(clock.us(f.first_fragment_at), f.send_us));
                 win.assembly
                     .push_duration(f.completed_at.saturating_duration_since(f.first_fragment_at));
+                let key = parse_video(&f.data).and_then(|vf| {
+                    crate::client::latency::frame_pts(&vf).map(|pts| (vf.display, pts))
+                });
                 let frame = ShadowFrame {
                     data: f.data,
+                    key,
                     completed_at: f.completed_at,
                 };
                 if tx.send(ViewerEvent::Frame(frame)).is_err() {
@@ -332,6 +349,8 @@ pub struct ViewerLane {
     client: Option<UdpVideoClient>,
     matcher: ShadowMatcher,
     peer: String,
+    /// When `peer.next()` returned the TCP message being handled.
+    tcp_rx_at: Option<Instant>,
 }
 
 impl ViewerLane {
@@ -450,11 +469,10 @@ impl ViewerLane {
                 ))
             }
             ViewerEvent::Frame(f) => {
+                // Branch entry: the copy was parsed on the receive thread.
                 let app = Instant::now();
-                if let Some(vf) = parse_video(&f.data) {
-                    if let Some(pts) = crate::client::latency::frame_pts(&vf) {
-                        self.matcher.on_udp(vf.display, pts, f.completed_at, app);
-                    }
+                if let Some((display, pts)) = f.key {
+                    self.matcher.on_udp(display, pts, f.completed_at, app);
                 }
                 None
             }
@@ -465,12 +483,21 @@ impl ViewerLane {
         }
     }
 
-    /// The TCP copy of a frame, as the io_loop handles it. Only while a lane exists.
+    /// The time `peer.next()` returned the TCP message about to be parsed and handled.
+    #[inline]
+    pub fn note_tcp_rx(&mut self, at: Instant) {
+        self.tcp_rx_at = Some(at);
+    }
+
+    /// The TCP copy of a frame, as the io_loop handles it. Only while a lane exists. Stamped
+    /// with [`Self::note_tcp_rx`], taken before the message was parsed, like the UDP copy.
     #[inline]
     pub fn on_tcp_frame(&mut self, vf: &VideoFrame) {
+        let at = self.tcp_rx_at.take();
         if self.client.is_some() {
             if let Some(pts) = crate::client::latency::frame_pts(vf) {
-                self.matcher.on_tcp(vf.display, pts, Instant::now());
+                self.matcher
+                    .on_tcp(vf.display, pts, at.unwrap_or_else(Instant::now));
             }
         }
     }
@@ -608,6 +635,8 @@ mod latency_tests {
         let mut got = Vec::new();
         while got.len() < 3 {
             if let ViewerEvent::Frame(f) = next_event(&mut rx) {
+                // Parsed on the receive thread.
+                assert_eq!(f.key, Some((0, got.len() as i64 * 2000)));
                 got.push(Message::parse_from_bytes(&f.data).unwrap());
             }
         }

@@ -10,6 +10,11 @@
 //!   and sends its datagrams back to back (no pacing in shadow mode), and logs a
 //!   `UDPVIDEO host` line every 5 s.
 //!
+//! Both threads seal with one `LaneSender` and send each datagram while still holding its lock
+//! ([`seal_send`]), one datagram at a time: the wire order is then the seq order, so a PONG sent
+//! in the middle of a frame does not overtake the rest of the frame (which the viewer would count
+//! as reorder, and, past the 1024-seq replay window, as replayed and lost fragments).
+//!
 //! The connection's video path calls [`ShadowTap::offer`] with every video item before its TCP
 //! send. While no lane is active that is one relaxed atomic load. The tap never blocks: a full
 //! queue drops the copy (`qdrop`).
@@ -19,7 +24,7 @@
 
 use super::{
     crypto::{Role, SECRET_LEN},
-    fragment::FrameMeta,
+    fragment::{fragment, FrameMeta},
     lane::{LaneReceiver, LaneSender, Received},
     net::{self, LaneClock},
     packet::{Inner, PathClass, FLAG_KEY, FLAG_SHADOW},
@@ -30,6 +35,7 @@ use base::message_proto::{
 };
 use hbb_common::{log, protobuf::Message as _};
 use std::{
+    io,
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,6 +53,8 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// the video bitrate.
 pub const DEFAULT_SHADOW_EVERY: u32 = 2;
 const QUEUE: usize = 4;
+/// Shadow mode is offered on LAN paths only.
+const PATH: PathClass = PathClass::Lan;
 const LOG_EVERY: Duration = Duration::from_secs(5);
 
 /// What the connection knows about its transport when it starts, for the offer gate.
@@ -249,7 +257,7 @@ impl UdpVideoHost {
             &secret,
             lane_id,
             Role::Host,
-            PathClass::Lan,
+            PATH,
         )));
         let clock = LaneClock::new();
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(QUEUE);
@@ -282,7 +290,7 @@ impl UdpVideoHost {
             secret: secret.to_vec().into(),
             ip: net::ip_to_bytes(local).into(),
             port: port as u32,
-            max_datagram: PathClass::Lan.max_datagram() as u32,
+            max_datagram: PATH.max_datagram() as u32,
             shadow_every: every,
             ..Default::default()
         };
@@ -455,13 +463,22 @@ fn recv_loop(
                 continue;
             }
         };
-        let sealed = sender.lock().ok().and_then(|mut s| s.seal(&reply).ok());
-        if let Some(d) = sealed {
-            if let Err(e) = socket.send(&d) {
-                log::debug!("UDPVIDEO host conn={conn_id} reply send: {e}");
-            }
+        if let Err(e) = seal_send(sender, &reply, |d| socket.send(d)) {
+            log::debug!("UDPVIDEO host conn={conn_id} reply send: {e}");
         }
     }
+}
+
+/// Seals one datagram and sends it before letting go of the sender, so that the seq order of
+/// the two threads' datagrams is their wire order. Returns the bytes sent.
+fn seal_send(
+    sender: &Mutex<LaneSender>,
+    inner: &Inner,
+    send: impl FnOnce(&[u8]) -> io::Result<usize>,
+) -> Result<usize, String> {
+    let mut s = sender.lock().map_err(|_| "lane sender lock poisoned".to_owned())?;
+    let d = s.seal(inner).map_err(|e| format!("seal: {e:?}"))?;
+    send(&d).map_err(|e| e.to_string())
 }
 
 #[derive(Default)]
@@ -492,7 +509,7 @@ fn send_loop(
     let mut last_log = Instant::now();
     loop {
         match jobs.recv_timeout(Duration::from_secs(1)) {
-            Ok(job) => send_job(socket, sender, &mut ids, &mut w, job, clock),
+            Ok(job) => send_job(sender, &mut ids, &mut w, job, clock, |d| socket.send(d)),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -510,12 +527,12 @@ fn send_loop(
 }
 
 fn send_job(
-    socket: &UdpSocket,
     sender: &Mutex<LaneSender>,
     ids: &mut Vec<(u8, u32)>,
     w: &mut Window,
     job: Job,
     clock: LaneClock,
+    mut send: impl FnMut(&[u8]) -> io::Result<usize>,
 ) {
     let begin = Instant::now();
     w.lag.push_duration(begin.saturating_duration_since(job.queued));
@@ -538,34 +555,32 @@ fn send_job(
             0
         }
     };
+    // Stamped after serialization, right before the first datagram is sealed and sent: the
+    // viewer measures one-way delay from here to its first fragment's arrival.
     let meta = FrameMeta {
         frame_id: id,
         display: job.display,
         epoch: job.epoch,
         flags: job.flags,
-        send_us: clock.us(begin),
+        send_us: clock.now_us(),
     };
-    let dgrams = match sender.lock() {
-        Ok(mut s) => s.frame(&bytes, meta),
-        Err(_) => return,
-    };
-    let dgrams = match dgrams {
-        Ok(d) => d,
+    let parts = match fragment(&bytes, meta, PATH.max_fragment_payload()) {
+        Ok(p) => p,
         Err(e) => {
             w.errors += 1;
-            w.first_error.get_or_insert_with(|| format!("frame: {e:?}"));
+            w.first_error.get_or_insert_with(|| format!("fragment: {e:?}"));
             return;
         }
     };
-    for d in &dgrams {
-        match socket.send(d) {
-            Ok(_) => {
+    for (h, payload) in parts {
+        match seal_send(sender, &Inner::Video(h, payload), &mut send) {
+            Ok(n) => {
                 w.dgrams += 1;
-                w.bytes += d.len() as u64;
+                w.bytes += n as u64;
             }
             Err(e) => {
                 w.errors += 1;
-                w.first_error.get_or_insert_with(|| e.to_string());
+                w.first_error.get_or_insert(e);
             }
         }
     }
@@ -705,6 +720,79 @@ pub(crate) mod latency_tests {
         tap.deactivate();
         tap.offer(&video(0, 8, false));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A PONG sealed by the receive thread while the sender thread is in the middle of a frame
+    /// goes out between two of the frame's datagrams, never ahead of datagrams sealed before
+    /// it: the viewer sees no reorder, no loss and the whole frame, also for a frame longer than
+    /// the 1024-seq replay window.
+    #[test]
+    fn pong_mid_frame_keeps_seq_order() {
+        use crate::udp_video::{fragment::Event, lane::LaneReceiver};
+        use std::sync::Barrier;
+        let secret = [3u8; SECRET_LEN];
+        let sender = Arc::new(Mutex::new(LaneSender::new(&secret, 11, Role::Host, PATH)));
+        let wire = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let barrier = Arc::new(Barrier::new(2));
+        let pong = {
+            let (sender, wire, barrier) = (sender.clone(), wire.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                seal_send(&sender, &Inner::Pong { id: 1, echo_us: 2 }, |d| {
+                    wire.lock().unwrap().push(d.to_vec());
+                    Ok(d.len())
+                })
+                .unwrap();
+            })
+        };
+        // About 1.6 MB: more fragments than the replay window holds.
+        let msg = video(0, 1_600_000, true);
+        let bytes = msg.write_to_bytes().unwrap();
+        let job = Job {
+            msg,
+            display: 0,
+            epoch: 0,
+            flags: FLAG_SHADOW | FLAG_KEY,
+            queued: Instant::now(),
+        };
+        let (mut ids, mut w) = (Vec::new(), Window::default());
+        let mut n = 0usize;
+        send_job(&sender, &mut ids, &mut w, job, LaneClock::new(), |d| {
+            wire.lock().unwrap().push(d.to_vec());
+            n += 1;
+            if n == 10 {
+                // The ping arrives now: the receive thread wants the sender mid-frame.
+                barrier.wait();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(d.len())
+        });
+        pong.join().unwrap();
+        let wire = std::mem::take(&mut *wire.lock().unwrap());
+        assert!(wire.len() > 1100);
+        assert_eq!((w.errors, w.dgrams as usize), (0, wire.len() - 1));
+        let mut rx = LaneReceiver::new(&secret, 11, Role::Viewer, Default::default());
+        let now = Instant::now();
+        let mut pongs = 0;
+        for mut d in wire.iter().cloned() {
+            if let Received::Pong { .. } = rx.on_datagram(&mut d, now).unwrap() {
+                pongs += 1;
+            }
+        }
+        assert_eq!(pongs, 1);
+        let frames: Vec<_> = rx
+            .poll(now)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Frame(f) => Some(f.data),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![bytes]);
+        let (loss, drops) = rx.take_stats();
+        assert_eq!((loss.reorder_events, drops.replayed), (0, 0));
+        assert_eq!(loss.datagrams_expected, wire.len() as u64);
+        assert_eq!(loss.datagrams_received, wire.len() as u64);
     }
 
     #[test]

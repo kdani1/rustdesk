@@ -190,20 +190,26 @@ viewer logs `handshake failed ... (UDP from this viewer to the host, or back, is
 - The sender thread serializes the `Message{VideoFrame}` once, gives it the next lane frame id
   of its display (consecutive over what it actually sends, so a `qdrop` is not counted as loss
   by the viewer), sets `KEY` (any key frame in it) and `SHADOW`, stamps `send_us` on the lane
-  clock, seals all fragments and sends them back to back. **No pacing** in shadow mode (see
-  "Left out").
+  clock right before the first datagram, and seals and sends the fragments back to back.
+  **No pacing** in shadow mode (see "Left out").
 - The receive thread answers PING with PONG through the same `LaneSender` (a mutex: the seq
-  must stay unique per direction).
+  must stay unique per direction). Both threads seal and `send` one datagram per lock hold, so
+  the wire order is the seq order: a PONG sent mid-frame goes between two fragments and never
+  overtakes fragments sealed before it (otherwise the viewer would count reorder, and past the
+  1024-seq replay window drop the frame's tail as replayed).
 
 ### Viewer: measurement without bias
 
 - The receive thread (ABOVE_NORMAL with `enable-viewer-priority-boost`) reassembles with
-  `gate_after_loss` off (shadow frames are never decoded, so every complete one counts),
-  stamps each complete frame and sends it through a tokio mpsc to a `select!` branch of the
-  io_loop: the path M20 will deliver live frames on.
-- That branch parses the frame like a TCP message, takes its pts and stamps the time. The TCP
-  copy is stamped where `handle_msg_from_peer` takes a `VideoFrame`. Copies pair by (display,
-  pts), whichever comes first. `ahead_net` = t(TCP) - t(complete on the thread): the upper
+  `gate_after_loss` off (shadow frames are never decoded, so every complete one counts) and a
+  500 ms frame timeout instead of 50 ms (unpaced shadow bursts share the link with the TCP
+  copy; a slow but complete frame is paired, not lost), stamps each complete frame, parses it
+  for display and pts, and sends it through a tokio mpsc to a `select!` branch of the io_loop:
+  the path M20 will deliver live frames on.
+- That branch stamps the time at its entry. The TCP copy is stamped when `peer.next()` returns
+  it, before `handle_msg_from_peer` parses it, so neither stamp includes a parse and the
+  io_loop does no full-frame parse of UDP copies. Copies pair by (display, pts), whichever
+  comes first. `ahead_net` = t(TCP) - t(complete on the thread): the upper
   bound, it credits UDP with the io_loop's own scheduling delay. `ahead_app` = t(TCP) - t(UDP
   branch): both copies pay the same loop delay (the review's fix).
 - UDP copies are dropped after pairing; nothing reaches the decoder, the video queue or the
