@@ -78,6 +78,29 @@ const DXGI_RECOVERY_LIMIT: usize = 3;
 const DXGI_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const DXGI_RECOVERY_FRAME_GRACE: Duration = Duration::from_secs(2);
+// A new DXGI capturer that has produced no image for this long falls back to GDI. Upstream fell
+// back after 4 empty waits (~70 ms), which a fullscreen game switching display modes hits on
+// every switch, leaving the session on GDI (~36 ms per 1440p grab, ~25 fps) until a restart.
+#[cfg(windows)]
+const NO_IMAGE_GDI_AFTER: Duration = Duration::from_secs(2);
+// After a fallback to GDI (not forced by option or portable service), DXGI is tried again after
+// these delays, per display; a DXGI run that lasts `DXGI_RETRY_RESET_AFTER` resets the backoff.
+#[cfg(windows)]
+const DXGI_RETRY_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+#[cfg(windows)]
+const DXGI_RETRY_RESET_AFTER: Duration = Duration::from_secs(30);
+
+// display name -> index into `DXGI_RETRY_BACKOFF`.
+#[cfg(windows)]
+fn dxgi_retry_level() -> &'static Mutex<HashMap<String, usize>> {
+    static LEVEL: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    LEVEL.get_or_init(Default::default)
+}
 
 #[cfg(windows)]
 struct DxgiRecoveryState {
@@ -737,6 +760,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut try_gdi = 1;
     #[cfg(windows)]
     log::info!("gdi: {}", c.is_gdi());
+    // When this run fell back from DXGI to GDI (`set_gdi` below or the recovery fallback above),
+    // for the periodic DXGI retry. Not for GDI forced by option or the portable service.
+    #[cfg(windows)]
+    let dxgi_retry = !last_portable_service_running
+        && scrap::codec::enable_directx_capture()
+        && Config::get_option(base::config::keys::OPTION_ENABLE_DXGI_RETRY) != "N";
+    #[cfg(windows)]
+    let mut gdi_fallback_at: Option<Instant> = (dxgi_retry && c.is_gdi()).then(Instant::now);
+    #[cfg(windows)]
+    let mut dxgi_retry_reset = false;
     #[cfg(windows)]
     start_uac_elevation_check();
 
@@ -804,6 +837,24 @@ fn run(vs: VideoService) -> ResultType<()> {
         if Encoder::use_i444(&encoder_cfg) != use_i444 {
             log::info!("switch due to i444 changed");
             bail_switch!("i444");
+        }
+        #[cfg(windows)]
+        if let Some(at) = gdi_fallback_at {
+            let level = *dxgi_retry_level().lock().unwrap().get(sp.name().as_str()).unwrap_or(&0);
+            let delay = DXGI_RETRY_BACKOFF[level.min(DXGI_RETRY_BACKOFF.len() - 1)];
+            if at.elapsed() >= delay {
+                dxgi_retry_level()
+                    .lock()
+                    .unwrap()
+                    .insert(sp.name(), (level + 1).min(DXGI_RETRY_BACKOFF.len() - 1));
+                #[cfg(feature = "vram")]
+                VRamEncoder::set_fallback_gdi(sp.name(), false);
+                log::info!("gdi for {:?}, retry dxgi (level {level})", at.elapsed());
+                bail_switch!("gdi_retry_dxgi");
+            }
+        } else if !dxgi_retry_reset && !c.is_gdi() && start.elapsed() >= DXGI_RETRY_RESET_AFTER {
+            dxgi_retry_reset = true;
+            dxgi_retry_level().lock().unwrap().remove(sp.name().as_str());
         }
         #[cfg(all(windows, feature = "vram"))]
         if c.is_gdi() && encoder.input_texture() {
@@ -944,12 +995,18 @@ fn run(vs: VideoService) -> ResultType<()> {
                     .unwrap_or(true)
                 {
                     if try_gdi > 0 && !c.is_gdi() {
-                        if try_gdi > 3 {
+                        // With `dxgi_retry` (default), wait `NO_IMAGE_GDI_AFTER` for the first
+                        // image; without it, upstream's 4 empty waits.
+                        if try_gdi > 3 && (!dxgi_retry || start.elapsed() >= NO_IMAGE_GDI_AFTER) {
                             c.set_gdi();
                             try_gdi = 0;
-                            log::info!("No image, fall back to gdi");
+                            if dxgi_retry {
+                                gdi_fallback_at = Some(Instant::now());
+                            }
+                            log::info!("No image for {:?}, fall back to gdi", start.elapsed());
+                        } else {
+                            try_gdi += 1;
                         }
-                        try_gdi += 1;
                     }
                 }
                 #[cfg(target_os = "linux")]
@@ -1020,6 +1077,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                         dxgi_recovery_state.lock().unwrap().take_fallback_pending();
                     }
                     c.set_gdi();
+                    if dxgi_retry {
+                        gdi_fallback_at = Some(Instant::now());
+                    }
                     log::info!("dxgi error, fall back to gdi: {:?}", err);
                     continue;
                 }

@@ -209,6 +209,12 @@ pub const OPTION_ENABLE_LAN_QOS: &str = "enable-lan-qos";
 // the period truncated to ms. A change applies from the next capture restart. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_CAPTURE_DEADLINE_PACING: &str = "enable-capture-deadline-pacing";
+// Windows host, server option (Config), default on: "N" restores upstream's GDI fallback. A new
+// DXGI capturer gets 2 s (not 4 empty waits) for its first image before falling back to GDI, and
+// after a fallback to GDI the capturer tries DXGI again after 3 s, 10 s, 30 s, then every 60 s
+// (reset after 30 s on DXGI). Fullscreen games switching display modes otherwise leave the session
+// on GDI capture (~25 fps at 1440p) until it restarts.
+pub const OPTION_ENABLE_DXGI_RETRY: &str = "enable-dxgi-retry";
 // Viewer, local option: present pacing, "always show the newest frame". Every frame is still
 // decoded, but a stale one is not handed to the UI while a newer one waits; the soft renderer
 // replaces a buffer Flutter has not fetched yet instead of dropping the newer frame. On by
