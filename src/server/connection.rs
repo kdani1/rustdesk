@@ -476,6 +476,10 @@ pub struct Connection {
     // Live mode: after a fallback to TCP, the next offer and how many were made.
     udp_retry_at: Option<Instant>,
     udp_retries: usize,
+    // M22: held while this connection's lane takes recovery points, so HEVC on NVIDIA is
+    // encoded by the NV SDK driver (reference frame invalidation).
+    #[cfg(all(windows, feature = "vram"))]
+    udp_rfi_encoder: Option<scrap::vram::RfiEncoderWanted>,
     // Fork-only per-frame video feedback (M23, docs/UDP-VIDEO.md): the send time of each video
     // frame (also written by the split writer) and the estimator, once advertised.
     video_feedback_log: Arc<crate::video_feedback::host::SendLog>,
@@ -787,6 +791,8 @@ impl Connection {
             udp_video: None,
             udp_retry_at: None,
             udp_retries: 0,
+            #[cfg(all(windows, feature = "vram"))]
+            udp_rfi_encoder: None,
             video_feedback_log: Default::default(),
             video_feedback: None,
         };
@@ -6056,6 +6062,11 @@ impl Connection {
             // An M19/M20 viewer drops parity datagrams as an unknown type: send none.
             params.fec_percent = 0;
         }
+        // M22: only a viewer that resumes at a RECOVERY_POINT frame; HEVC on NVIDIA only (the
+        // capture loop falls back to a key frame for any other encoder).
+        params.rfi = mode == Mode::Live
+            && version >= udp::VIEWER_RFI_VERSION
+            && scrap::codec::enable_nvenc_rfi();
         let hooks = (mode == Mode::Live).then(|| {
             // A tail loss key frame, as `refresh_video_display`, from the lane's sender thread.
             let server = self.server.clone();
@@ -6088,13 +6099,23 @@ impl Connection {
                 if mode == Mode::Live {
                     let forced = Config::get_option(keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y";
                     log::info!(
-                        "UDPVIDEO host conn={id} live: a loss is repaired by {}",
+                        "UDPVIDEO host conn={id} live: a loss is repaired by {}{}",
+                        if lane.rfi() {
+                            "reference frame invalidation where the encoder can (enable-nvenc-rfi=Y), else "
+                        } else {
+                            ""
+                        },
                         if forced {
                             "a forced key frame (enable-refresh-keyframe=Y)"
                         } else {
                             "a capture restart (enable-refresh-keyframe is not Y)"
                         }
                     );
+                }
+                #[cfg(all(windows, feature = "vram"))]
+                if lane.rfi() {
+                    self.udp_rfi_encoder
+                        .get_or_insert_with(scrap::vram::RfiEncoderWanted::new);
                 }
                 self.udp_video = Some(lane);
                 let mut misc = Misc::new();
@@ -6128,15 +6149,20 @@ impl Connection {
         }
     }
 
-    /// Live: the viewer lost frames of a display. A key frame through the refresh path (M13
-    /// forced key frame with enable-refresh-keyframe=Y, else a capture restart); sustained loss
-    /// falls back to TCP.
+    /// Live: the viewer lost frames of a display. With RFI (M22) the display's capture loop
+    /// invalidates the lost frames (or falls back to a key frame itself); otherwise a key frame
+    /// through the refresh path (M13 forced key frame with enable-refresh-keyframe=Y, else a
+    /// capture restart). Sustained loss falls back to TCP.
     async fn on_udp_video_feedback(&mut self, f: &UdpVideoFeedback) {
+        use crate::udp_video::host::Repair;
         let Some(lane) = self.udp_video.as_mut() else {
             return;
         };
         match lane.on_feedback(f) {
-            Ok(Some(display)) => self.refresh_video_display(Some(display)),
+            Ok(Some(Repair::KeyFrame(display))) => self.refresh_video_display(Some(display)),
+            Ok(Some(Repair::Rfi { display, from_pts })) => {
+                crate::udp_video::rfi::request(display, from_pts)
+            }
             Ok(None) => {}
             Err(why) => self.udp_video_stop(&why, true).await,
         }
@@ -6219,6 +6245,11 @@ impl Connection {
         };
         let lane_id = lane.lane_id();
         let info = lane.shutdown(why);
+        // The encoder already opened keeps its driver; the next one is chosen without this lane.
+        #[cfg(all(windows, feature = "vram"))]
+        {
+            self.udp_rfi_encoder = None;
+        }
         log::warn!(
             "UDPVIDEO host conn={} stop lane={:016x} mode={}: {} (in_band={} displays={:?})",
             self.inner.id,

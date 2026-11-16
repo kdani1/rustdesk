@@ -99,6 +99,37 @@ pub trait EncoderApi {
     fn small_vbv(&self) -> bool {
         false
     }
+
+    /// Reference frame invalidation (roadmap M22): from now on the encoder references no frame
+    /// it encoded with a pts of `from_pts` or later, and its next frame is a recovery point
+    /// (`take_recovery_point`).
+    fn invalidate_refs(&mut self, _from_pts: i64) -> Rfi {
+        Rfi::Unsupported
+    }
+
+    /// The frames of the last encode included a recovery point after `invalidate_refs`; reading
+    /// it clears it.
+    fn take_recovery_point(&mut self) -> bool {
+        false
+    }
+
+    /// M22: this encoder could be replaced by one with reference frame invalidation, and a UDP
+    /// lane wants that now: the capture loop restarts to switch (once; a failing switch is
+    /// remembered).
+    fn wants_rfi_encoder(&self) -> bool {
+        false
+    }
+}
+
+/// Result of `EncoderApi::invalidate_refs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rfi {
+    /// Invalidated: the next encoded frame is a recovery point.
+    Done,
+    /// This encoder has no reference frame invalidation.
+    Unsupported,
+    /// Not possible now (the frame is unknown or too far back for the DPB): force a key frame.
+    TooLate,
 }
 
 pub struct Encoder {
@@ -1035,6 +1066,17 @@ pub fn nvenc_vbv_frames() -> i32 {
     }
     #[cfg(not(windows))]
     0
+}
+
+/// Host option `enable-nvenc-rfi` (Windows, roadmap M22): "Y" turns reference frame invalidation
+/// on for live UDP lanes (and the NV SDK driver for HEVC on NVIDIA while such a lane wants it).
+pub fn enable_nvenc_rfi() -> bool {
+    #[cfg(windows)]
+    {
+        Config::get_option(base::config::keys::OPTION_ENABLE_NVENC_RFI) == "Y"
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 pub const BR_BEST: f32 = 1.5;

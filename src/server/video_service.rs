@@ -71,6 +71,47 @@ pub(super) struct Encoded {
     pub bytes: usize,
 }
 
+/// Roadmap M22: reference frame invalidations since the last recovery frame of this capture loop
+/// (Windows monitors with `enable-nvenc-rfi=Y`; never set elsewhere). See docs/UDP-VIDEO.md.
+#[derive(Default)]
+struct RfiPending {
+    // The oldest pts invalidated from: the recovery frame references only older frames.
+    bound: Option<i64>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RfiPending {
+    fn on_invalidated(&mut self, from_pts: i64) {
+        self.bound = Some(self.bound.map_or(from_pts, |b| b.min(from_pts)));
+    }
+
+    fn pending(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    fn clear(&mut self) {
+        self.bound = None;
+    }
+
+    /// After an encode: the bound to register when the encoder made the recovery point. The
+    /// encoder's flag is read every time, so a recovery point whose wait was dropped (a key frame
+    /// went out instead) never marks a later frame.
+    fn take(&mut self, encoder: &mut Encoder) -> Option<i64> {
+        if encoder.take_recovery_point() {
+            self.bound.take()
+        } else {
+            None
+        }
+    }
+
+    /// A key frame went out: it repairs every loss, no recovery point is needed any more.
+    fn on_sent(&mut self, encoded: &Encoded) {
+        if encoded.key {
+            self.bound = None;
+        }
+    }
+}
+
 // `bail!("SWITCH")` that names its reason for the `LATENCY switch` line (latency_stats.rs).
 macro_rules! bail_switch {
     ($reason:expr) => {{
@@ -760,6 +801,12 @@ fn run(vs: VideoService) -> ResultType<()> {
     }
 
     let mut frame_controller = VideoFrameController::new(display_idx);
+    // M22: this loop's pts start from 0, so older RFI requests and recovery frames of this
+    // display no longer name its frames.
+    if vs.source.is_monitor() {
+        crate::udp_video::rfi::reset_display(display_idx);
+    }
+    let mut rfi = RfiPending::default();
 
     let start = time::Instant::now();
     let mut last_check_displays = time::Instant::now();
@@ -832,6 +879,32 @@ fn run(vs: VideoService) -> ResultType<()> {
         )?;
         if quality != quality_before && encoder.support_changing_quality() {
             latency_stats.on_quality(encoder.bitrate());
+        }
+        // M22: an encoder with reference frame invalidation is wanted (a UDP lane with
+        // enable-nvenc-rfi=Y), and a lane's loss report invalidates the lost frames, or falls
+        // back to a key frame through the refresh below.
+        #[cfg(windows)]
+        {
+            if encoder.wants_rfi_encoder() {
+                log::info!("switch to the NV SDK driver for reference frame invalidation");
+                bail_switch!("nv_rfi");
+            }
+            if vs.source.is_monitor() {
+                if let Some(from_pts) = crate::udp_video::rfi::take_request(display_idx) {
+                    match encoder.invalidate_refs(from_pts) {
+                        scrap::codec::Rfi::Done => {
+                            rfi.on_invalidated(from_pts);
+                            latency_stats.on_rfi(true);
+                        }
+                        r => {
+                            log::debug!("rfi from pts {from_pts}: {r:?}, key frame instead");
+                            latency_stats.on_rfi(false);
+                            super::latency_stats::on_refresh_request(vs.source, display_idx);
+                            sp.set_option_bool(OPTION_REFRESH, true);
+                        }
+                    }
+                }
+            }
         }
         if sp.is_option_true(OPTION_REFRESH) {
             #[cfg(windows)]
@@ -1035,6 +1108,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                         capture_width,
                         capture_height,
                         &mut latency_stats,
+                        &mut rfi,
                     )?;
                     #[cfg(windows)]
                     if let Some(encoded) = _encoded {
@@ -1136,6 +1210,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             capture_width,
                             capture_height,
                             &mut latency_stats,
+                            &mut rfi,
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -1158,6 +1233,37 @@ fn run(vs: VideoService) -> ResultType<()> {
                         frame_controller.set_send(now, send_conn_ids);
                         wait_sample = false;
                         send_counter += 1;
+                    } else if rfi.pending() && !key_refresh.pending() {
+                        // M22: the recovery frame after an invalidation, from the kept image.
+                        check_new_subscriber(&sp)?;
+                        match encode_kept_frame(
+                            display_idx,
+                            &sp,
+                            &mut encoder,
+                            &yuv,
+                            ms,
+                            &recorder,
+                            capture_width,
+                            capture_height,
+                            &mut latency_stats,
+                            &mut rfi,
+                        ) {
+                            Ok((send_conn_ids, encoded)) => {
+                                latency_stats.on_rfi_kept();
+                                let _ = key_refresh.on_encoded(encoded, now, true);
+                                frame_controller.set_send(now, send_conn_ids);
+                                wait_sample = false;
+                                send_counter += 1;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "rfi: no recovery frame from the kept image ({e}), key frame instead"
+                                );
+                                rfi.clear();
+                                super::latency_stats::on_refresh_request(vs.source, display_idx);
+                                sp.set_option_bool(OPTION_REFRESH, true);
+                            }
+                        }
                     } else if !key_refresh.pending() && static_refine.on_idle(now) {
                         check_new_subscriber(&sp)?;
                         match encode_kept_frame(
@@ -1170,6 +1276,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             capture_width,
                             capture_height,
                             &mut latency_stats,
+                            &mut rfi,
                         ) {
                             Ok((send_conn_ids, encoded)) => {
                                 latency_stats.on_refine();
@@ -1201,6 +1308,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             capture_width,
                             capture_height,
                             &mut latency_stats,
+                            &mut rfi,
                         )?;
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
@@ -1575,6 +1683,7 @@ fn handle_one_frame(
     width: usize,
     height: usize,
     latency_stats: &mut super::latency_stats::LatencyStats,
+    rfi: &mut RfiPending,
 ) -> ResultType<(HashSet<i32>, Option<Encoded>)> {
     check_new_subscriber(sp)?;
 
@@ -1585,8 +1694,18 @@ fn handle_one_frame(
     match encoder.encode_to_message(frame, ms) {
         Ok(vf) => {
             *encode_fail_counter = 0;
-            let (ids, info) =
-                send_encoded(display, sp, vf, &recorder, width, height, latency_stats);
+            let recovery = rfi.take(encoder);
+            let (ids, info) = send_encoded(
+                display,
+                sp,
+                vf,
+                &recorder,
+                width,
+                height,
+                latency_stats,
+                recovery,
+            );
+            rfi.on_sent(&info);
             send_conn_ids = ids;
             encoded = Some(info);
         }
@@ -1635,7 +1754,8 @@ fn check_new_subscriber(sp: &GenericService) -> ResultType<()> {
     })
 }
 
-// Records and sends one encoded frame to the display's connections.
+// Records and sends one encoded frame to the display's connections. `recovery`: the frame is
+// the recovery point after invalidating from this pts on (M22), registered for the lanes first.
 fn send_encoded(
     display: usize,
     sp: &GenericService,
@@ -1644,14 +1764,21 @@ fn send_encoded(
     width: usize,
     height: usize,
     latency_stats: &mut super::latency_stats::LatencyStats,
+    recovery: Option<i64>,
 ) -> (HashSet<i32>, Encoded) {
     vf.display = display as _;
     let mut msg = Message::new();
     msg.set_video_frame(vf);
     let mut encoded = Encoded::default();
+    let mut pts = None;
     for f in super::latency_stats::encoded_frames(&msg).unwrap_or_default() {
         encoded.key |= f.key;
         encoded.bytes += f.data.len();
+        pts.get_or_insert(f.pts);
+    }
+    if let (Some(bound), Some(pts)) = (recovery, pts) {
+        crate::udp_video::rfi::register(display, pts, bound);
+        latency_stats.on_recovery(encoded.bytes);
     }
     recorder
         .lock()
@@ -1680,6 +1807,7 @@ fn encode_kept_frame(
     width: usize,
     height: usize,
     latency_stats: &mut super::latency_stats::LatencyStats,
+    rfi: &mut RfiPending,
 ) -> ResultType<(HashSet<i32>, Encoded)> {
     #[cfg(feature = "vram")]
     let texture = encoder.input_texture();
@@ -1692,7 +1820,8 @@ fn encode_kept_frame(
     } else {
         bail!("no kept image");
     };
-    Ok(send_encoded(
+    let recovery = rfi.take(encoder);
+    let (ids, info) = send_encoded(
         display,
         sp,
         vf,
@@ -1700,7 +1829,10 @@ fn encode_kept_frame(
         width,
         height,
         latency_stats,
-    ))
+        recovery,
+    );
+    rfi.on_sent(&info);
+    Ok((ids, info))
 }
 
 #[cfg(windows)]

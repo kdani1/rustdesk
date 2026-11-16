@@ -1,6 +1,6 @@
 # UDP video lane
 
-Status: **M21 done: live mode with FEC.** A fork viewer and a fork host on the same LAN negotiate a
+Status: **M22 done: live mode with FEC and RFI.** A fork viewer and a fork host on the same LAN negotiate a
 UDP lane after login. In **shadow mode** (M19, host option `enable-udp-video=shadow`) the host
 sends a copy of every Nth video frame over it and the viewer only measures it. In **live mode**
 (M20, `enable-udp-video=live`) the video frames go over UDP only and the viewer decodes them;
@@ -10,9 +10,11 @@ parity (20% by default, `udp-video-fec-percent`) when the viewer speaks lane v4,
 losses are repaired on arrival instead of costing a key frame. Since M23 a fork viewer can send
 per-frame feedback (arrival, decode and present times, UDP losses) over the session stream on any
 transport; the host measures the one-way queueing delay from it and, when told to, uses it for
-QoS, an adaptive FEC level and the lane's fallback (see "Per-frame feedback (M23)"). Off by
-default on the host. Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21
-(FEC), M23 (feedback), M24 (internet).
+QoS, an adaptive FEC level and the lane's fallback (see "Per-frame feedback (M23)"). Since M22
+a lost frame FEC could not save can be repaired by reference frame invalidation on NVENC (HEVC)
+instead of a key frame (`enable-nvenc-rfi`, see "RFI (M22)"). Off by default on the host.
+Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), M22 (RFI), M23
+(feedback), M24 (internet).
 
 ## What exists
 
@@ -28,6 +30,7 @@ default on the host. Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on 
 | `src/udp_video/host.rs` | Offer gate, `UdpVideoHost` (socket, receive and sender threads, send window, QoS signal), `VideoTap` (routing, ACTIVE/STOP markers) |
 | `src/udp_video/viewer.rs` | Offer check, `UdpVideoClient` (socket, receive thread, ACKs), `ViewerLane` (io_loop state: hold, epochs, key frame requests, watchdog) |
 | `src/udp_video/shadow.rs` | Pairing of UDP and TCP copies by pts, window statistics |
+| `src/udp_video/rfi.rs` | RFI requests (connection -> capture loop) and recovery frames (capture loop -> taps) per display (M22) |
 | `src/video_feedback/viewer.rs` | Per-frame feedback, viewer: `Collector` (batches), `DoneLog` (the video thread's hook), `UdpCounts` (M23) |
 | `src/video_feedback/host.rs` | Per-frame feedback, host: `SendLog`, `Estimator` (q_owd, GCC trendline, jitter, loss), `FeedbackInput` / `FeedbackSink` (the seam to the fast ABR), `LegacyQos`, `FecAdapt`, `ConnFeedback` (M23) |
 
@@ -196,7 +199,8 @@ Misc 1002 was taken by the lane.
 1. **Viewer -> host:** `LoginRequest.udp_video_version` (1001), set by a Windows viewer for
    remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 by the
    first M20 build (live without EPOCH markers), 3 since the M20 review (live with them), 4
-   since M21 (also takes FEC parity datagrams). Stock hosts ignore the field. A host with
+   since M21 (also takes FEC parity datagrams), 5 since M22 (resumes a broken display at a
+   `RECOVERY_POINT` frame too). Stock hosts ignore the field. A host with
    `live` offers live mode to v3 and later only; an older viewer gets a `not offered` line
    instead. Only a v4 viewer gets `fec_percent` > 0. Shadow offers have version 1, live offers version 2 (EPOCH
    markers); the viewer refuses a live offer of version 1 (the first M20 host). The datagram
@@ -635,8 +639,8 @@ At the merge:
 
 ### Left out of M23
 
-- **Feedback-driven RFI**: the per-loss request stays the key frame request of M20 (RFI is M22,
-  hwcodec-dependent).
+- **Feedback-driven RFI**: the per-loss request stays the key frame request of M20; M22 (below)
+  answers that same request with RFI where it can.
 - **Per-frame NACK with retransmission**: a lost UDP frame is repaired by FEC or a key frame,
   never resent (a resend arrives too late for a 60 fps stream on the LAN).
 - **The fast ABR itself on this stream**: only the seam; `LegacyQos` is what this build uses.
@@ -645,3 +649,111 @@ At the merge:
 - **Pacing or bitrate decisions from `trend` in this build**: `usage` is logged and handed to
   the sinks; `LegacyQos` uses only `q_owd` and loss. The roadmap gate (a throttled
   hbbr-to-viewer leg) decides how much more the signal is worth.
+
+## RFI (M22)
+
+Roadmap M22: after a loss FEC could not repair, the viewer resumes without an IDR spike when
+detection plus the round trip stay within about 4 frames. Host option `enable-nvenc-rfi=Y`
+(off by default), live lanes of a viewer that advertises lane v5, NVIDIA GPU, HEVC.
+
+### Encoder: hwcodec's NV SDK driver
+
+FFmpeg's `hevc_nvenc` exposes no reference frame invalidation (and an FFmpeg patch would mean
+a full vcpkg rebuild, roadmap "dropped"), so RFI runs on hwcodec's own NVENC SDK driver
+(`cpp/nv/nv_encode.cpp`, Video Codec SDK 12.1.14 samples with the 12.1 `nvEncodeAPI.h` of
+nv-codec-headers n12.1.14.0, which declares `nvEncInvalidateRefFrames` and
+`NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`). Fork changes (docs/patches/README.md):
+
+- `nv_set_rfi(on)` before an encoder is opened (RustDesk sets it from the option at every
+  encoder creation): the encoder runs with preset P2 and ultra-low-latency tuning (FFmpeg
+  nvenc's settings in RustDesk), logs the caps `SUPPORT_REF_PIC_INVALIDATION`,
+  `SUPPORT_INTRA_REFRESH`, `SINGLE_SLICE_INTRA_REFRESH` and `SUPPORT_MULTIPLE_REF_FRAMES` of
+  both codecs, and offers forced IDRs and `encode_last` (the single input buffer, zero output
+  delay, still holds the last image). HEVC with the RFI cap also gets `maxNumRefFramesInDPB=5`
+  and `numRefL0=1` (when multiple references are supported at all).
+- `inputTimeStamp` is a per-encoder frame counter, so a frame is named unambiguously; a ring of
+  the last 16 frames since the last IDR maps the capture pts to it.
+- `nv_invalidate_refs(pts)`: invalidates every frame from the oldest one encoded with that pts
+  to the newest, if a valid reference is left: a frame before it, after the last IDR, not
+  invalidated before, among the last 5 (the DPB). So at most 4 frames from the lost one to the
+  newest; beyond that (or for an unknown pts) it returns -2 and the caller forces an IDR. The
+  next encoded picture is the recovery point: callback key 2 (1 if it is an IDR); an intra
+  picture NVENC may choose instead is also reported as 2, not as a key frame (no SPS/PPS, not
+  a start for a new decoder).
+- H.264 is left out on purpose: a viewer that skipped invalidated frames sees a `frame_num` gap,
+  which H.264 decoders treat as an error (concealment) unless the SPS allows gaps; HEVC names
+  its references explicitly (RPS) and a decoder never misses the skipped pictures. H.264
+  sessions keep key frames.
+
+RustDesk side (`libs/scrap/src/common/vram.rs`): an HEVC encoder that would be FFmpeg nvenc on
+an NVIDIA adapter is opened with the NV driver (same LUID) while a connection holds
+`RfiEncoderWanted` (from the offer of a lane with `rfi` until the lane ends). If the running
+encoder is FFmpeg nvenc when a lane starts wanting RFI, the capture loop restarts once
+(`reason=nv_rfi`). The NV driver is not taken from `HwCodecConfig` (the check process tests it
+only when FFmpeg fails for that adapter), so its first open happens in the host process: a
+failing open or failing encodes (`disable`) set a process-wide flag and FFmpeg nvenc stays;
+hardware encoding is not disabled for it. The encoder stays NV after the lane ends until the
+next encoder start. Not applied on the NV path: `nvenc-vbv-frames` and static refine (FFmpeg
+only); the M13 forced key frame and its kept-image path work (`request_keyframe` and
+`encode_last` are now supported by this driver when `nv_set_rfi` was on).
+
+### Flow
+
+1. The viewer's loss report (`UdpVideoFeedback{request_keyframe, display, lost_from, lost_to}`,
+   unchanged since M20; repeated every 250 ms while the display waits) reaches the host.
+2. A lane with `rfi` maps `lost_from` (lane frame id) to the frame's pts: the tap remembers
+   (display, id, pts) of the last 128 frames and forgets a display's frames before its newest
+   key frame. Found: that pts becomes the display's pending first lost pts on this lane (the
+   minimum if one is pending) and the connection calls `rfi::request(display, pts)`. Not found:
+   a key frame through the refresh path as before.
+3. The capture loop of that display takes the request (requests of several lanes merge to the
+   oldest pts; one atomic load per iteration when there is none) and calls
+   `invalidate_refs(pts)`. Done: it remembers the bound (the oldest pts invalidated since the
+   last recovery frame). Unsupported or too late: `OPTION_REFRESH`, i.e. the M13 forced key
+   frame, or a capture restart without M13, exactly as a key frame request (`rfi_idr`).
+4. The next encoded frame (a captured one, or with no new image within one capture wait the
+   kept image, `rfi_kept`) carries the encoder's recovery flag. Before it goes to the
+   connections the capture loop registers (display, pts, bound) in `rfi`; a key frame instead
+   drops the wait.
+5. Every lane's tap looks the frame up. It sets `RECOVERY_POINT` only for a display with a
+   pending first lost pts F and a bound <= F: the frame references only frames encoded before
+   F, all of which this viewer decoded (any frame it skipped before was either invalidated
+   when it was repaired, or before an IDR). A recovery frame made for another viewer's later
+   loss is not a recovery point here; this viewer waits for its own. A key frame clears the
+   pending pts too. A flagged frame dropped from the full queue puts the pending pts back.
+6. The viewer's receive thread already lifted its loss gate on `RECOVERY_POINT` (M19 wire
+   format); since lane v5 the io_loop also resumes a broken display at such a frame (`rp`,
+   `fix_ms`). The frame is a P frame: `EncodedVideoFrame.key` stays false, nothing changes on
+   the session stream or for TCP viewers of the same encoder, which simply decode it.
+
+Losses repaired by RFI still count toward sustained loss (4 key frame requests or tail losses
+within 5 s end the lane). A lost recovery frame shows as the display still broken: the viewer
+repeats its request with the first lost frame, which by then is usually too far back, so a key
+frame repairs it.
+
+### Compatibility
+
+- Only a v5 viewer's lanes get `rfi`; older fork viewers and every stock peer get key frames as
+  before. The flag value already existed in the M19 wire format, so no datagram change.
+- `enable-nvenc-rfi` off (default): no `RfiEncoderWanted`, `nv_set_rfi(false)`, the NV driver
+  behaves as upstream (forced key frames and `encode_last` refused, as before this change), and
+  the lane never asks for RFI.
+- Multiple viewers share the encoder: one viewer's recovery frame is a plain P frame for the
+  others; an invalidation costs them nothing but a slightly older reference.
+
+### Left out of M22
+
+- **Gradual intra refresh** (`enableIntraRefresh`, `forceIntraRefreshWithFrameCnt`): never as
+  loss recovery (the frames after a loss reference the lost one until the wave completes, which
+  breaks the no-broken-reference rule) and never for `RefreshVideo` (roadmap); only the caps are
+  logged.
+- **RFI for H.264** (see above) and for AMF/QSV (no SDK path in hwcodec).
+- **Tail-loss repairs by RFI**: the host's own tail loss check still asks for a key frame; such
+  a loss is one small frame on a static screen.
+- **Direct NV driver parity measurements** (roadmap step 6): encode p50/p95, kbps, keymax and a
+  colour check against FFmpeg nvenc (the NV driver converts ARGB inside NVENC and its VUI
+  says SMPTE170M, not verified against the FFmpeg path's output), and the HEVC caps on the RTX 5060 Ti: the
+  first run with the option on logs them. The NV driver has no VBV option (`nvenc-vbv-frames`)
+  and no static refine.
+- **Hardware validation**: Iris Xe and the RTX viewer decoding a stream with skipped
+  invalidated frames, recovery time and spike size against IDR (the roadmap gate).

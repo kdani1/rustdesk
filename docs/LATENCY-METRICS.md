@@ -47,7 +47,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 qos_sig=tcp
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 rfi=0 rfi_idr=0 rfi_kept=0 rfi_max=0 qos_sig=tcp
 ```
 
 | Field | Meaning |
@@ -77,10 +77,14 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
 | `qos_sig` | the delay signal `video_qos` adapts fps and bitrate from: `tcp`, the TestDelay round trip on the session stream (always, unless a live UDP lane exists); `udp` while at least one connection of this host has an active live UDP video lane (M20): that connection's TestDelay samples are replaced by TCP delay + the largest queueing excess of the lane's ACK round trips + 150 ms if the viewer lost frames since the last sample (`UDPVIDEO host` `ack_rtt_ms`, `base_ms`, `vlost`). Process-wide, not per display |
+| `rfi` | Windows host, `enable-nvenc-rfi=Y` (M22): live UDP lanes' loss reports served by reference frame invalidation on the running encoder (the lost frames are no longer referenced; the next frame is the recovery point). Requests of several lanes for one display that came within one loop iteration count once |
+| `rfi_idr` | RFI requests the encoder could not serve (not the NV SDK driver, H.264, the lost frame more than 4 frames back or unknown), and recovery frames the kept image could not give: a key frame through the refresh path instead (also counted in `gap`/`rkey` like any refresh) |
+| `rfi_kept` | recovery frames encoded from the kept last image (`encode_last`) because no new image came within one capture wait after the invalidation (static screen) |
+| `rfi_max` | largest recovery frame of the window, bytes (0 when none): compare with `keymax` for the spike RFI saves |
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
-`rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
+`rmerge`, `refine` and the `rfi` fields are only counted while logging is on, like the other fields; `set_kbps` is
 kept always.
 
 **With a live UDP video lane (M20) `wait` and `send` mean something else** for that
@@ -152,6 +156,10 @@ Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL
 | `[FFMPEG] avg bitrate change: a -> b` / `[FFMPEG] vbv buffer size change: a -> b` | with `nvenc-vbv-frames` > 0, FFmpeg's own nvenc reconfigure lines for the first 8 such messages in the process: the proof that a bitrate change re-applies the VBV |
 | `static refine on` | the capture loop starts with static refine |
 | `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |
+| `[NVENC] caps hevc: rfi=… ir=… ss_ir=… multiref=… h264: …; hevc encoder rfi=on dpb=5 numRefL0=1` | M22, once per encoder of hwcodec's NV SDK driver opened with `enable-nvenc-rfi=Y`: the NVENC caps `SUPPORT_REF_PIC_INVALIDATION`, `SUPPORT_INTRA_REFRESH`, `SINGLE_SLICE_INTRA_REFRESH` and `SUPPORT_MULTIPLE_REF_FRAMES` for both codecs on this GPU and driver, and whether this encoder runs with RFI (HEVC with the cap only; `off` for H.264). The roadmap's precondition for M22 |
+| `vram encoder: NV SDK driver for reference frame invalidation (luid …)` | M22: an HEVC encoder on NVIDIA was opened with the NV SDK driver instead of FFmpeg nvenc because a lane wants RFI |
+| `vram encoder: the NV SDK driver failed to open, FFmpeg nvenc stays (no RFI in this process)` / `… failed, FFmpeg nvenc from the next start` | M22: the NV SDK driver could not be opened, or its encodes failed (the capture loop's usual encode-failure restart): FFmpeg nvenc for the rest of the process, hardware encoding stays on |
+| `switch to the NV SDK driver for reference frame invalidation` | M22: a lane wants RFI while the running HEVC encoder is FFmpeg nvenc: one capture restart, `reason=nv_rfi` |
 
 ### Host: capture restarts, connection loop, transport
 
@@ -165,7 +173,7 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 |---|---|
 | `LATENCY switch` | one line per completed capture restart (`gap`), with logging on, at most one per source and display per second. A capture restart is any error return of the capture loop (`run()` in `video_service.rs`), which the service restarts: a `SWITCH` (refresh, codec change, new subscriber, …) or an error. |
 | `source` / `display` | `monitor` or `camera`, and the display index. Gaps are kept per source and display. |
-| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), the `enable-refresh-keyframe` reasons below, `codec`, `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
+| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), the `enable-refresh-keyframe` reasons below, `codec`, `nv_rfi` (M22: switch to the NV SDK driver), `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
 | `restarts` | restarts within this gap (a restart that failed again before sending a frame adds one). `0` with `reason=refresh_keyframe`: the refresh was served by a key frame without a restart. |
 | `gap_ms` | the gap: from the viewer's refresh request (`RefreshVideo` for one display, recorded in `refresh_video_display`) or, without one, the restart, until the restarted loop handed its first frame to at least one connection. It includes the service's error back-off sleep and the capturer/encoder re-creation. A refresh request for all displays (login, `PeerInfo`) has no request time: its gap starts at the restart. Gaps older than 60 s when the loop starts are dropped (the session that caused it is most likely gone). |
 | `not_logged` | completed gaps of this source and display not logged since the previous line (rate limit); they are still in the `gap` field |
@@ -488,6 +496,46 @@ live) end with:
 `dgrams` and `loss_pct` count parity datagrams like any other, so they are the raw datagram
 loss; `lost`, `frag_miss` and `kf_req` are what was left after FEC. Roadmap gate: with the same
 loss pattern as an M20 run, fewer `lost` and more `fec_rec`.
+
+### UDP video lane (RFI, M22)
+
+Host server option `enable-nvenc-rfi=Y` (off by default), a viewer that advertises lane version
+5, an NVIDIA GPU and HEVC: a lost frame is repaired by reference frame invalidation instead of a
+key frame where possible (docs/UDP-VIDEO.md, "RFI (M22)"). The fields below are added to the
+lines of the live sections above and to `LATENCY server` (`rfi`, `rfi_idr`, `rfi_kept`,
+`rfi_max`, see "Host").
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=192.168.1.5:61234 every=2 burst=8 timeout_ms=1000 fec=20 rfi=true viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 live: a loss is repaired by reference frame invalidation where the encoder can (enable-nvenc-rfi=Y), else a forced key frame (enable-refresh-keyframe=Y)
+[NVENC] caps hevc: rfi=1 ir=1 ss_ir=1 multiref=1 h264: rfi=1 ir=1 ss_ir=1 multiref=1; hevc encoder rfi=on dpb=5 numRefL0=1
+UDPVIDEO host conn=5 lane=3f2a… mode=live win_s=5.0 frames=300 … vlost=1 kf_req=1 tail_kf=0 rfi_req=1 rp=1
+UDPVIDEO viewer peer=123456789 lane=3f2a… mode=live win_s=5.0 frames=300 lost=1 gated=2 … kf_req=1 lost_fixed=0 tcp_drop=0 rp=1 fix_ms=31.2/31.2/31.2 owd_var_ms=…
+LATENCY server display=0 fps=59.8 … key=0 keymax=0 … rfi=1 rfi_idr=0 rfi_kept=0 rfi_max=41220 qos_sig=udp
+```
+
+(The caps values above are an example; the first run on the RTX 5060 Ti logs the real ones.)
+
+Host: `rfi` in the `offer` line says the lane takes recovery points (option on, viewer lane v5,
+live mode). The window line gets:
+
+| Field | Meaning |
+|---|---|
+| `rfi_req` | loss reports (part of `kf_req`) turned into an RFI request to the capture loop: the lane still knew the first lost frame's pts (the last 128 frames since the display's last key frame). The rest asked for a key frame as before; the capture loop may still answer an RFI request with a key frame (`rfi_idr`) |
+| `rp` | frames sent to this viewer flagged `RECOVERY_POINT`: a recovery frame whose invalidation started at or before this viewer's first lost frame. Another viewer's recovery frame is not flagged here (it may reference a frame this viewer lost) |
+
+`kf_req` and `tail_kf` still count toward sustained loss (4 within 5 s end the lane), RFI or not.
+
+Viewer window line (`mode=live`) adds:
+
+| Field | Meaning |
+|---|---|
+| `rp` | broken displays that resumed at a `RECOVERY_POINT` frame instead of a key frame |
+| `fix_ms` | p50/p95/max from a display breaking (the loss reached the io_loop) to the frame that resumed it, key frame or recovery point: the recovery time the roadmap gate compares between RFI and IDR |
+
+Roadmap gate: with the same loss pattern, `rfi_idr` low, `fix_ms` and the viewer's `lost` no
+worse than with the option off, and `rfi_max` well below the `keymax` of the IDR run; the Dell
+(Iris Xe) decodes the stream after a recovery point without artefacts.
 
 ### Per-frame feedback (M23)
 

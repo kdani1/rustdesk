@@ -1,8 +1,11 @@
 //! Viewer end of the UDP video lane: shadow probe (M19) and live video (M20).
 //!
-//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 4: live
-//!   mode with EPOCH markers and FEC parity shards too) on Windows, for remote control, unless
-//!   `enable-udp-video` is `N`.
+//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 5: live
+//!   mode with EPOCH markers, FEC parity shards and RECOVERY_POINT frames too) on Windows, for
+//!   remote control, unless `enable-udp-video` is `N`.
+//! - RFI (M22): a display broken by a loss resumes at a key frame or at a frame the host flagged
+//!   `RECOVERY_POINT` (the receive thread's loss gate and the io_loop both take either); the host
+//!   flags one only for this viewer's own loss, so it never references a frame the viewer lacks.
 //! - FEC (M21): the receive thread takes parity shards whenever they come and rebuilds lost
 //!   fragments at once (`fragment::Reassembler::push_parity`); the window line splits losses
 //!   into recovered (`fec_rec`) and unrecoverable (`fec_unrec`).
@@ -35,10 +38,10 @@ use super::{
     crypto::{Role, SECRET_LEN},
     fragment::{Event, LossStats, ReassemblyConfig},
     fec,
-    host::{DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_FEC_VERSION},
+    host::{DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_RFI_VERSION},
     lane::{DropStats, LaneReceiver, LaneSender, Received},
     net::{self, LaneClock, ReadTimeout},
-    packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, VIDEO_OVERHEAD},
+    packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, FLAG_RECOVERY_POINT, VIDEO_OVERHEAD},
     shadow::{Samples, ShadowMatcher},
 };
 use base::{
@@ -93,7 +96,7 @@ pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 /// The lane version to advertise in the login request, 0 for none.
 pub fn advertised_version(conn_type: ConnType) -> u32 {
     if cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled() {
-        VIEWER_FEC_VERSION
+        VIEWER_RFI_VERSION
     } else {
         0
     }
@@ -122,6 +125,9 @@ pub struct LiveFrame {
     pub epoch: u8,
     /// The host flagged it as a key frame.
     pub key: bool,
+    /// The host flagged it as a recovery point for this viewer's loss (M22): it ends a broken
+    /// display like a key frame.
+    pub recovery: bool,
     pub bytes: usize,
 }
 
@@ -494,6 +500,7 @@ fn recv_loop(
                                 frame_id: f.frame_id,
                                 epoch: f.epoch,
                                 key: f.flags & FLAG_KEY != 0,
+                                recovery: f.flags & FLAG_RECOVERY_POINT != 0,
                                 bytes,
                             }),
                             None => {
@@ -731,6 +738,10 @@ struct LiveStats {
     /// Losses a key frame right behind them repaired (no request).
     lost_fixed: u64,
     tcp_drop: u64,
+    /// Broken displays resumed at a RECOVERY_POINT frame (M22), and from the loss to the frame
+    /// that resumed a broken display (key or recovery point).
+    rp: u64,
+    fix: Samples,
 }
 
 /// The io_loop's lane state across rounds.
@@ -1006,12 +1017,17 @@ impl ViewerLane {
             return;
         }
         let d = l.disp(f.display);
-        if d.awaiting.is_some() && !f.key {
+        if d.awaiting.is_some() && !f.key && !f.recovery {
             self.stats.gated += 1;
             return;
         }
-        if f.key {
-            d.awaiting = None;
+        if let Some(since) = d.awaiting.take() {
+            self.stats.fix.push_duration(since.elapsed());
+            if !f.key {
+                self.stats.rp += 1;
+            }
+        }
+        if f.key || f.recovery {
             d.last_req = None;
         }
         l.stale_since = None;
@@ -1265,7 +1281,7 @@ impl ViewerLane {
         if self.live.is_some() {
             let s = std::mem::take(&mut self.stats);
             log::info!(
-                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={}",
+                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} rp={} fix_ms={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={}",
                 self.peer,
                 w.span.as_secs_f64(),
                 l.frames_completed,
@@ -1292,6 +1308,8 @@ impl ViewerLane {
                 s.kf_req,
                 s.lost_fixed,
                 s.tcp_drop,
+                s.rp,
+                { s.fix }.ms3(),
                 w.transit.above_min().ms3(),
                 w.assembly.ms3(),
                 w.rtt.ms3(),
@@ -1558,6 +1576,7 @@ mod latency_tests {
             frame_id,
             epoch,
             key,
+            recovery: false,
             bytes: 100,
         }
     }
@@ -1645,6 +1664,34 @@ mod latency_tests {
         assert!(lane.on_tcp_frame(&tcp(0, true)));
         assert!(lane.on_tcp_frame(&tcp(0, false)));
         assert_eq!(lane.stats.tcp_drop, 1);
+    }
+
+    /// M22: a broken display resumes at a RECOVERY_POINT frame as at a key frame, and the
+    /// window counts it and the time to repair.
+    #[test]
+    fn latency_viewer_live_recovery_point_resumes() {
+        let mut lane = ViewerLane::default();
+        lane.live = Some(LiveLane::new(5));
+        lane.on_control(&ctl(udp_video_control::Kind::KindActive, 0));
+        lane.on_live_frame(live_frame(0, 0, 0, true));
+        lane.live.as_mut().unwrap().disp(0).awaiting = Some(Instant::now());
+        lane.live.as_mut().unwrap().disp(0).last_req = Some(Instant::now());
+        lane.on_live_frame(live_frame(0, 1, 0, false));
+        let mut rp = live_frame(0, 2, 0, false);
+        rp.recovery = true;
+        lane.on_live_frame(rp);
+        lane.on_live_frame(live_frame(0, 3, 0, false));
+        assert_eq!(ready_ids(&mut lane), vec![0, 2, 3]);
+        let d = lane.live.as_mut().unwrap().disp(0);
+        assert!(d.awaiting.is_none() && d.last_req.is_none());
+        assert_eq!((lane.stats.gated, lane.stats.rp), (1, 1));
+        assert!(lane.stats.fix.summary().is_some());
+        // A recovery point on a display that is not broken is just the next frame.
+        let mut rp = live_frame(0, 4, 0, false);
+        rp.recovery = true;
+        lane.on_live_frame(rp);
+        assert_eq!(ready_ids(&mut lane), vec![4]);
+        assert_eq!(lane.stats.rp, 1);
     }
 
     /// The watchdog asks to stop a live lane whose display stays broken; frames that come

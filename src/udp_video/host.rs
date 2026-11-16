@@ -40,7 +40,8 @@ use super::{
     lane::{LaneReceiver, LaneSender, Received},
     net::{self, LaneClock},
     pacing::{self, Pacer, Waiter},
-    packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, FLAG_SHADOW},
+    packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, FLAG_RECOVERY_POINT, FLAG_SHADOW},
+    rfi,
     shadow::Samples,
 };
 use base::message_proto::{
@@ -72,6 +73,9 @@ pub const VIEWER_LIVE_VERSION: u32 = 3;
 /// `LoginRequest.udp_video_version` of a viewer that takes FEC parity shards (M21): it is
 /// offered `fec_percent` (`udp-video-fec-percent`); older viewers get lanes without parity.
 pub const VIEWER_FEC_VERSION: u32 = 4;
+/// `LoginRequest.udp_video_version` of a viewer that resumes a broken display at a
+/// `RECOVERY_POINT` frame too (M22): only its lanes get reference frame invalidation.
+pub const VIEWER_RFI_VERSION: u32 = 5;
 /// From the offer to the viewer's READY.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default of `udp-video-shadow-every`: half the frames, so the extra Wi-Fi load stays at half
@@ -112,6 +116,9 @@ pub const TAIL_LOSS_AFTER: Duration = Duration::from_millis(200);
 const LOG_EVERY: Duration = Duration::from_secs(5);
 /// The QoS baseline (minimum ACK round trip) is the lower of this window's and the last one's.
 const BASE_WINDOW: Duration = Duration::from_secs(10);
+/// RFI: lane frame ids remembered per lane with their pts (all displays), to name the first lost
+/// frame to the encoder. 2 s at 60 fps; a loss reported later is repaired by a key frame.
+const RFI_IDS: usize = 128;
 
 static LIVE_LANES: AtomicUsize = AtomicUsize::new(0);
 
@@ -186,6 +193,9 @@ pub struct Params {
     /// FEC parity in percent of each block's data shards (M21); 0 = no FEC. The caller sets it
     /// to 0 for a viewer older than [`VIEWER_FEC_VERSION`].
     pub fec_percent: u32,
+    /// Live: losses are repaired by reference frame invalidation where the encoder can (M22).
+    /// The caller sets it for a viewer of [`VIEWER_RFI_VERSION`] with `enable-nvenc-rfi=Y`.
+    pub rfi: bool,
 }
 
 impl Params {
@@ -220,6 +230,7 @@ impl Params {
                 .ok()
                 .filter(|n| *n <= fec::MAX_PERCENT)
                 .unwrap_or(fec::DEFAULT_PERCENT),
+            rfi: false,
         }
     }
 }
@@ -248,6 +259,16 @@ impl Drop for Fetched {
     fn drop(&mut self) {
         (self.hooks.fetched)(self.display, self.queued);
     }
+}
+
+/// How a lost frame is repaired: what the connection asks the display's capture loop for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repair {
+    /// A key frame (the refresh path: M13 forced key frame or a capture restart).
+    KeyFrame(usize),
+    /// Reference frame invalidation from the frame with this pts on (M22); the capture loop
+    /// falls back to a key frame when its encoder cannot.
+    Rfi { display: usize, from_pts: i64 },
 }
 
 /// Where the connection writes a video channel item, and the markers to write before it.
@@ -377,6 +398,10 @@ struct Shared {
     /// feedback's fallback rule takes them off the viewer's lost frames).
     qdrop_live: AtomicU64,
     kf_req: AtomicU64,
+    /// Live, M22: loss reports turned into an RFI request (a subset of `kf_req`), and frames
+    /// flagged RECOVERY_POINT for this viewer.
+    rfi_req: AtomicU64,
+    rp: AtomicU64,
     /// Live: key frames asked for on a tail loss; `tail_new` is drained by `check` into the
     /// sustained-loss count, `tail_kf` by the log line.
     tail_kf: AtomicU64,
@@ -408,6 +433,8 @@ impl Shared {
             qdrop: AtomicU64::new(0),
             qdrop_live: AtomicU64::new(0),
             kf_req: AtomicU64::new(0),
+            rfi_req: AtomicU64::new(0),
+            rp: AtomicU64::new(0),
             tail_kf: AtomicU64::new(0),
             tail_new: AtomicU64::new(0),
             last_rx_ms: AtomicU64::new(0),
@@ -513,7 +540,96 @@ enum TapMode {
         ids: Vec<(u8, u32)>,
         /// The ACTIVE marker went out (with the first UDP frame).
         announced: bool,
+        /// M22: the lane's reference frame invalidation state (None: losses get key frames).
+        rfi: Option<RfiTap>,
     },
+}
+
+/// M22, per live lane: the pts of the recent lane frames, and per display the pts of the first
+/// frame its viewer lost while it still waits for a key frame or a recovery point.
+#[derive(Default)]
+struct RfiTap {
+    /// (display, lane frame id, pts), oldest first, at most `RFI_IDS`.
+    sent: VecDeque<(u8, u32, i64)>,
+    /// (display, pts of the first lost frame).
+    pending: Vec<(u8, i64)>,
+}
+
+impl RfiTap {
+    /// A frame given to the lane. A key frame repairs every earlier loss of its display, so the
+    /// frames before it are forgotten (also the pts of an earlier capture loop, which restarts
+    /// with a key frame and pts from 0).
+    fn on_frame(&mut self, display: u8, frame_id: u32, pts: i64, key: bool) {
+        if key {
+            self.sent.retain(|(d, _, _)| *d != display);
+        }
+        self.sent.push_back((display, frame_id, pts));
+        while self.sent.len() > RFI_IDS {
+            self.sent.pop_front();
+        }
+    }
+
+    /// The viewer lost frames of `display` from `frame_id` on: that frame's pts, now pending.
+    fn on_loss(&mut self, display: u8, frame_id: u32) -> Option<i64> {
+        let pts = self
+            .sent
+            .iter()
+            .rev()
+            .find(|(d, id, _)| *d == display && *id == frame_id)
+            .map(|(_, _, pts)| *pts)?;
+        match self.pending.iter_mut().find(|(d, _)| *d == display) {
+            Some((_, p)) => *p = (*p).min(pts),
+            None => self.pending.push((display, pts)),
+        }
+        Some(pts)
+    }
+
+    fn take_pending(&mut self, display: u8) -> Option<i64> {
+        let i = self.pending.iter().position(|(d, _)| *d == display)?;
+        Some(self.pending.swap_remove(i).1)
+    }
+
+    /// The flags a frame of `display` with `pts` gets: a key frame ends the wait; a recovery
+    /// frame ends it when it references nothing from the first lost frame on (Some: the pending
+    /// pts it ended, to restore if the frame is not sent).
+    fn route(&mut self, display: u8, pts: i64, key: bool) -> (u8, Option<i64>) {
+        if key {
+            self.take_pending(display);
+            return (FLAG_KEY, None);
+        }
+        let Some(first_lost) = self
+            .pending
+            .iter()
+            .find(|(d, _)| *d == display)
+            .map(|(_, p)| *p)
+        else {
+            return (0, None);
+        };
+        match rfi::recovery_bound(display as usize, pts) {
+            Some(bound) if bound <= first_lost => {
+                self.take_pending(display);
+                (FLAG_RECOVERY_POINT, Some(first_lost))
+            }
+            _ => (0, None),
+        }
+    }
+
+    fn restore(&mut self, display: u8, pts: i64) {
+        if !self.pending.iter().any(|(d, _)| *d == display) {
+            self.pending.push((display, pts));
+        }
+    }
+}
+
+/// The pts of a video frame (its first encoded frame's).
+fn frame_pts(vf: &VideoFrame) -> Option<i64> {
+    use video_frame::Union::*;
+    match vf.union.as_ref() {
+        Some(Vp8s(f)) | Some(Vp9s(f)) | Some(Av1s(f)) | Some(H264s(f)) | Some(H265s(f)) => {
+            f.frames.first().map(|e| e.pts)
+        }
+        _ => None,
+    }
 }
 
 struct TapInner {
@@ -633,6 +749,7 @@ impl VideoTap {
                     lane_id,
                     ids,
                     announced,
+                    rfi,
                 } => {
                     if !*announced {
                         *announced = true;
@@ -655,11 +772,19 @@ impl VideoTap {
                             0
                         }
                     };
+                    let key = has_key_frame(vf);
+                    let (flags, ended) = match (rfi.as_mut(), frame_pts(vf)) {
+                        (Some(r), Some(pts)) => {
+                            r.on_frame(display, frame_id, pts, key);
+                            r.route(display, pts, key)
+                        }
+                        _ => (if key { FLAG_KEY } else { 0 }, None),
+                    };
                     let job = Job {
                         msg: msg.clone(),
                         display,
                         epoch: t.epoch,
-                        flags: if has_key_frame(vf) { FLAG_KEY } else { 0 },
+                        flags,
                         queued,
                         frame_id: Some(frame_id),
                         fetched: Some(Fetched {
@@ -677,6 +802,12 @@ impl VideoTap {
                         if let Ok(mut live) = shared.live.lock() {
                             live.disp(display).on_newest(frame_id, Instant::now());
                         }
+                        // A recovery point that is not sent repairs nothing.
+                        if let (Some(r), Some(first_lost)) = (rfi.as_mut(), ended) {
+                            r.restore(display, first_lost);
+                        }
+                    } else if ended.is_some() {
+                        shared.rp.fetch_add(1, Ordering::Relaxed);
                     }
                     route.tcp = false;
                 }
@@ -735,6 +866,7 @@ impl VideoTap {
         shared: Arc<Shared>,
         hooks: Arc<LiveHooks>,
         lane_id: u64,
+        rfi: bool,
     ) {
         if let Ok(mut t) = self.inner.lock() {
             t.mode = TapMode::Live {
@@ -744,8 +876,20 @@ impl VideoTap {
                 lane_id,
                 ids: Vec::new(),
                 announced: false,
+                rfi: rfi.then(RfiTap::default),
             };
             self.update_busy(&t);
+        }
+    }
+
+    /// M22: the viewer lost frames of `display` from lane frame `frame_id` on. The frame's pts
+    /// (now this display's first lost frame until a key frame or a recovery point for it), or
+    /// None when the lane has no RFI or no longer knows the frame.
+    fn rfi_loss(&self, display: u8, frame_id: u32) -> Option<i64> {
+        let mut t = self.inner.lock().ok()?;
+        match &mut t.mode {
+            TapMode::Live { rfi: Some(r), .. } => r.on_loss(display, frame_id),
+            _ => None,
         }
     }
 
@@ -906,13 +1050,14 @@ impl UdpVideoHost {
             ..Default::default()
         };
         log::info!(
-            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} fec={} viewer={viewer} installed={}",
+            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} fec={} rfi={} viewer={viewer} installed={}",
             params.mode.label(),
             SocketAddr::new(local, port),
             params.every,
             params.burst,
             params.timeout.as_millis(),
             params.fec_percent,
+            params.rfi,
             installed()
         );
         Ok((
@@ -969,8 +1114,13 @@ impl UdpVideoHost {
         };
         match (self.params.mode, &self.hooks) {
             (Mode::Live, Some(hooks)) => {
-                self.tap
-                    .activate_live(tx, self.shared.clone(), hooks.clone(), self.lane_id);
+                self.tap.activate_live(
+                    tx,
+                    self.shared.clone(),
+                    hooks.clone(),
+                    self.lane_id,
+                    self.params.rfi,
+                );
                 LIVE_LANES.fetch_add(1, Ordering::Relaxed);
                 self.live_counted = true;
                 // The viewer is heard from now on (pings, ACKs); silence counts from here.
@@ -1044,9 +1194,9 @@ impl UdpVideoHost {
         }
     }
 
-    /// The viewer's loss report. Ok(Some(display)): ask the capture loop of that display for a
-    /// key frame. Err: sustained loss, the lane must end.
-    pub fn on_feedback(&mut self, f: &UdpVideoFeedback) -> Result<Option<usize>, String> {
+    /// The viewer's loss report. Ok(Some(repair)): what to ask the capture loop of that display
+    /// for. Err: sustained loss, the lane must end.
+    pub fn on_feedback(&mut self, f: &UdpVideoFeedback) -> Result<Option<Repair>, String> {
         if f.lane_id != self.lane_id || !self.is_live_active() || !f.request_keyframe {
             return Ok(None);
         }
@@ -1060,7 +1210,20 @@ impl UdpVideoHost {
                 f.lost_to
             ));
         }
-        Ok(Some(f.display.max(0) as usize))
+        let display = f.display.max(0) as usize;
+        if self.params.rfi {
+            let lane_display = f.display.clamp(0, u8::MAX as i32) as u8;
+            if let Some(from_pts) = self.tap.rfi_loss(lane_display, f.lost_from) {
+                self.shared.rfi_req.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(Repair::Rfi { display, from_pts }));
+            }
+        }
+        Ok(Some(Repair::KeyFrame(display)))
+    }
+
+    /// Live with RFI (M22).
+    pub fn rfi(&self) -> bool {
+        self.params.rfi
     }
 
     /// Counts `n` key frames for losses; Some(count within `KF_WINDOW`) when that is sustained
@@ -1761,7 +1924,7 @@ fn log_window(
                 let l = &mut *guard;
                 let base = l.baseline();
                 let s = format!(
-                    " paced_ms={} win_wait_ms={} win_to={} inflight_max={} acks={} ack_rtt_ms={} base_ms={} vlost={} kf_req={} tail_kf={}",
+                    " paced_ms={} win_wait_ms={} win_to={} inflight_max={} acks={} ack_rtt_ms={} base_ms={} vlost={} kf_req={} tail_kf={} rfi_req={} rp={}",
                     w.paced.ms3(),
                     l.win_wait.ms3(),
                     l.win_timeouts,
@@ -1772,6 +1935,8 @@ fn log_window(
                     l.lost_win,
                     take(&shared.kf_req),
                     take(&shared.tail_kf),
+                    take(&shared.rfi_req),
+                    take(&shared.rp),
                 );
                 l.win_wait = Samples::default();
                 l.rtt = Samples::default();
@@ -2007,7 +2172,7 @@ pub(crate) mod latency_tests {
         let shared = Arc::new(Shared::new(LaneClock::new()));
         let (hooks, fetched) = counting_hooks();
         let now = Instant::now();
-        tap.activate_live(tx, shared, hooks, 77);
+        tap.activate_live(tx, shared, hooks, 77, false);
         let r = tap.route(&video(0, 0, true), now);
         assert!(!r.tcp);
         assert_eq!(r.before.len(), 1);
@@ -2063,6 +2228,74 @@ pub(crate) mod latency_tests {
         assert!(!tap.busy.load(Ordering::Relaxed));
     }
 
+    /// M22: a lane with RFI maps the viewer's lost frame id to its pts, and flags a recovery
+    /// frame RECOVERY_POINT only when it references nothing from that frame on; a key frame ends
+    /// the wait too, and a lane without RFI never flags one.
+    #[test]
+    fn latency_live_rfi_recovery_point_per_lane() {
+        // Display 7: the registry is shared with the other tests of the binary.
+        let tap = VideoTap::default();
+        let (tx, rx) = mpsc::sync_channel(64);
+        let shared = Arc::new(Shared::new(LaneClock::new()));
+        let (hooks, _) = counting_hooks();
+        let now = Instant::now();
+        tap.activate_live(tx, shared.clone(), hooks, 3, true);
+        // Lane ids 0..=4 carry pts 100..=104.
+        for pts in 100..=104 {
+            assert!(!tap.route(&video(7, pts, pts == 100), now).tcp);
+        }
+        assert_eq!(tap.rfi_loss(7, 9), None);
+        assert_eq!(tap.rfi_loss(7, 3), Some(103));
+        // A recovery frame of another lane's later loss (bound 104 > 103) is not ours.
+        rfi::register(7, 105, 104);
+        tap.route(&video(7, 105, false), now);
+        // Ours: references nothing from 103 on.
+        rfi::register(7, 106, 103);
+        tap.route(&video(7, 106, false), now);
+        // Only once: the wait has ended.
+        rfi::register(7, 107, 100);
+        tap.route(&video(7, 107, false), now);
+        // A new loss ends with a key frame, not with a recovery point registered later.
+        assert_eq!(tap.rfi_loss(7, 7), Some(107));
+        tap.route(&video(7, 108, true), now);
+        rfi::register(7, 109, 107);
+        tap.route(&video(7, 109, false), now);
+        // Frames before a key frame are forgotten: a loss among them gets a key frame.
+        assert_eq!(tap.rfi_loss(7, 7), None);
+        assert_eq!(tap.rfi_loss(7, 9), Some(109));
+        let flags: Vec<(Option<u32>, u8)> = rx.try_iter().map(|j| (j.frame_id, j.flags)).collect();
+        assert_eq!(
+            flags,
+            vec![
+                (Some(0), FLAG_KEY),
+                (Some(1), 0),
+                (Some(2), 0),
+                (Some(3), 0),
+                (Some(4), 0),
+                (Some(5), 0),
+                (Some(6), FLAG_RECOVERY_POINT),
+                (Some(7), 0),
+                (Some(8), FLAG_KEY),
+                (Some(9), 0),
+            ]
+        );
+        assert_eq!(shared.rp.load(Ordering::Relaxed), 1);
+        rfi::reset_display(7);
+
+        // Without RFI: no mapping, no flag.
+        let tap = VideoTap::default();
+        let (tx, rx) = mpsc::sync_channel(64);
+        let (hooks, _) = counting_hooks();
+        tap.activate_live(tx, Arc::new(Shared::new(LaneClock::new())), hooks, 4, false);
+        tap.route(&video(8, 200, true), now);
+        assert_eq!(tap.rfi_loss(8, 0), None);
+        rfi::register(8, 201, 0);
+        tap.route(&video(8, 201, false), now);
+        let flags: Vec<u8> = rx.try_iter().map(|j| j.flags).collect();
+        assert_eq!(flags, vec![FLAG_KEY, 0]);
+        rfi::reset_display(8);
+    }
+
     /// Live: a full queue drops the frame, reports it fetched at once and leaves its id unused.
     #[test]
     fn latency_live_full_queue_drops_and_reports_fetched() {
@@ -2070,7 +2303,7 @@ pub(crate) mod latency_tests {
         let (tx, rx) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared::new(LaneClock::new()));
         let (hooks, fetched) = counting_hooks();
-        tap.activate_live(tx, shared.clone(), hooks, 1);
+        tap.activate_live(tx, shared.clone(), hooks, 1, false);
         for pts in 0..3 {
             assert!(!tap.route(&video(2, pts, false), Instant::now()).tcp);
         }

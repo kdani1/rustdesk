@@ -2,7 +2,8 @@
 //! shadow probe (negotiation over the session stream, sockets and threads on both ends, the
 //! host's copy of every Nth frame, the viewer's pairing with the TCP copy). M20: live mode,
 //! video frames over UDP with paced bursts, a send window, key frames on loss and a fallback
-//! to TCP video in the same session. M21: Reed-Solomon FEC per frame. See docs/UDP-VIDEO.md.
+//! to TCP video in the same session. M21: Reed-Solomon FEC per frame. M22: loss repaired by
+//! reference frame invalidation. See docs/UDP-VIDEO.md.
 //!
 //! - `packet`: wire format (frame id, fragment index/count, FEC block fields and parity
 //!   datagrams, epoch, flags).
@@ -17,6 +18,8 @@
 //! - `host`: offer gate, `UdpVideoHost` (socket, receive and sender threads), `VideoTap`.
 //! - `viewer`: offer check, `UdpVideoClient` (socket, receive thread), `ViewerLane`.
 //! - `shadow`: UDP/TCP pairing and window statistics.
+//! - `rfi`: reference frame invalidation requests and recovery frames between the connections
+//!   and the capture loops (M22).
 //!
 //! Platform-neutral code; only socket options are Windows-specific. Hosts offer and viewers
 //! advertise only on Windows, so other platforms compile it and never use it.
@@ -36,5 +39,6 @@ pub mod net;
 pub mod pacing;
 #[allow(dead_code)]
 pub mod packet;
+pub mod rfi;
 pub mod shadow;
 pub mod viewer;

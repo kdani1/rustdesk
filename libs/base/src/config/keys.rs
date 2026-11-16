@@ -357,6 +357,17 @@ pub const OPTION_VIDEO_FEEDBACK_QOS: &str = "video-feedback-qos";
 // raised at once, lowered after 2 s. Needs enable-video-feedback=Y and a lane with parity
 // (viewer lane v4, udp-video-fec-percent not "0"). Read every second.
 pub const OPTION_UDP_VIDEO_FEC_ADAPTIVE: &str = "udp-video-fec-adaptive";
+// Windows host, server option, off by default (roadmap M22, docs/UDP-VIDEO.md "RFI"): "Y" repairs
+// a live UDP lane's frame loss by reference frame invalidation instead of a key frame. The
+// viewer's loss report then invalidates the lost frames on the encoder and the next frame,
+// flagged RECOVERY_POINT on that lane only, references only frames the viewer has; when that is
+// not possible (more than 4 frames since the loss, H.264, no NVENC support) a key frame repairs
+// it as before. Needs an NVIDIA GPU with the HEVC codec and a viewer of lane v5: while such a
+// lane is offered, HEVC on NVIDIA is encoded by the NV SDK driver of hwcodec (DPB 5, one
+// reference, forced IDRs and encode_last) instead of FFmpeg nvenc, switched at the next encoder
+// start or by a capture restart; a failing NV SDK driver goes back to FFmpeg for the process.
+// Read at each offer and when an encoder is created.
+pub const OPTION_ENABLE_NVENC_RFI: &str = "enable-nvenc-rfi";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
