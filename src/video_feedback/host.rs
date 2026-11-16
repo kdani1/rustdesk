@@ -5,10 +5,13 @@
 //!   pacer). Shared with the split writer; one relaxed load per video item while off.
 //! - `Estimator`: one per connection; turns each viewer batch into a `FeedbackInput`.
 //!   - `q_owd`: one-way delay of each frame (viewer arrival minus host send, an unknown clock
-//!     offset included) minus its lowest value over the last 10 s: the queueing on the whole
-//!     path (host write, network, relay, viewer io_loop), for any transport. The batch value is
-//!     the smallest over its frames, so a large frame's own transmission time does not count
-//!     as queue (the fast ABR's `min(Q) over 100 ms` idea); `q_owd_max_ms` keeps the largest.
+//!     offset included) minus its lowest value over the last 10 s (1 s buckets, dropped by
+//!     age): the queueing on the whole path (host write, network, relay, viewer io_loop). The
+//!     batch value is the smallest over its frames, so a large frame's own transmission time
+//!     does not count as queue (the fast ABR's `min(Q) over 100 ms` idea); `q_owd_max_ms`
+//!     keeps the largest. TCP and the UDP lane have different fixed delays: when a frame's
+//!     transport differs from the previous one the baseline and the trendline's previous frame
+//!     start over, and `q_owd` stays None until the new baseline is `BASE_WARMUP` old.
 //!   - GCC trendline (draft-ietf-rmcat-gcc-02, WebRTC's `TrendlineEstimator`): per frame the
 //!     delay gradient (arrival delta minus send delta), accumulated and smoothed (0.9), slope
 //!     over the last 20 frames, times min(frames, 60) times 4; the overuse detector with the
@@ -49,6 +52,11 @@ const MAX_BATCH_FRAMES: usize = 128;
 /// The lowest one-way delay is kept over this long, in 1 s buckets.
 const BASE_BUCKET: Duration = Duration::from_secs(1);
 const BASE_BUCKETS: usize = 10;
+/// `q_owd` is None until the baseline has this much behind it (at the start and after a
+/// transport switch).
+const BASE_WARMUP: Duration = Duration::from_secs(1);
+/// Each lane counter of one batch is taken up to this (a broken or hostile viewer).
+const MAX_BATCH_COUNT: u64 = 1_000_000;
 /// UDP counters kept for the loss rates.
 const UDP_HISTORY: Duration = Duration::from_secs(3);
 /// GCC trendline (WebRTC defaults).
@@ -210,8 +218,9 @@ pub trait FeedbackSink {
 
 /// The feedback as a `video_qos` delay sample (`video-feedback-qos=Y`): the TestDelay sample
 /// (or the UDP lane's) becomes `max(sample, q_owd)`, plus `LOSS_PENALTY_MS` when datagram loss
-/// went above `LOSS_HIGH` since the previous sample. `q_owd` is the largest batch value since
-/// then.
+/// went above `LOSS_HIGH` since the previous sample, unless the lane's sample already carries
+/// its own loss penalty (one penalty per sample at most). `q_owd` is the largest batch value
+/// since then.
 #[derive(Default)]
 pub struct LegacyQos {
     q_owd_ms: f64,
@@ -230,10 +239,11 @@ impl FeedbackSink for LegacyQos {
 }
 
 impl LegacyQos {
-    /// The delay sample for `user_network_delay`; resets what it used.
-    pub fn delay(&mut self, sample_ms: u32) -> u32 {
+    /// The delay sample for `user_network_delay`; resets what it used. `penalised`: the sample
+    /// already has the lane's `LOSS_PENALTY_MS` in it.
+    pub fn delay(&mut self, sample_ms: u32, penalised: bool) -> u32 {
         let q = std::mem::take(&mut self.q_owd_ms).round().min(u32::MAX as f64) as u32;
-        let penalty = if std::mem::take(&mut self.loss_high) {
+        let penalty = if std::mem::take(&mut self.loss_high) && !penalised {
             LOSS_PENALTY_MS
         } else {
             0
@@ -422,6 +432,15 @@ struct UdpCounts {
     lost: u64,
 }
 
+impl UdpCounts {
+    fn add(&mut self, c: &UdpCounts) {
+        self.expected = self.expected.saturating_add(c.expected);
+        self.received = self.received.saturating_add(c.received);
+        self.completed = self.completed.saturating_add(c.completed);
+        self.lost = self.lost.saturating_add(c.lost);
+    }
+}
+
 #[derive(Default)]
 struct Win {
     batches: u64,
@@ -443,6 +462,8 @@ struct Win {
     decode: Samples,
     queue_max: u32,
     udp: UdpCounts,
+    /// Transport switches seen in the matched frames.
+    switches: u64,
 }
 
 /// One connection's feedback state.
@@ -451,12 +472,18 @@ pub struct Estimator {
     second: Option<Instant>,
     in_second: u32,
     base_buckets: VecDeque<(Instant, i64)>,
+    /// Send time of the first frame of the current baseline.
+    base_from: Option<Instant>,
+    /// Transport (UDP lane) of the previous matched frame.
+    path_udp: Option<bool>,
     /// (send µs on the host clock, arrival µs on the viewer clock) of the previous frame.
     prev: Option<(i64, i64)>,
     trend: Trendline,
     detector: Detector,
     jitter_ms: f64,
     udp_hist: VecDeque<(Instant, UdpCounts)>,
+    /// The live lane's own queue drops (running total) at each fallback check.
+    qdrop_hist: VecDeque<(Instant, u64)>,
     last_input: Option<FeedbackInput>,
     win: Win,
     win_start: Instant,
@@ -469,11 +496,14 @@ impl Estimator {
             second: None,
             in_second: 0,
             base_buckets: VecDeque::new(),
+            base_from: None,
+            path_udp: None,
             prev: None,
             trend: Trendline::new(),
             detector: Detector::new(),
             jitter_ms: 0.0,
             udp_hist: VecDeque::new(),
+            qdrop_hist: VecDeque::new(),
             last_input: None,
             win: Win::default(),
             win_start: now,
@@ -501,7 +531,7 @@ impl Estimator {
             }
         }
         self.win.batches += 1;
-        self.win.dropped += fb.dropped as u64;
+        self.win.dropped = self.win.dropped.saturating_add(fb.dropped as u64);
         let mut input = FeedbackInput {
             at: now,
             frames: 0,
@@ -532,10 +562,20 @@ impl Estimator {
                 self.win.unmatched += 1;
                 continue;
             };
-            if sent.udp || f.udp {
+            let udp = sent.udp || f.udp;
+            if udp {
                 input.udp = true;
                 self.win.udp_frames += 1;
             }
+            if self.path_udp.map_or(false, |p| p != udp) {
+                // Another transport, another fixed delay: a new baseline, and no gradient
+                // across the switch.
+                self.base_buckets.clear();
+                self.base_from = None;
+                self.prev = None;
+                self.win.switches += 1;
+            }
+            self.path_udp = Some(udp);
             input.frames += 1;
             bytes += sent.bytes as u64;
             let send_us = us_since(self.base, sent.at) as i64;
@@ -543,10 +583,15 @@ impl Estimator {
             last_arrival = Some(arrival_us);
             let owd = arrival_us.saturating_sub(send_us);
             let min = self.base_min(owd, sent.at);
-            let q_ms = (owd - min) as f64 / 1000.0;
-            input.q_owd_ms = Some(input.q_owd_ms.map_or(q_ms, |q: f64| q.min(q_ms)));
-            input.q_owd_max_ms = Some(input.q_owd_max_ms.map_or(q_ms, |q: f64| q.max(q_ms)));
-            self.win.q_owd.push(owd - min);
+            let from = *self.base_from.get_or_insert(sent.at);
+            if sent.at.saturating_duration_since(from) >= BASE_WARMUP {
+                let q_us = owd.saturating_sub(min);
+                let q_ms = q_us as f64 / 1000.0;
+                input.q_owd_ms = Some(input.q_owd_ms.map_or(q_ms, |q: f64| q.min(q_ms)));
+                input.q_owd_max_ms =
+                    Some(input.q_owd_max_ms.map_or(q_ms, |q: f64| q.max(q_ms)));
+                self.win.q_owd.push(q_us);
+            }
             if let Some((ps, pa)) = self.prev {
                 if send_us > ps && arrival_us >= pa {
                     let send_delta_ms = (send_us - ps) as f64 / 1000.0;
@@ -570,7 +615,7 @@ impl Estimator {
             }
         }
         if let (Some(from), Some(to)) = (span_from, last_arrival) {
-            let span_us = to - from;
+            let span_us = to.saturating_sub(from);
             if span_us >= 10_000 {
                 input.recv_kbps = Some(bytes as f64 * 8.0 * 1000.0 / span_us as f64);
             }
@@ -595,19 +640,19 @@ impl Estimator {
             }
         }
         if let Some(u) = fb.udp.as_ref() {
+            let clamp = |v: u64| v.min(MAX_BATCH_COUNT);
+            let expected = clamp(u.datagrams_expected);
             let c = UdpCounts {
-                expected: u.datagrams_expected,
-                received: u.datagrams_received.min(u.datagrams_expected),
-                completed: u.frames_completed,
-                lost: u.frames_lost,
+                expected,
+                received: clamp(u.datagrams_received).min(expected),
+                completed: clamp(u.frames_completed),
+                lost: clamp(u.frames_lost),
             };
-            input.fec_recovered = u.fec_recovered;
-            self.win.fec_recovered += u.fec_recovered;
-            self.win.fec_unrec += u.fec_unrecoverable;
-            self.win.udp.expected += c.expected;
-            self.win.udp.received += c.received;
-            self.win.udp.completed += c.completed;
-            self.win.udp.lost += c.lost;
+            input.fec_recovered = clamp(u.fec_recovered);
+            let w = &mut self.win;
+            w.fec_recovered = w.fec_recovered.saturating_add(input.fec_recovered);
+            w.fec_unrec = w.fec_unrec.saturating_add(clamp(u.fec_unrecoverable));
+            w.udp.add(&c);
             self.udp_hist.push_back((now, c));
         }
         while self
@@ -622,9 +667,9 @@ impl Estimator {
             input.loss =
                 Some(last_1s.expected.saturating_sub(last_1s.received) as f64 / last_1s.expected as f64);
         }
-        if last_1s.completed + last_1s.lost > 0 {
-            input.frame_loss =
-                Some(last_1s.lost as f64 / (last_1s.completed + last_1s.lost) as f64);
+        let frames_1s = last_1s.completed.saturating_add(last_1s.lost);
+        if frames_1s > 0 {
+            input.frame_loss = Some(last_1s.lost as f64 / frames_1s as f64);
         }
         input.trend = self.trend.trend;
         input.threshold = self.detector.threshold;
@@ -635,16 +680,23 @@ impl Estimator {
     }
 
     /// The lowest one-way delay over the last `BASE_BUCKETS` seconds, with `owd` in it.
+    /// Buckets go by age as well as by count: a static screen opens few of them.
     fn base_min(&mut self, owd: i64, at: Instant) -> i64 {
         match self.base_buckets.back_mut() {
             Some((start, min)) if at.saturating_duration_since(*start) < BASE_BUCKET => {
                 *min = (*min).min(owd);
             }
             _ => {
-                self.base_buckets.push_back((at, owd));
-                while self.base_buckets.len() > BASE_BUCKETS {
+                let keep = BASE_BUCKET * BASE_BUCKETS as u32;
+                while self.base_buckets.len() >= BASE_BUCKETS
+                    || self
+                        .base_buckets
+                        .front()
+                        .map_or(false, |(start, _)| at.saturating_duration_since(*start) >= keep)
+                {
                     self.base_buckets.pop_front();
                 }
+                self.base_buckets.push_back((at, owd));
             }
         }
         self.base_buckets
@@ -661,32 +713,45 @@ impl Estimator {
             .iter()
             .filter(|(t, _)| now.saturating_duration_since(*t) <= over)
         {
-            s.expected += c.expected;
-            s.received += c.received;
-            s.completed += c.completed;
-            s.lost += c.lost;
+            s.add(c);
         }
         s
     }
 
     /// The live lane's fallback rule: Some(reason) when more than `FALLBACK_FRAME_LOSS` of the
     /// frames of the last `FALLBACK_WINDOW` (at least `FALLBACK_MIN_FRAMES`) were lost after
-    /// FEC.
-    pub fn lane_verdict(&self, now: Instant) -> Option<String> {
+    /// FEC. `qdrop_total` is the lane's own queue drops so far (called about once a second):
+    /// the viewer counts those frames as lost too, but they never reached the network, so the
+    /// ones of the window are taken off.
+    pub fn lane_verdict(&mut self, now: Instant, qdrop_total: u64) -> Option<String> {
+        while self
+            .qdrop_hist
+            .front()
+            .map_or(false, |(t, _)| now.saturating_duration_since(*t) > FALLBACK_WINDOW)
+        {
+            self.qdrop_hist.pop_front();
+        }
+        self.qdrop_hist.push_back((now, qdrop_total));
+        let qdrop = self
+            .qdrop_hist
+            .front()
+            .map_or(0, |(_, first)| qdrop_total.saturating_sub(*first));
         let s = self.udp_sum(now, FALLBACK_WINDOW);
-        let frames = s.completed + s.lost;
+        let frames = s.completed.saturating_add(s.lost);
         if frames < FALLBACK_MIN_FRAMES {
             return None;
         }
-        let loss = s.lost as f64 / frames as f64;
+        let lost = s.lost.saturating_sub(qdrop);
+        let loss = lost as f64 / frames as f64;
         (loss > FALLBACK_FRAME_LOSS).then(|| {
             format!(
-                "feedback: {} of {} frames lost after FEC in {} s ({:.1}% > {:.0}%), datagram loss {:.1}%",
-                s.lost,
+                "feedback: {} of {} frames lost after FEC in {} s ({:.1}% > {:.0}%; {} host queue drops left out), datagram loss {:.1}%",
+                lost,
                 frames,
                 FALLBACK_WINDOW.as_secs(),
                 loss * 100.0,
                 FALLBACK_FRAME_LOSS * 100.0,
+                qdrop,
                 if s.expected > 0 {
                     s.expected.saturating_sub(s.received) as f64 * 100.0 / s.expected as f64
                 } else {
@@ -699,6 +764,7 @@ impl Estimator {
     /// Forget the UDP history (a lane ended or started): its losses say nothing about the next.
     pub fn reset_udp(&mut self) {
         self.udp_hist.clear();
+        self.qdrop_hist.clear();
     }
 
     /// The `VFB host` log fields of the window since the last call, once it is `every` long
@@ -727,7 +793,7 @@ impl Estimator {
             "-".to_owned()
         };
         Some(format!(
-            "secs={:.1} batches={} rl={} frames={} unmatched={} udp_frames={} done={} dropped={} q_owd={} trend_max={:.1} thr={:.1} usage={:?} over={} under={} jitter={:.1} viewer={} decode={} queue_max={} dgram_loss={} frames_lost={} lost_ranges={} fec_rec={} fec_unrec={} last=[{}]",
+            "secs={:.1} batches={} rl={} frames={} unmatched={} udp_frames={} done={} dropped={} q_owd={} trend_max={:.1} thr={:.1} usage={:?} over={} under={} jitter={:.1} viewer={} decode={} queue_max={} dgram_loss={} frames_lost={} lost_ranges={} fec_rec={} fec_unrec={} switches={} last=[{}]",
             span.as_secs_f64(),
             w.batches,
             w.rate_limited,
@@ -751,6 +817,7 @@ impl Estimator {
             w.lost_ranges,
             w.fec_recovered,
             w.fec_unrec,
+            w.switches,
             last,
         ))
     }
@@ -834,9 +901,10 @@ impl ConnFeedback {
     }
 
     /// The `video_qos` delay sample: `sample_ms` itself unless `video-feedback-qos=Y`.
-    pub fn qos_delay(&mut self, sample_ms: u32) -> u32 {
+    /// `penalised`: the UDP lane already added its loss penalty to it.
+    pub fn qos_delay(&mut self, sample_ms: u32, penalised: bool) -> u32 {
         if self.qos {
-            self.legacy.delay(sample_ms)
+            self.legacy.delay(sample_ms, penalised)
         } else {
             sample_ms
         }
@@ -861,11 +929,12 @@ impl ConnFeedback {
     }
 
     /// With `video-feedback-qos=Y`: Some(reason) when the live lane should go back to TCP.
-    pub fn lane_verdict(&self, now: Instant) -> Option<String> {
+    /// `qdrop_total`: the lane's own queue drops so far.
+    pub fn lane_verdict(&mut self, now: Instant, qdrop_total: u64) -> Option<String> {
         if !self.qos {
             return None;
         }
-        self.estimator.lane_verdict(now)
+        self.estimator.lane_verdict(now, qdrop_total)
     }
 
     pub fn take_window(&mut self, now: Instant, every: Duration) -> Option<String> {
@@ -1041,20 +1110,29 @@ mod latency_tests {
         let last = last.unwrap();
         assert!((last.loss.unwrap() - 0.15).abs() < 1e-9);
         assert_eq!(last.frame_loss, Some(0.0));
-        assert!(est.lane_verdict(t).is_none());
+        assert!(est.lane_verdict(t, 0).is_none());
         let mut legacy = LegacyQos::default();
         legacy.on_feedback(&last);
-        assert_eq!(legacy.delay(20), 20 + LOSS_PENALTY_MS);
-        assert_eq!(legacy.delay(20), 20);
+        assert_eq!(legacy.delay(20, false), 20 + LOSS_PENALTY_MS);
+        assert_eq!(legacy.delay(20, false), 20);
+        // The lane's sample already carries its penalty: not a second one.
+        legacy.on_feedback(&last);
+        assert_eq!(legacy.delay(20 + LOSS_PENALTY_MS, true), 20 + LOSS_PENALTY_MS);
         // Frames lost after FEC: 1 in 3 for 2 s.
         for _ in 0..40 {
             t += Duration::from_millis(50);
             est.on_batch(&batch(100, 60, 2, 1), &log, t);
         }
-        let why = est.lane_verdict(t).unwrap();
+        // Host queue drops are not network loss: 30 of the 40 lost frames were the tap's.
+        let _ = est.lane_verdict(t - Duration::from_secs(2), 0);
+        assert!(est.lane_verdict(t, 30).is_none());
+        // 1.5 s later those drops left the window; the loss is the network's.
+        let later = t + Duration::from_millis(1500);
+        let why = est.lane_verdict(later, 30).unwrap();
         assert!(why.contains("lost after FEC"), "{why}");
+        assert!(why.contains("0 host queue drops"), "{why}");
         est.reset_udp();
-        assert!(est.lane_verdict(t).is_none());
+        assert!(est.lane_verdict(later, 30).is_none());
     }
 
     #[test]
@@ -1064,9 +1142,9 @@ mod latency_tests {
         for i in &inputs {
             legacy.on_feedback(i);
         }
-        let d = legacy.delay(30);
+        let d = legacy.delay(30, false);
         assert!(d > 100, "{d}");
-        assert_eq!(legacy.delay(30), 30);
+        assert_eq!(legacy.delay(30, false), 30);
     }
 
     #[test]
@@ -1090,5 +1168,110 @@ mod latency_tests {
         assert_eq!(f.on_loss(0.0, t0 + Duration::from_millis(5000)), None);
         assert_eq!(f.on_loss(0.0, t0 + Duration::from_millis(6500)), None);
         assert_eq!(f.on_loss(0.0, t0 + Duration::from_millis(7100)), Some(FEC_MIN));
+    }
+    /// Frames every 16 ms over TCP, then (from frame `switch`) over the UDP lane with a
+    /// one-way delay `udp_ms` lower; batches of 3. Returns (frame index, input) per batch.
+    fn run_switch(n: usize, switch: usize, udp_ms: f64) -> Vec<(usize, FeedbackInput)> {
+        let t0 = Instant::now();
+        let log = SendLog::default();
+        log.enable();
+        let mut est = Estimator::new(t0);
+        let mut out = Vec::new();
+        let mut batch = VideoFeedback::new();
+        for i in 0..n {
+            let udp = i >= switch;
+            let sent = t0 + Duration::from_millis(16 * i as u64);
+            log.record(&msg(0, i as i64, 20_000), sent, udp);
+            let owd = if udp { 25.0 - udp_ms } else { 25.0 };
+            let arrival_us = 1_000_000_000 + (16_000.0 * i as f64 + owd * 1000.0) as u64;
+            batch.frames.push(VideoFeedbackFrame {
+                display: 0,
+                pts: i as i64,
+                arrival_us,
+                udp,
+                ..Default::default()
+            });
+            if batch.frames.len() == 3 {
+                let now = sent + Duration::from_millis(30);
+                if let Some(input) = est.on_batch(&std::mem::take(&mut batch), &log, now) {
+                    out.push((i, input));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn latency_feedback_transport_switch_restarts_the_baseline() {
+        // UDP 20 ms faster than TCP: no phantom queue after the switch back either way.
+        let inputs = run_switch(400, 150, 20.0);
+        for (i, input) in &inputs {
+            if let Some(q) = input.q_owd_ms {
+                assert!(q < 0.5, "frame {i}: {input:?}");
+            }
+            assert_ne!(input.usage, Usage::Overuse, "frame {i}: {input:?}");
+        }
+        // q_owd is None for about 1 s after the switch, then back.
+        let after: Vec<_> = inputs.iter().filter(|(i, _)| *i >= 150).collect();
+        assert!(after[0].1.q_owd_ms.is_none());
+        assert!(after.last().unwrap().1.q_owd_ms.is_some());
+        // UDP 20 ms slower (pacer, hold): the same.
+        for (i, input) in run_switch(400, 150, -20.0) {
+            assert!(input.q_owd_ms.map_or(true, |q| q < 0.5), "frame {i}: {input:?}");
+        }
+    }
+
+    #[test]
+    fn latency_feedback_base_buckets_expire_by_age() {
+        let t0 = Instant::now();
+        let mut est = Estimator::new(t0);
+        // One frame every 5 s at 10 ms, then the path gets 10 ms longer.
+        for k in 0..4u64 {
+            assert_eq!(est.base_min(10_000, t0 + Duration::from_secs(5 * k)), 10_000);
+        }
+        // 15 s after the last one only buckets of the last 10 s count.
+        let at = t0 + Duration::from_secs(30);
+        assert_eq!(est.base_min(20_000, at), 20_000);
+        assert!(est.base_buckets.len() <= 1, "{}", est.base_buckets.len());
+        // The count cap still holds with frames every second.
+        for k in 0..30u64 {
+            est.base_min(5_000, at + Duration::from_secs(k));
+        }
+        assert_eq!(est.base_buckets.len(), BASE_BUCKETS);
+    }
+
+    #[test]
+    fn latency_feedback_hostile_counters_do_not_overflow() {
+        let t0 = Instant::now();
+        let log = SendLog::default();
+        log.enable();
+        let mut est = Estimator::new(t0);
+        let mut fb = VideoFeedback::new();
+        fb.udp = Some(VideoFeedbackUdp {
+            datagrams_expected: u64::MAX,
+            datagrams_received: u64::MAX,
+            frames_completed: u64::MAX,
+            frames_lost: u64::MAX,
+            fec_recovered: u64::MAX,
+            fec_unrecoverable: u64::MAX,
+            ..Default::default()
+        })
+        .into();
+        fb.dropped = u32::MAX;
+        for k in 0..3u64 {
+            let at = t0 + Duration::from_secs(k);
+            log.record(&msg(0, k as i64, 10), at, true);
+            fb.frames = vec![VideoFeedbackFrame {
+                display: 0,
+                pts: k as i64,
+                arrival_us: if k == 1 { 0 } else { u64::MAX },
+                ..Default::default()
+            }];
+            est.on_batch(&fb, &log, t0 + Duration::from_secs(2 * k)).unwrap();
+        }
+        let _ = est.lane_verdict(t0 + Duration::from_secs(4), u64::MAX);
+        assert!(est
+            .take_window(t0 + Duration::from_secs(10), Duration::from_secs(5))
+            .is_some());
     }
 }

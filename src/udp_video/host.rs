@@ -373,6 +373,9 @@ struct Shared {
     refused: AtomicU64,
     skipped: AtomicU64,
     qdrop: AtomicU64,
+    /// Live: frames the tap dropped since the lane started (never reset; the per-frame
+    /// feedback's fallback rule takes them off the viewer's lost frames).
+    qdrop_live: AtomicU64,
     kf_req: AtomicU64,
     /// Live: key frames asked for on a tail loss; `tail_new` is drained by `check` into the
     /// sustained-loss count, `tail_kf` by the log line.
@@ -403,6 +406,7 @@ impl Shared {
             refused: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             qdrop: AtomicU64::new(0),
+            qdrop_live: AtomicU64::new(0),
             kf_req: AtomicU64::new(0),
             tail_kf: AtomicU64::new(0),
             tail_new: AtomicU64::new(0),
@@ -669,6 +673,7 @@ impl VideoTap {
                     // and the tail loss check repairs it when none does.
                     if tx.try_send(job).is_err() {
                         shared.qdrop.fetch_add(1, Ordering::Relaxed);
+                        shared.qdrop_live.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut live) = shared.live.lock() {
                             live.disp(display).on_newest(frame_id, Instant::now());
                         }
@@ -1076,19 +1081,26 @@ impl UdpVideoHost {
 
     /// The delay sample for `video_qos` while the lane is live: the TCP probe's own delay plus
     /// the largest queueing excess the ACK round trips showed since the last sample, plus
-    /// `LOSS_PENALTY_MS` if the viewer lost frames since. None when not live (TCP decides).
-    pub fn qos_delay(&self, tcp_ms: u32) -> Option<u32> {
+    /// `LOSS_PENALTY_MS` if the viewer lost frames since; the flag says whether it was added.
+    /// None when not live (TCP decides).
+    pub fn qos_delay(&self, tcp_ms: u32) -> Option<(u32, bool)> {
         if !self.is_live_active() {
             return None;
         }
         let mut live = self.shared.live.lock().ok()?;
         let excess_ms = std::mem::take(&mut live.excess_max) / 1000;
-        let lost = std::mem::take(&mut live.lost);
-        Some(
+        let lost = std::mem::take(&mut live.lost) > 0;
+        Some((
             tcp_ms
                 .saturating_add(excess_ms)
-                .saturating_add(if lost > 0 { LOSS_PENALTY_MS } else { 0 }),
-        )
+                .saturating_add(if lost { LOSS_PENALTY_MS } else { 0 }),
+            lost,
+        ))
+    }
+
+    /// Live: frames the tap dropped on a full queue since the lane started.
+    pub fn qdrop_total(&self) -> u64 {
+        self.shared.qdrop_live.load(Ordering::Relaxed)
     }
 
     /// The FEC percentage the lane started with (0: no parity, e.g. a viewer below lane v4).

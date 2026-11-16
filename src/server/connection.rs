@@ -3427,14 +3427,15 @@ impl Connection {
                     let new_delay = tm.elapsed().as_millis() as u32;
                     // A live UDP lane carries the video: TestDelay on the near-idle TCP stream
                     // no longer sees the video queue, so QoS gets the lane's signal instead.
-                    let qos_delay = self
+                    let (qos_delay, penalised) = self
                         .udp_video
                         .as_ref()
                         .and_then(|l| l.qos_delay(new_delay))
-                        .unwrap_or(new_delay);
-                    // video-feedback-qos=Y: the viewer's queueing delay and UDP loss (M23).
+                        .unwrap_or((new_delay, false));
+                    // video-feedback-qos=Y: the viewer's queueing delay and UDP loss (M23),
+                    // one loss penalty per sample at most.
                     let qos_delay = match self.video_feedback.as_mut() {
-                        Some(fb) => fb.qos_delay(qos_delay),
+                        Some(fb) => fb.qos_delay(qos_delay, penalised),
                         None => qos_delay,
                     };
                     video_service::VIDEO_QOS
@@ -6179,11 +6180,15 @@ impl Connection {
                 log::info!("VFB host conn={} {}", self.inner.id, line);
             }
         }
-        let live = self.udp_video.as_ref().map_or(false, |l| l.is_live_active());
-        if !live {
+        let Some(qdrop) = self
+            .udp_video
+            .as_ref()
+            .filter(|l| l.is_live_active())
+            .map(|l| l.qdrop_total())
+        else {
             return;
-        }
-        if let Some(why) = fb.lane_verdict(now) {
+        };
+        if let Some(why) = fb.lane_verdict(now, qdrop) {
             fb.lane_started();
             self.udp_video_stop(&why, true).await;
         }

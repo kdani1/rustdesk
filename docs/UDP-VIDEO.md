@@ -566,7 +566,7 @@ are dropped and counted) and produces a `FeedbackInput`:
 
 | Field | Meaning |
 |---|---|
-| `q_owd_ms` / `q_owd_max_ms` | per-frame one-way delay (viewer arrival - host send, clock offset included) minus its lowest value over the last 10 s (1 s buckets); the batch's smallest and largest. The smallest is the queue: a large frame's own transmission time does not count (the fast ABR's `min(Q) over 100 ms` idea) |
+| `q_owd_ms` / `q_owd_max_ms` | per-frame one-way delay (viewer arrival - host send, clock offset included) minus its lowest value over the last 10 s (1 s buckets, dropped by age as well as count); the batch's smallest and largest. The smallest is the queue: a large frame's own transmission time does not count (the fast ABR's `min(Q) over 100 ms` idea). TCP (possibly through hbbr) and the lane (its queue, pacer and the viewer's reassembly hold included) have different fixed delays: a change of transport between two matched frames clears the baseline and the trendline's previous frame, and the value is None for the first 1 s of a baseline |
 | `trend`, `threshold`, `usage` | GCC (draft-ietf-rmcat-gcc-02, the defaults of WebRTC's `TrendlineEstimator` and `OveruseDetector`): delay gradient per frame, accumulated, smoothed 0.9, slope over 20 frames x min(n, 60) x 4; adaptive threshold from 12.5 (k_up 0.0087, k_down 0.039, 6..600); overuse after more than 10 ms and two samples above it with a rising trend |
 | `jitter_ms` | RFC 3550 style, gain 1/16 |
 | `recv_kbps` | the batch's frame bytes over their arrival span (from the previous batch's last arrival) |
@@ -575,7 +575,9 @@ are dropped and counted) and produces a `FeedbackInput`:
 | `fec_recovered`, `lost_frames` | UDP lane, this batch |
 
 Clocks: the viewer's clock is never compared with the host's directly. Drift between the two
-(tens of ppm) moves the 10 s minimum by well under a millisecond.
+(tens of ppm) moves the 10 s minimum by well under a millisecond; the buckets expire by age, so
+a sparse screen does not keep a minute-old minimum. The viewer's counters are taken at most
+1,000,000 per batch and every sum saturates: a broken or hostile viewer cannot overflow them.
 
 Uses in this build, each behind its own host option (all off by default):
 
@@ -583,7 +585,8 @@ Uses in this build, each behind its own host option (all off by default):
   TestDelay (or the live lane's sample, see "QoS signal") becomes `max(sample, q_owd)`, `q_owd`
   being the largest batch value since the previous sample, plus `LOSS_PENALTY_MS` (150) when the
   lane's datagram loss over 1 s went above 10% (the threshold of GCC's loss controller). Frame
-  losses after FEC already add the penalty through the lane's own sample.
+  losses after FEC add the penalty through the lane's own sample (`UdpVideoHost::qos_delay`
+  says when); then `LegacyQos` adds none, so one sample carries at most one penalty.
 - **Adaptive FEC** (`udp-video-fec-adaptive=Y`, `FecAdapt`): for a live lane that has parity
   (viewer lane v4, `udp-video-fec-percent` not 0) the percentage follows
   `clamp(10, 50, 2 x loss% + 5)` of the datagram loss over 1 s: raised at once, lowered after
@@ -591,7 +594,10 @@ Uses in this build, each behind its own host option (all off by default):
   every datagram carries its block's parity count. A new lane starts from the configured value.
 - **Fallback** (`video-feedback-qos=Y`): a live lane that loses more than 10% of its frames
   after FEC over 3 s (at least 30 frames) goes back to TCP (`udp_video_stop`, with the same retry
-  backoff as the other reasons). The existing rules (4 key frames in 5 s, silence, socket
+  backoff as the other reasons). Frames the host's tap dropped on a full lane queue took a frame
+  id and were never sent, so the viewer counts them as lost too; the lane's running count of
+  them (`UdpVideoHost::qdrop_total`) over the same window is taken off first, and the stop reason
+  names it. The existing rules (4 key frames in 5 s, silence, socket
   errors) stay.
 
 ### Seam to the fast ABR (M15/M16, the `rate` stream)

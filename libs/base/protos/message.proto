@@ -972,8 +972,6 @@ message UdpVideoLastFrame {
   uint32 frame_id = 2;
 }
 
-// Fork-only, viewer -> host over the session stream, live mode: frames of a display were lost
-// on the lane; the viewer shows nothing of that display until a key frame.
 // Fork-only, viewer -> host over the session stream (M23, docs/UDP-VIDEO.md "Per-frame
 // feedback"): what happened to the video frames since the previous batch. At most one batch
 // per 50 ms, only while there is something to report. Times are microseconds on the viewer's
@@ -1034,6 +1032,8 @@ message VideoFeedbackUdp {
   uint64 fec_recovered = 5;
   uint64 fec_unrecoverable = 6;
 }
+// Fork-only, viewer -> host over the session stream, live mode: frames of a display were lost
+// on the lane; the viewer shows nothing of that display until a key frame.
 message UdpVideoFeedback {
   uint64 lane_id = 1;
   int32 display = 2;
