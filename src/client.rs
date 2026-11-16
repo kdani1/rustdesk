@@ -78,7 +78,7 @@ use base::{
 };
 pub use helper::*;
 use scrap::{
-    codec::Decoder,
+    codec::{DecodeOutput, Decoder},
     record::{Recorder, RecorderContext},
     CodecFormat, ImageFormat, ImageRgb, ImageTexture,
 };
@@ -3106,6 +3106,59 @@ mod audio_format_tests {
     }
 }
 
+/// `VideoHandler::fail_counter` after a frame: reset by any decoded picture, shown or not
+/// (`DecodeOutput::Output` and `DecodedNoOutput`); otherwise grown by one, or set straight to
+/// `MAX_DECODE_FAIL_COUNTER` when the first frame after a decoder start fails. `None`: unchanged
+/// (saturated).
+fn next_fail_counter(fail_counter: usize, first_frame: bool, decoded: bool) -> Option<usize> {
+    if decoded {
+        return Some(0);
+    }
+    if fail_counter == usize::MAX {
+        return None;
+    }
+    Some(if first_frame && fail_counter < MAX_DECODE_FAIL_COUNTER {
+        MAX_DECODE_FAIL_COUNTER
+    } else {
+        fail_counter + 1
+    })
+}
+
+#[cfg(test)]
+mod decode_output_latency_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_no_output_latency_counts_as_success() {
+        assert!(DecodeOutput::Output.decoded());
+        assert!(DecodeOutput::DecodedNoOutput.decoded());
+        assert!(!DecodeOutput::NoFrame.decoded());
+        let no_output = DecodeOutput::DecodedNoOutput.decoded();
+        // A frame decoded without output resets the counter like a shown one ...
+        assert_eq!(next_fail_counter(2, false, no_output), Some(0));
+        // ... also as the first frame after a decoder start (H.265 must not be marked
+        // unsupported because pacing skipped its first frames).
+        assert_eq!(next_fail_counter(0, true, no_output), Some(0));
+        let mut counter = 0;
+        for _ in 0..1000 {
+            counter = next_fail_counter(counter, false, no_output).unwrap();
+        }
+        assert_eq!(counter, 0);
+        // No picture: a failure, as before.
+        let no_frame = DecodeOutput::NoFrame.decoded();
+        assert_eq!(next_fail_counter(0, false, no_frame), Some(1));
+        assert_eq!(
+            next_fail_counter(0, true, no_frame),
+            Some(MAX_DECODE_FAIL_COUNTER)
+        );
+        assert_eq!(
+            next_fail_counter(MAX_DECODE_FAIL_COUNTER, true, no_frame),
+            Some(MAX_DECODE_FAIL_COUNTER + 1)
+        );
+        assert_eq!(next_fail_counter(usize::MAX, false, no_frame), None);
+    }
+}
+
 /// Video handler for the [`Client`].
 pub struct VideoHandler {
     decoder: Decoder,
@@ -3154,13 +3207,18 @@ impl VideoHandler {
     }
 
     /// Handle a new video frame.
+    ///
+    /// `want_output == false`: the frame will not be shown, so it is decoded without conversion
+    /// where the decoder supports it (`DecodeOutput::DecodedNoOutput`, a success: it does not
+    /// grow `fail_counter`, or a skipped H.265 stream would be marked unsupported).
     #[inline]
     pub fn handle_frame(
         &mut self,
         vf: VideoFrame,
         pixelbuffer: &mut bool,
         chroma: &mut Option<Chroma>,
-    ) -> ResultType<bool> {
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         let format = CodecFormat::from(&vf);
         if format != self.decoder.format() {
             self.reset(Some(format));
@@ -3173,17 +3231,17 @@ impl VideoHandler {
                     &mut self.texture,
                     pixelbuffer,
                     chroma,
+                    want_output,
                 );
-                if res.as_ref().is_ok_and(|x| *x) {
-                    self.fail_counter = 0;
-                } else {
-                    if self.fail_counter < usize::MAX {
-                        if self.first_frame && self.fail_counter < MAX_DECODE_FAIL_COUNTER {
-                            log::error!("decode first frame failed");
-                            self.fail_counter = MAX_DECODE_FAIL_COUNTER;
-                        } else {
-                            self.fail_counter += 1;
-                        }
+                let decoded = res.as_ref().is_ok_and(|x| x.decoded());
+                if let Some(counter) =
+                    next_fail_counter(self.fail_counter, self.first_frame, decoded)
+                {
+                    if self.first_frame && counter == MAX_DECODE_FAIL_COUNTER {
+                        log::error!("decode first frame failed");
+                    }
+                    self.fail_counter = counter;
+                    if !decoded {
                         log::error!(
                             "Failed to handle video frame, fail counter: {}",
                             self.fail_counter
@@ -3203,8 +3261,14 @@ impl VideoHandler {
                 }
                 res
             }
-            _ => Ok(false),
+            _ => Ok(DecodeOutput::NoFrame),
         }
+    }
+
+    /// Whether the decoder outputs GPU textures (D3D11 vram path).
+    #[cfg(windows)]
+    fn is_vram(&self) -> bool {
+        self.decoder.is_vram()
     }
 
     /// Reset the decoder, change format if it is Some
@@ -4468,6 +4532,7 @@ pub struct VideoCounters {
     received: std::sync::atomic::AtomicUsize,
     discarded: std::sync::atomic::AtomicUsize,
     decoded: std::sync::atomic::AtomicUsize,
+    no_output: std::sync::atomic::AtomicUsize,
     failed: std::sync::atomic::AtomicUsize,
     shown: std::sync::atomic::AtomicUsize,
     ui_lost: std::sync::atomic::AtomicUsize,
@@ -4496,6 +4561,9 @@ pub struct VideoCountersTick {
     pub discarded: usize,
     /// `handle_frame` returned a picture.
     pub decoded: usize,
+    /// Of the `decoded` frames, those decoded without output (no conversion; frames present
+    /// pacing skipped, enable-viewer-decode-no-output).
+    pub no_output: usize,
     /// `handle_frame` returned no picture or an error.
     pub failed: usize,
     /// Decoded frames handed to the UI callback.
@@ -4577,6 +4645,7 @@ impl VideoCounters {
             received: self.received.swap(0, Ordering::Relaxed),
             discarded: self.discarded.swap(0, Ordering::Relaxed),
             decoded: self.decoded.swap(0, Ordering::Relaxed),
+            no_output: self.no_output.swap(0, Ordering::Relaxed),
             failed: self.failed.swap(0, Ordering::Relaxed),
             shown: self.shown.swap(0, Ordering::Relaxed),
             ui_lost: self.ui_lost.swap(0, Ordering::Relaxed),
@@ -4602,6 +4671,8 @@ pub struct PresentPacing {
     key_frames_pending: std::sync::atomic::AtomicUsize,
     // pts of the newest frame received, `i64::MIN` while none carried one.
     newest_pts: std::sync::atomic::AtomicI64,
+    // A frame that will not be shown is decoded without output (enable-viewer-decode-no-output).
+    decode_no_output: bool,
 }
 
 impl PresentPacing {
@@ -4617,6 +4688,9 @@ impl PresentPacing {
             },
             key_frames_pending: Default::default(),
             newest_pts: std::sync::atomic::AtomicI64::new(i64::MIN),
+            decode_no_output: LocalConfig::get_option(
+                keys::OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
+            ) != "N",
         }
     }
 
@@ -4664,6 +4738,11 @@ pub fn is_present_pacing_thread() -> bool {
 /// frame is at least 1.5 frame intervals newer than this one (Moonlight-style window: two frames
 /// arriving together, as Wi-Fi aggregation delivers them, are both shown). Key frames and the
 /// first frame after a start, reset or codec change are always shown.
+///
+/// The decision is taken before the decode (`should_present`), so a frame that will not be
+/// shown is decoded without output (enable-viewer-decode-no-output). A frame it would show only
+/// because nothing newer was waiting yet is checked again after the decode (`still_present`):
+/// if a newer frame arrived meanwhile, only the UI callback is skipped, as before.
 struct PresentPacer {
     shared: Arc<PresentPacing>,
     present_next: bool,
@@ -4671,6 +4750,8 @@ struct PresentPacer {
     last_pts: Option<i64>,
     // EWMA of the pts step between decoded frames, in ms.
     interval_ms: f64,
+    // The last `should_present` accepted the frame by the stale-frame rule (not forced).
+    recheck: bool,
 }
 
 impl PresentPacer {
@@ -4681,6 +4762,7 @@ impl PresentPacer {
             backlog_since: None,
             last_pts: None,
             interval_ms: 1000.0 / 60.0,
+            recheck: false,
         }
     }
 
@@ -4688,10 +4770,16 @@ impl PresentPacer {
         self.shared.enabled
     }
 
+    /// Whether a frame `should_present` rejected is decoded without output.
+    fn decode_without_output(&self) -> bool {
+        self.shared.enabled && self.shared.decode_no_output
+    }
+
     /// Shows the next decoded frame unconditionally.
     fn reset(&mut self) {
         self.present_next = true;
         self.backlog_since = None;
+        self.recheck = false;
     }
 
     fn should_present(
@@ -4712,22 +4800,51 @@ impl PresentPacer {
             }
         }
         self.last_pts = pts;
+        self.recheck = false;
         if key_frame || std::mem::take(&mut self.present_next) {
             self.backlog_since = None;
             return true;
         }
+        let (present, forced) = self.backlog_decision(pts, queue_len, now);
+        self.recheck = present && !forced;
+        present
+    }
+
+    /// After the decode of a frame `should_present` accepted by the stale-frame rule (not a key
+    /// frame, a first frame or a forced one): the same rule again at the decode's end, so a
+    /// newer frame that arrived during the decode still makes it stale.
+    fn still_present(
+        &mut self,
+        pts: Option<i64>,
+        queue_len: usize,
+        now: std::time::Instant,
+    ) -> bool {
+        if !std::mem::take(&mut self.recheck) {
+            return true;
+        }
+        self.backlog_decision(pts, queue_len, now).0
+    }
+
+    // The stale-frame rule for a frame that is not a key frame and not the first one:
+    // (present, forced by PACING_MAX_BACKLOG).
+    fn backlog_decision(
+        &mut self,
+        pts: Option<i64>,
+        queue_len: usize,
+        now: std::time::Instant,
+    ) -> (bool, bool) {
         let newer_waiting =
             queue_len > 0 || self.shared.key_frames_pending.load(Ordering::Relaxed) > 0;
         if !newer_waiting {
             self.backlog_since = None;
-            return true;
+            return (true, false);
         }
         let since = *self.backlog_since.get_or_insert(now);
         let backlog = now.saturating_duration_since(since);
         if backlog >= PACING_MAX_BACKLOG {
             // Still behind: show this frame so motion stays visible, and start a new window.
             self.backlog_since = Some(now);
-            return true;
+            return (true, true);
         }
         let window_ms = self.interval_ms.clamp(4.0, 50.0) * 1.5;
         let lasting = backlog.as_secs_f64() * 1000.0 >= window_ms;
@@ -4736,7 +4853,64 @@ impl PresentPacer {
         let behind = pts.map_or(false, |pts| {
             newest != i64::MIN && newest >= pts && (newest - pts) as f64 >= window_ms
         });
-        !(lasting || behind)
+        (!(lasting || behind), false)
+    }
+}
+
+/// MMCSS "Playback" for a display's decoder thread while its decoder outputs GPU textures
+/// (enable-viewer-mmcss): registered when the decoder becomes a vram one, reverted when it stops
+/// being one or the thread ends. Software and RAM decoding stay at the thread's normal priority,
+/// so a CPU-heavy decode cannot starve the UI threads that present.
+#[cfg(windows)]
+struct DecoderMmcss {
+    enabled: bool,
+    display: usize,
+    // Whether the decoder was a GPU one at the last update (None before the first).
+    gpu: Option<bool>,
+    registration: Option<crate::platform::windows::MmcssRegistration>,
+}
+
+#[cfg(windows)]
+impl DecoderMmcss {
+    fn new(display: usize) -> Self {
+        let enabled = crate::platform::windows::viewer_mmcss_enabled();
+        if !enabled {
+            log::info!("LATENCY client mmcss display={display} task=Playback state=off");
+        }
+        Self {
+            enabled,
+            display,
+            gpu: None,
+            registration: None,
+        }
+    }
+
+    /// After each decode: registers or reverts when the decoder kind changed. Cheap otherwise.
+    fn update(&mut self, gpu: bool) {
+        if !self.enabled || self.gpu == Some(gpu) {
+            return;
+        }
+        let first = self.gpu.is_none();
+        self.gpu = Some(gpu);
+        // Revert before a new registration.
+        self.registration = None;
+        if gpu {
+            self.registration = crate::platform::windows::mmcss_register("Playback");
+        } else if first {
+            // Never registered: nothing to log.
+            return;
+        }
+        log::info!(
+            "LATENCY client mmcss display={} task=Playback state={}",
+            self.display,
+            if !gpu {
+                "reverted"
+            } else if self.registration.is_some() {
+                "on"
+            } else {
+                "failed"
+            }
+        );
     }
 }
 
@@ -4778,6 +4952,8 @@ pub fn start_video_thread<F, T>(
         // thread is dedicated, the guard only lives as long as it.
         #[cfg(windows)]
         let _priority_boost = crate::platform::windows::viewer_thread_boost("decoder", Some(display));
+        #[cfg(windows)]
+        let mut decoder_mmcss = DecoderMmcss::new(display);
         #[cfg(windows)]
         sync_cpu_usage();
         get_hwcodec_config();
@@ -4840,18 +5016,49 @@ pub fn start_video_thread<F, T>(
                                 warmup = 0;
                             }
                             let decode_start = std::time::Instant::now();
-                            match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
-                                Ok(true) => {
+                            // Present pacing: a stale frame is decoded (later frames reference
+                            // it) but not handed to the UI. With enable-viewer-decode-no-output
+                            // the decision comes before the decode, and a frame that will not be
+                            // shown is decoded without conversion.
+                            let decide_before = pacer.decode_without_output();
+                            let want_output = !decide_before
+                                || pacer.should_present(
+                                    key_frame,
+                                    latency_pts,
+                                    video_queue.read().unwrap().len(),
+                                    decode_start,
+                                );
+                            let result = handler.handle_frame(
+                                vf,
+                                &mut pixelbuffer,
+                                &mut tmp_chroma,
+                                want_output,
+                            );
+                            #[cfg(windows)]
+                            decoder_mmcss.update(handler.is_vram());
+                            match result {
+                                Ok(output) if output.decoded() => {
                                     let decode_end = std::time::Instant::now();
-                                    // Present pacing: a stale frame is decoded (later frames
-                                    // reference it) but not handed to the UI.
-                                    let present = !pacer.enabled()
-                                        || pacer.should_present(
+                                    let present = if !pacer.enabled() {
+                                        true
+                                    } else if decide_before {
+                                        want_output
+                                            && pacer.still_present(
+                                                latency_pts,
+                                                video_queue.read().unwrap().len(),
+                                                decode_end,
+                                            )
+                                    } else {
+                                        pacer.should_present(
                                             key_frame,
                                             latency_pts,
                                             video_queue.read().unwrap().len(),
                                             decode_end,
-                                        );
+                                        )
+                                    };
+                                    if output == DecodeOutput::DecodedNoOutput {
+                                        counters.no_output.fetch_add(1, Ordering::Relaxed);
+                                    }
                                     if present {
                                         video_callback(
                                             display,
@@ -4886,6 +5093,7 @@ pub fn start_video_thread<F, T>(
                                         format,
                                         gpu_texture: !pixelbuffer,
                                         paced: pacer.enabled(),
+                                        no_output: output == DecodeOutput::DecodedNoOutput,
                                     };
                                     if present {
                                         latency::on_frame_done(
@@ -4926,11 +5134,19 @@ pub fn start_video_thread<F, T>(
                                         &mut duration,
                                     );
                                 }
-                                Ok(false) => {
+                                Ok(_) => {
                                     counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    if decide_before {
+                                        // The decision was spent on a frame that was not
+                                        // decoded: show the next decoded one.
+                                        pacer.reset();
+                                    }
                                 }
                                 Err(e) => {
                                     counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    if decide_before {
+                                        pacer.reset();
+                                    }
                                     // This is a simple workaround.
                                     //
                                     // I only see the following error:

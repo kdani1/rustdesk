@@ -122,6 +122,26 @@ pub struct Decoder {
     i420: Vec<u8>,
 }
 
+/// What `Decoder::handle_video_frame` produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeOutput {
+    /// A picture was decoded and written to the output (`rgb`, or `texture` on the GPU path).
+    Output,
+    /// A picture was decoded but, as the caller asked, not converted or handed out: the output
+    /// still holds the previous picture. A success, like `Output`.
+    DecodedNoOutput,
+    /// No picture: the packets produced none, or converting it failed. A failure, as `false`
+    /// was before.
+    NoFrame,
+}
+
+impl DecodeOutput {
+    /// Whether a picture was decoded (with or without output).
+    pub fn decoded(self) -> bool {
+        self != DecodeOutput::NoFrame
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EncodingUpdate {
     Update(i32, SupportedDecoding),
@@ -627,6 +647,15 @@ impl Decoder {
         self.valid
     }
 
+    /// Whether the decoder outputs GPU textures (the D3D11 vram path).
+    pub fn is_vram(&self) -> bool {
+        #[cfg(feature = "vram")]
+        if self.h264_vram.is_some() || self.h265_vram.is_some() {
+            return true;
+        }
+        false
+    }
+
     /// The decoder in use, for logs: "vram/<driver>" (GPU texture output), "hwram/<FFmpeg
     /// decoder>/<device>", "vpx", "aom", "other" (MediaCodec) or "none".
     pub fn describe(&self) -> String {
@@ -648,6 +677,11 @@ impl Decoder {
     }
 
     // rgb [in/out] fmt and stride must be set in ImageRgb
+    //
+    // `want_output == false`: the caller will not show this picture (present pacing). It is
+    // still decoded, since later frames reference it, but not converted or handed out, and the
+    // result is `DecodeOutput::DecodedNoOutput` (a success). `rgb` / `texture` keep the previous
+    // picture then.
     pub fn handle_video_frame(
         &mut self,
         frame: &video_frame::Union,
@@ -655,25 +689,26 @@ impl Decoder {
         _texture: &mut ImageTexture,
         _pixelbuffer: &mut bool,
         chroma: &mut Option<Chroma>,
-    ) -> ResultType<bool> {
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         match frame {
             video_frame::Union::Vp8s(vp8s) => {
                 if let Some(vp8) = &mut self.vp8 {
-                    Decoder::handle_vpxs_video_frame(vp8, vp8s, rgb, chroma)
+                    Decoder::handle_vpxs_video_frame(vp8, vp8s, rgb, chroma, want_output)
                 } else {
                     bail!("vp8 decoder not available");
                 }
             }
             video_frame::Union::Vp9s(vp9s) => {
                 if let Some(vp9) = &mut self.vp9 {
-                    Decoder::handle_vpxs_video_frame(vp9, vp9s, rgb, chroma)
+                    Decoder::handle_vpxs_video_frame(vp9, vp9s, rgb, chroma, want_output)
                 } else {
                     bail!("vp9 decoder not available");
                 }
             }
             video_frame::Union::Av1s(av1s) => {
                 if let Some(av1) = &mut self.av1 {
-                    Decoder::handle_av1s_video_frame(av1, av1s, rgb, chroma)
+                    Decoder::handle_av1s_video_frame(av1, av1s, rgb, chroma, want_output)
                 } else {
                     bail!("av1 decoder not available");
                 }
@@ -684,11 +719,22 @@ impl Decoder {
                 #[cfg(feature = "vram")]
                 if let Some(decoder) = &mut self.h264_vram {
                     *_pixelbuffer = false;
-                    return Decoder::handle_vram_video_frame(decoder, h264s, _texture);
+                    return Decoder::handle_vram_video_frame(
+                        decoder,
+                        h264s,
+                        _texture,
+                        want_output,
+                    );
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h264_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h264s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h264s,
+                        rgb,
+                        &mut self.i420,
+                        want_output,
+                    );
                 }
                 Err(anyhow!("don't support h264!"))
             }
@@ -698,11 +744,22 @@ impl Decoder {
                 #[cfg(feature = "vram")]
                 if let Some(decoder) = &mut self.h265_vram {
                     *_pixelbuffer = false;
-                    return Decoder::handle_vram_video_frame(decoder, h265s, _texture);
+                    return Decoder::handle_vram_video_frame(
+                        decoder,
+                        h265s,
+                        _texture,
+                        want_output,
+                    );
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h265_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h265s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h265s,
+                        rgb,
+                        &mut self.i420,
+                        want_output,
+                    );
                 }
                 Err(anyhow!("don't support h265!"))
             }
@@ -710,7 +767,7 @@ impl Decoder {
             video_frame::Union::H264s(h264s) => {
                 *chroma = Some(Chroma::I420);
                 if let Some(decoder) = &mut self.h264_media_codec {
-                    Decoder::handle_mediacodec_video_frame(decoder, h264s, rgb)
+                    Decoder::handle_mediacodec_video_frame(decoder, h264s, rgb, want_output)
                 } else {
                     Err(anyhow!("don't support h264!"))
                 }
@@ -719,7 +776,7 @@ impl Decoder {
             video_frame::Union::H265s(h265s) => {
                 *chroma = Some(Chroma::I420);
                 if let Some(decoder) = &mut self.h265_media_codec {
-                    Decoder::handle_mediacodec_video_frame(decoder, h265s, rgb)
+                    Decoder::handle_mediacodec_video_frame(decoder, h265s, rgb, want_output)
                 } else {
                     Err(anyhow!("don't support h265!"))
                 }
@@ -734,7 +791,8 @@ impl Decoder {
         vpxs: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
         chroma: &mut Option<Chroma>,
-    ) -> ResultType<bool> {
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         let mut last_frame = vpxcodec::Image::new();
         for vpx in vpxs.frames.iter() {
             for frame in decoder.decode(&vpx.data)? {
@@ -747,11 +805,14 @@ impl Decoder {
             last_frame = frame;
         }
         if last_frame.is_null() {
-            Ok(false)
+            Ok(DecodeOutput::NoFrame)
         } else {
             *chroma = Some(last_frame.chroma());
+            if !want_output {
+                return Ok(DecodeOutput::DecodedNoOutput);
+            }
             last_frame.to(rgb);
-            Ok(true)
+            Ok(DecodeOutput::Output)
         }
     }
 
@@ -761,7 +822,8 @@ impl Decoder {
         av1s: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
         chroma: &mut Option<Chroma>,
-    ) -> ResultType<bool> {
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         let mut last_frame = aom::Image::new();
         for av1 in av1s.frames.iter() {
             for frame in decoder.decode(&av1.data)? {
@@ -774,32 +836,46 @@ impl Decoder {
             last_frame = frame;
         }
         if last_frame.is_null() {
-            Ok(false)
+            Ok(DecodeOutput::NoFrame)
         } else {
             *chroma = Some(last_frame.chroma());
+            if !want_output {
+                return Ok(DecodeOutput::DecodedNoOutput);
+            }
             last_frame.to(rgb);
-            Ok(true)
+            Ok(DecodeOutput::Output)
         }
     }
 
     // rgb [in/out] fmt and stride must be set in ImageRgb
+    //
+    // Converts only the last image of each `decode()` call (the images borrow the decoder, so
+    // none can be kept across the next packet's call), and none without output.
     #[cfg(feature = "hwcodec")]
     fn handle_hwram_video_frame(
         decoder: &mut HwRamDecoder,
         frames: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
         i420: &mut Vec<u8>,
-    ) -> ResultType<bool> {
-        let mut ret = false;
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
+        let mut converted = false;
+        let mut decoded = false;
         for h264 in frames.frames.iter() {
-            for image in decoder.decode(&h264.data)? {
-                // TODO: just process the last frame
-                if image.to_fmt(rgb, i420).is_ok() {
-                    ret = true;
+            if let Some(image) = decoder.decode(&h264.data)?.last() {
+                decoded = true;
+                if want_output && image.to_fmt(rgb, i420).is_ok() {
+                    converted = true;
                 }
             }
         }
-        return Ok(ret);
+        Ok(if converted {
+            DecodeOutput::Output
+        } else if decoded && !want_output {
+            DecodeOutput::DecodedNoOutput
+        } else {
+            DecodeOutput::NoFrame
+        })
     }
 
     #[cfg(feature = "vram")]
@@ -807,16 +883,27 @@ impl Decoder {
         decoder: &mut VRamDecoder,
         frames: &EncodedVideoFrames,
         texture: &mut ImageTexture,
-    ) -> ResultType<bool> {
-        let mut ret = false;
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
+        let mut ret = DecodeOutput::NoFrame;
         for h26x in frames.frames.iter() {
-            for image in decoder.decode(&h26x.data)? {
-                *texture = ImageTexture {
-                    texture: image.frame.texture,
-                    w: image.frame.width as _,
-                    h: image.frame.height as _,
-                };
-                ret = true;
+            match decoder.decode_with_output(&h26x.data, want_output)? {
+                Some(images) => {
+                    for image in images {
+                        *texture = ImageTexture {
+                            texture: image.frame.texture,
+                            w: image.frame.width as _,
+                            h: image.frame.height as _,
+                        };
+                        ret = DecodeOutput::Output;
+                    }
+                }
+                // Decoded on the GPU without conversion (FFMPEG driver).
+                None => {
+                    if ret == DecodeOutput::NoFrame {
+                        ret = DecodeOutput::DecodedNoOutput;
+                    }
+                }
             }
         }
         return Ok(ret);
@@ -828,12 +915,12 @@ impl Decoder {
         decoder: &mut MediaCodecDecoder,
         frames: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
-    ) -> ResultType<bool> {
-        let mut ret = false;
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         for h264 in frames.frames.iter() {
-            return decoder.decode(&h264.data, rgb);
+            return decoder.decode(&h264.data, rgb, want_output);
         }
-        return Ok(false);
+        return Ok(DecodeOutput::NoFrame);
     }
 
     fn preference(id: Option<&str>) -> (PreferCodec, Chroma) {

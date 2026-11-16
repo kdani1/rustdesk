@@ -183,6 +183,8 @@ pub struct DecodedFrame {
     pub gpu_texture: bool,
     // Present pacing on for this display.
     pub paced: bool,
+    // Decoded without output (`DecodeOutput::DecodedNoOutput`): no conversion was done.
+    pub no_output: bool,
 }
 
 struct StreamLatency {
@@ -217,8 +219,13 @@ struct StreamLatency {
     net_srv: Samples,
     queue: Samples,
     decode: Samples,
-    // `decode` of the frames present pacing did not hand to the UI.
+    // `decode` of the frames present pacing did not hand to the UI and that were decoded
+    // without output.
     decode_skip: Samples,
+    // `decode` of the frames present pacing did not hand to the UI although they were
+    // converted (turned stale during the decode, pacing decided after the decode, or a decoder
+    // that always outputs).
+    decode_skip_conv: Samples,
     to_ui: Samples,
     ui_take: Samples,
     total: Samples,
@@ -256,6 +263,7 @@ impl StreamLatency {
             queue: Default::default(),
             decode: Default::default(),
             decode_skip: Default::default(),
+            decode_skip_conv: Default::default(),
             to_ui: Default::default(),
             ui_take: Default::default(),
             total: Default::default(),
@@ -301,6 +309,7 @@ impl StreamLatency {
         c.received += t.received;
         c.discarded += t.discarded;
         c.decoded += t.decoded;
+        c.no_output += t.no_output;
         c.failed += t.failed;
         c.shown += t.shown;
         c.ui_lost += t.ui_lost;
@@ -414,8 +423,12 @@ impl StreamLatency {
     // A frame present pacing decoded but did not hand to the UI: no `queue`/`to_ui`/`total`.
     fn on_frame_skipped(&mut self, frame: DecodedFrame, queue_len: usize) {
         self.on_decoded(&frame, queue_len);
-        self.decode_skip
-            .push(frame.decode_end.saturating_duration_since(frame.decode_start));
+        let took = frame.decode_end.saturating_duration_since(frame.decode_start);
+        if frame.no_output {
+            self.decode_skip.push(took);
+        } else {
+            self.decode_skip_conv.push(took);
+        }
     }
 
     /// Returns the report line when a window ended; the caller logs it after
@@ -431,6 +444,7 @@ impl StreamLatency {
             let queue = self.queue.summary();
             let decode = self.decode.summary();
             let decode_skip = self.decode_skip.summary();
+            let decode_skip_conv = self.decode_skip_conv.summary();
             let shown_gap = self.shown_gap.summary();
             let to_ui = self.to_ui.summary();
             let ui_take = self.ui_take.summary();
@@ -442,7 +456,7 @@ impl StreamLatency {
             let fmt_rate = |n: usize| rate(n).map_or("n/a".to_owned(), |r| format!("{:.1}", r));
             let skipped = c.decoded.saturating_sub(c.shown);
             let line = format!(
-                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} shown_gap={} discard={} dec_fail={} via={}",
+                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} discard={} dec_fail={} via={}",
                 self.display,
                 self.codec.map_or("-".to_owned(), |c| c.to_string()),
                 self.gpu_texture,
@@ -464,6 +478,8 @@ impl StreamLatency {
                 fmt_rate(c.displayed()),
                 skipped,
                 format_summary(decode_skip),
+                format_summary(decode_skip_conv),
+                c.no_output,
                 format_summary(shown_gap),
                 c.discarded,
                 c.failed,
@@ -499,6 +515,7 @@ impl StreamLatency {
         self.queue.clear();
         self.decode.clear();
         self.decode_skip.clear();
+        self.decode_skip_conv.clear();
         self.to_ui.clear();
         self.ui_take.clear();
         self.total.clear();
@@ -981,6 +998,7 @@ mod tests {
             enabled: true,
             key_frames_pending: Default::default(),
             newest_pts: std::sync::atomic::AtomicI64::new(i64::MIN),
+            decode_no_output: true,
         }))
     }
 
@@ -1013,6 +1031,34 @@ mod tests {
         // A key frame is always shown.
         receive(&p, 500);
         assert!(p.should_present(true, Some(408), 5, ms(440)));
+    }
+
+    #[test]
+    fn present_pacing_latency_rechecks_after_decode() {
+        let mut p = pacer();
+        assert!(p.decode_without_output());
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // First frame: shown unconditionally, no recheck.
+        receive(&p, 0);
+        assert!(p.should_present(false, Some(0), 0, ms(0)));
+        receive(&p, 100);
+        assert!(p.still_present(Some(0), 3, ms(5)));
+        // Nothing waits before the decode: decoded with output. Two newer frames arrived during
+        // the decode: only the UI callback is skipped.
+        receive(&p, 17);
+        assert!(p.should_present(false, Some(17), 0, ms(20)));
+        receive(&p, 51);
+        assert!(!p.still_present(Some(17), 2, ms(30)));
+        // Nothing arrived during the decode: shown.
+        receive(&p, 68);
+        assert!(p.should_present(false, Some(68), 0, ms(70)));
+        assert!(p.still_present(Some(68), 0, ms(75)));
+        // A key frame is never rechecked.
+        receive(&p, 85);
+        assert!(p.should_present(true, Some(85), 0, ms(90)));
+        receive(&p, 200);
+        assert!(p.still_present(Some(85), 5, ms(95)));
     }
 
     #[test]
@@ -1050,6 +1096,7 @@ mod tests {
             format: CodecFormat::H265,
             gpu_texture: true,
             paced: true,
+            no_output: pts == 0,
         };
         s.on_frame_skipped(frame(0, t0 + Duration::from_millis(2)), 1);
         s.on_frame_done(
@@ -1069,6 +1116,30 @@ mod tests {
         assert!(line.contains(" pacing=on "));
         assert!(line.contains(" ui_replaced=1 "));
         assert!(line.contains(" decode_skip=4.0/4.0/4.0 "));
+        assert!(line.contains(" decode_skip_conv=n/a "));
+    }
+
+    #[test]
+    fn latency_converted_skips_stay_out_of_decode_skip() {
+        let mut s = StreamLatency::new(0);
+        let t0 = s.base + Duration::from_millis(1000);
+        let frame = |no_output: bool, at: Instant, ms: u64| DecodedFrame {
+            pts: None,
+            dequeued: at,
+            decode_start: at,
+            decode_end: at + Duration::from_millis(ms),
+            format: CodecFormat::H264,
+            gpu_texture: true,
+            paced: true,
+            no_output,
+        };
+        s.on_frame_skipped(frame(true, t0, 1), 1);
+        s.on_frame_skipped(frame(false, t0 + Duration::from_millis(5), 6), 1);
+        assert_eq!(s.decode_skip.0.len(), 1);
+        assert_eq!(s.decode_skip_conv.0.len(), 1);
+        let line = s.maybe_report(s.window_start + REPORT_INTERVAL).unwrap();
+        assert!(line.contains(" decode_skip=1.0/1.0/1.0 "));
+        assert!(line.contains(" decode_skip_conv=6.0/6.0/6.0 "));
     }
 
     #[test]
@@ -1084,6 +1155,7 @@ mod tests {
             format: CodecFormat::H265,
             gpu_texture: false,
             paced: true,
+            no_output: false,
         };
         s.on_frame_done(frame(ms(0)), ms(0), false, false, 0);
         s.on_frame_done(frame(ms(17)), ms(17), false, false, 0);

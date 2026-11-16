@@ -9,7 +9,7 @@ use std::{
 
 use crate::ImageFormat;
 use crate::{
-    codec::{EncoderApi, EncoderCfg},
+    codec::{DecodeOutput, EncoderApi, EncoderCfg},
     CodecFormat, I420ToABGR, I420ToARGB, ImageRgb,
 };
 
@@ -50,7 +50,15 @@ impl MediaCodecDecoder {
     }
 
     // rgb [in/out] fmt and stride must be set in ImageRgb
-    pub fn decode(&mut self, data: &[u8], rgb: &mut ImageRgb) -> ResultType<bool> {
+    //
+    // `want_output == false`: the output buffer is released without the YUV -> RGBA conversion
+    // (`DecodeOutput::DecodedNoOutput`), `rgb` keeps the previous picture.
+    pub fn decode(
+        &mut self,
+        data: &[u8],
+        rgb: &mut ImageRgb,
+        want_output: bool,
+    ) -> ResultType<DecodeOutput> {
         // take dst_stride into account please
         let dst_stride = rgb.stride();
         match self.dequeue_input_buffer(Duration::from_millis(10))? {
@@ -70,6 +78,10 @@ impl MediaCodecDecoder {
 
         return match self.dequeue_output_buffer(Duration::from_millis(100))? {
             Some(output_buffer) => {
+                if !want_output {
+                    self.release_output_buffer(output_buffer, false)?;
+                    return Ok(DecodeOutput::DecodedNoOutput);
+                }
                 let res_format = self.output_format();
                 let w = res_format
                     .i32("width")
@@ -105,6 +117,8 @@ impl MediaCodecDecoder {
                                 h as _,
                             );
                         }
+                        // FIXME (reported, not changed here): this arm repeats ARGB, so it is
+                        // unreachable and ABGR falls through to "Unsupported image format".
                         ImageFormat::ARGB => {
                             I420ToABGR(
                                 y_ptr,
@@ -125,11 +139,11 @@ impl MediaCodecDecoder {
                     }
                 }
                 self.release_output_buffer(output_buffer, false)?;
-                Ok(true)
+                Ok(DecodeOutput::Output)
             }
             None => {
                 log::debug!("Failed to dequeue_output: No available dequeue_output");
-                Ok(false)
+                Ok(DecodeOutput::NoFrame)
             }
         };
     }

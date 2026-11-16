@@ -381,6 +381,23 @@ impl VRamDecoder {
             Err(e) => Err(anyhow!(e)),
         }
     }
+
+    /// `decode` that, with `output == false`, skips the NV12 -> BGRA conversion and the texture
+    /// hand-off on the FFMPEG driver: `Ok(None)` then means a picture was decoded without
+    /// output. AMF/MFX ignore the flag and always output (`Ok(Some(images))`).
+    pub fn decode_with_output<'a>(
+        &'a mut self,
+        data: &[u8],
+        output: bool,
+    ) -> ResultType<Option<Vec<VRamDecoderImage<'a>>>> {
+        match self.decoder.decode_with_output(data, output) {
+            Ok(Some(v)) => Ok(Some(
+                v.iter().map(|f| VRamDecoderImage { frame: f }).collect(),
+            )),
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow!(e)),
+        }
+    }
 }
 
 pub struct VRamDecoderImage<'a> {

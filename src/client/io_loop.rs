@@ -1801,13 +1801,14 @@ impl<T: InvokeUiSession> Remote<T> {
                 ),
             };
             out += &format!(
-                " d{} rx={} dec={} shown={} ui_lost={} skip={} discard={} fail={} queue_len={} queue_max={} decode_fps={} dec_ms={} present_ms={} other_ms={} idle={} inactive={} trend={} net+server={};",
+                " d{} rx={} dec={} shown={} ui_lost={} skip={} noout={} discard={} fail={} queue_len={} queue_max={} decode_fps={} dec_ms={} present_ms={} other_ms={} idle={} inactive={} trend={} net+server={};",
                 display,
                 c.received,
                 c.decoded,
                 c.shown,
                 c.ui_lost,
                 c.decoded.saturating_sub(c.shown),
+                c.no_output,
                 c.discarded,
                 c.failed,
                 queue_len,

@@ -1,3 +1,50 @@
+diff --git a/cpp/common/platform/win/win.cpp b/cpp/common/platform/win/win.cpp
+index 2004166..f1477e7 100644
+--- a/cpp/common/platform/win/win.cpp
++++ b/cpp/common/platform/win/win.cpp
+@@ -379,9 +379,19 @@ void NativeDevice::BeginQuery() { context_->Begin(query_.Get()); }
+ 
+ void NativeDevice::EndQuery() { context_->End(query_.Get()); }
+ 
++// Waits for the event query: polls for at most 0.2 ms (the old loop polled 100 times, about
++// 0.1-0.3 ms), each failed poll followed by Sleep(0), then sleeps 1 ms per poll. Sleep(0)
++// returns at once unless a thread of equal or higher priority is ready, so the decoder never
++// gives its time slice to a lower-priority thread (SwitchToThread can, for a whole quantum).
++// It gives up after about the same number of sleeps as before (900).
+ bool NativeDevice::Query() {
+   BOOL bResult = FALSE;
+-  int attempts = 0;
++  LARGE_INTEGER freq, start, now;
++  QueryPerformanceFrequency(&freq);
++  QueryPerformanceCounter(&start);
++  const LONGLONG poll_ticks = freq.QuadPart / 5000; // 0.2 ms
++  bool polling = true;
++  int sleeps = 0;
+   while (!bResult) {
+     HRESULT hr = context_->GetData(query_.Get(), &bResult, sizeof(BOOL), 0);
+     if (SUCCEEDED(hr)) {
+@@ -389,11 +399,17 @@ bool NativeDevice::Query() {
+         break;
+       }
+     }
+-    attempts++;
+-    if (attempts > 100)
++    if (polling) {
++      QueryPerformanceCounter(&now);
++      polling = now.QuadPart - start.QuadPart < poll_ticks;
++    }
++    if (polling) {
++      Sleep(0);
++    } else {
++      if (++sleeps > 900)
++        break;
+       Sleep(1);
+-    if (attempts > 1000)
+-      break;
++    }
+   }
+   return bResult == TRUE;
+ }
 diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
 index 45810b4..b251804 100644
 --- a/cpp/common/util.cpp
@@ -37,6 +84,93 @@ index 0a8d1b1..4f1da97 100644
    }
  
    int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
+diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp
+index f8a0f92..6dfb0cf 100644
+--- a/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp
++++ b/cpp/ffmpeg_vram/ffmpeg_vram_decode.cpp
+@@ -161,7 +161,7 @@ public:
+   }
+ 
+   int decode(const uint8_t *data, int length, DecodeCallback callback,
+-             const void *obj) {
++             const void *obj, bool output) {
+     int ret = -1;
+ 
+     if (!data || !length) {
+@@ -170,12 +170,15 @@ public:
+     }
+     pkt_->data = (uint8_t *)data;
+     pkt_->size = length;
+-    ret = do_decode(callback, obj);
++    ret = do_decode(callback, obj, output);
+     return ret;
+   }
+ 
+ private:
+-  int do_decode(DecodeCallback callback, const void *obj) {
++  // output == false: decode only. No NV12 -> BGRA conversion, no texture pool rotation and no
++  // callback; one GPU event query still waits for the decode work, so the decode time stays
++  // honest and the GPU queue cannot run ahead of the decoder's surface pool.
++  int do_decode(DecodeCallback callback, const void *obj, bool output) {
+     int ret;
+     bool decoded = false;
+     bool locked = false;
+@@ -200,12 +203,19 @@ private:
+       }
+       lockContext(this);
+       locked = true;
+-      if (!convert(frame_, callback, obj)) {
+-        LOG_ERROR(std::string("Failed to convert"));
+-        goto _exit;
++      if (output) {
++        if (!convert(frame_, callback, obj)) {
++          LOG_ERROR(std::string("Failed to convert"));
++          goto _exit;
++        }
++        if (callback)
++          callback(native_->GetCurrentTexture(), obj);
++      } else {
++        // An event query needs no Begin; it completes once all earlier work, the decode
++        // included, has finished. A timeout is ignored, as in convert().
++        native_->EndQuery();
++        native_->Query();
+       }
+-      if (callback)
+-        callback(native_->GetCurrentTexture(), obj);
+       decoded = true;
+     }
+   _exit:
+@@ -337,11 +347,13 @@ extern "C" FFmpegVRamDecoder *ffmpeg_vram_new_decoder(void *device,
+   return NULL;
+ }
+ 
+-extern "C" int ffmpeg_vram_decode(FFmpegVRamDecoder *decoder,
+-                                  const uint8_t *data, int length,
+-                                  DecodeCallback callback, const void *obj) {
++// output == 0: decode only (see do_decode); the callback is not called.
++extern "C" int ffmpeg_vram_decode2(FFmpegVRamDecoder *decoder,
++                                   const uint8_t *data, int length,
++                                   DecodeCallback callback, const void *obj,
++                                   int output) {
+   try {
+-    int ret = decoder->decode(data, length, callback, obj);
++    int ret = decoder->decode(data, length, callback, obj, output != 0);
+     if (DataFormat::H265 == decoder->dataFormat_ && util_decode::has_flag_could_not_find_ref_with_poc()) {
+       return HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC;
+     } else {
+@@ -353,6 +365,12 @@ extern "C" int ffmpeg_vram_decode(FFmpegVRamDecoder *decoder,
+   return HWCODEC_ERR_COMMON;
+ }
+ 
++extern "C" int ffmpeg_vram_decode(FFmpegVRamDecoder *decoder,
++                                  const uint8_t *data, int length,
++                                  DecodeCallback callback, const void *obj) {
++  return ffmpeg_vram_decode2(decoder, data, length, callback, obj, 1);
++}
++
+ extern "C" int ffmpeg_vram_test_decode(int64_t *outLuids, int32_t *outVendors,
+                                        int32_t maxDescNum, int32_t *outDescNum,
+                                        DataFormat dataFormat,
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 index 2b21b73..63789ed 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
@@ -75,3 +209,58 @@ index 2b21b73..63789ed 100644
    } catch (const std::exception &e) {
      LOG_ERROR(std::string("ffmpeg_vram_set_framerate failed, ") + std::string(e.what()));
    }
+diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h b/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
+index 7a7f5f8..33231eb 100644
+--- a/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
++++ b/cpp/ffmpeg_vram/ffmpeg_vram_ffi.h
+@@ -8,6 +8,9 @@ void *ffmpeg_vram_new_decoder(void *device, int64_t luid,
+                               int32_t codecID);
+ int ffmpeg_vram_decode(void *decoder, uint8_t *data, int len,
+                        DecodeCallback callback, void *obj);
++// output == 0: decode only, no NV12 -> BGRA conversion and no callback (one GPU sync remains).
++int ffmpeg_vram_decode2(void *decoder, uint8_t *data, int len,
++                        DecodeCallback callback, void *obj, int output);
+ int ffmpeg_vram_destroy_decoder(void *decoder);
+ int ffmpeg_vram_test_decode(int64_t *outLuids, int32_t *outVendors, int32_t maxDescNum,
+                             int32_t *outDescNum,
+diff --git a/src/vram/decode.rs b/src/vram/decode.rs
+index aa43ad7..e49575b 100644
+--- a/src/vram/decode.rs
++++ b/src/vram/decode.rs
+@@ -70,6 +70,36 @@ impl Decoder {
+         }
+     }
+ 
++    /// Like `decode`, but with `output == false` the FFMPEG driver only decodes the packet: no
++    /// NV12 -> BGRA conversion, no texture hand-off and no frames (one GPU sync query still
++    /// waits for the decode). `Ok(None)` then means a picture was decoded without output. Other
++    /// drivers ignore `output` and always output (`Ok(Some(frames))`).
++    pub fn decode_with_output(
++        &mut self,
++        packet: &[u8],
++        output: bool,
++    ) -> Result<Option<&mut Vec<DecodeFrame>>, i32> {
++        if output || self.ctx.driver != FFMPEG {
++            return self.decode(packet).map(Some);
++        }
++        unsafe {
++            (&mut *self.frames).clear();
++            let ret = ffmpeg::ffmpeg_vram_decode2(
++                self.codec,
++                packet.as_ptr() as _,
++                packet.len() as _,
++                None,
++                std::ptr::null_mut(),
++                0,
++            );
++            if ret != 0 {
++                Err(ret)
++            } else {
++                Ok(None)
++            }
++        }
++    }
++
+     unsafe extern "C" fn callback(texture: *mut c_void, obj: *const c_void) {
+         let frames = &mut *(obj as *mut Vec<DecodeFrame>);
+         let mut width = 0;
