@@ -81,8 +81,9 @@ pub type WriterHandle = JoinHandle<Result<(), String>>;
 
 /// The connection's part of video writes; run by the writer task.
 pub trait WriterHooks: Send + 'static {
-    /// A video item was taken off the channel, before its write ("fetched").
-    fn video_dequeued(&mut self, msg: &Message, queued_at: Instant);
+    /// A video item was taken off the channel, before its write ("fetched"). The shared
+    /// message, so a hook can keep it past the write (the UDP shadow copy).
+    fn video_dequeued(&mut self, msg: &Arc<Message>, queued_at: Instant);
     /// The write of a video item completed.
     fn video_sent(&mut self, msg: &Message, send: Duration);
     /// The writer ended, however: return, error, panic or abort.
@@ -804,7 +805,7 @@ mod tests {
     struct TestHooks(Arc<AtomicBool>);
 
     impl WriterHooks for TestHooks {
-        fn video_dequeued(&mut self, _: &Message, _: Instant) {}
+        fn video_dequeued(&mut self, _: &Arc<Message>, _: Instant) {}
         fn video_sent(&mut self, _: &Message, _: Duration) {}
         fn writer_exited(&mut self) {
             self.0.store(true, Ordering::SeqCst);

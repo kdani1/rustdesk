@@ -107,6 +107,8 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     cursor_dedupe: CursorDedupe,
+    // Fork-only UDP video lane, shadow probe (docs/UDP-VIDEO.md).
+    udp_video: crate::udp_video::viewer::ViewerLane,
 }
 
 #[derive(Default)]
@@ -163,6 +165,7 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             cursor_dedupe: Default::default(),
+            udp_video: Default::default(),
         }
     }
 
@@ -297,6 +300,14 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut status_timer =
                     crate::rustdesk_interval(time::interval(Duration::new(1, 0)));
                 let mut fps_instant = Instant::now();
+                // A UDP video lane may be offered only on a direct, encrypted TCP session.
+                let udp_local = (conn_type == ConnType::DEFAULT_CONN
+                    && direct
+                    && is_secured
+                    && kcp.is_none()
+                    && !peer.is_webrtc())
+                .then(|| peer.local_addr());
+                let mut udp_rx = self.udp_video.begin_round(&self.handler.get_id(), udp_local);
 
                 let _keep_it = client::hc_connection(feedback, rendezvous_server, token).await;
                 let mut last_recv_time = Instant::now();
@@ -341,6 +352,11 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if !self.handle_msg_from_ui(d, &mut peer).await {
                                     break;
                                 }
+                            }
+                        }
+                        Some(ev) = udp_rx.recv() => {
+                            if let Some(msg) = self.udp_video.on_event(ev) {
+                                allow_err!(peer.send(&msg).await);
                             }
                         }
                         _msg = rx_clip_client.recv() => {
@@ -463,6 +479,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
+                self.udp_video.end_round();
                 client::latency::remove_input(client::latency::stream_key(&self.handler.sender));
                 self.microphone_request = None;
                 self.microphone_active = false;
@@ -1980,6 +1997,7 @@ impl<T: InvokeUiSession> Remote<T> {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
                 Some(message::Union::VideoFrame(vf)) => {
+                    self.udp_video.on_tcp_frame(&vf);
                     if !self.first_frame {
                         self.first_frame = true;
                         self.handler.close_success();
@@ -2520,6 +2538,12 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(misc::Union::PointerCaptured(captured)) => {
                         self.handler.on_pointer_captured(captured);
                     }
+                    Some(misc::Union::UdpVideoOffer(offer)) => {
+                        if let Some(msg) = self.udp_video.on_offer(&offer) {
+                            allow_err!(peer.send(&msg).await);
+                        }
+                    }
+                    Some(misc::Union::UdpVideoControl(c)) => self.udp_video.on_control(&c),
                     Some(misc::Union::MicrophoneForwarding(response)) => {
                         if response.response && self.microphone_id == Some(response.request_id) {
                             if !response.enabled {

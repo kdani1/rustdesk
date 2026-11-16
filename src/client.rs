@@ -4432,6 +4432,8 @@ impl LoginConfigHandler {
             }
             _ => {}
         }
+        // Fork-only UDP video lane (docs/UDP-VIDEO.md); 0 leaves the field off the wire.
+        lr.udp_video_version = crate::udp_video::viewer::advertised_version(self.conn_type);
 
         let mut msg_out = Message::new();
         msg_out.set_login_request(lr);

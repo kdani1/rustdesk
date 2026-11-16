@@ -14,8 +14,8 @@ Code:
 
 | Side | File | Hooks |
 |---|---|---|
-| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`, split session), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`), `src/platform/windows_qos.rs` (TCP meter, `HostSocket`), `src/session_io.rs` (split writer) |
-| Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer, `fps_control`, writes of UI messages), `src/client.rs` `start_video_thread` (`VideoCounters`, `PresentPacer`), `AudioBuffer` / `start_audio_thread`, `src/client/audio_target.rs` (adaptive audio target), `src/platform/windows.rs` (`viewer_thread_boost`, `viewer_process_boost`), `RaceLog`, `VideoHandler`, `src/client/audio_playback.rs` (underruns), `src/ui_session_interface.rs` `Session::send`, `src/flutter.rs` (soft-render handoff, drop and replace, `next_rgba`, quality status) |
+| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`, split session), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`), `src/platform/windows_qos.rs` (TCP meter, `HostSocket`), `src/session_io.rs` (split writer), `src/udp_video/host.rs` (UDP lane, `UDPVIDEO host`) |
+| Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer, `fps_control`, writes of UI messages), `src/client.rs` `start_video_thread` (`VideoCounters`, `PresentPacer`), `AudioBuffer` / `start_audio_thread`, `src/client/audio_target.rs` (adaptive audio target), `src/platform/windows.rs` (`viewer_thread_boost`, `viewer_process_boost`), `RaceLog`, `VideoHandler`, `src/client/audio_playback.rs` (underruns), `src/ui_session_interface.rs` `Session::send`, `src/flutter.rs` (soft-render handoff, drop and replace, `next_rgba`, quality status), `src/udp_video/viewer.rs` and `shadow.rs` (UDP lane, `UDPVIDEO viewer`) |
 | Flutter | `flutter/lib/models/model.dart` (`ImageModel.onRgba`, `_PaintLatencyStats`, `QualityMonitorModel`) | `flutter/lib/common/widgets/overlay.dart` (`QualityMonitor`) |
 
 ## Turning it on
@@ -293,6 +293,72 @@ With enable-refresh-keyframe or static refine on, `wait` still counts captured f
 so a forced refresh key frame always reaches the socket; its `gap` (`refresh_keyframe`) ends
 when the capture loop hands the frame to the connections, before the writer's queue, as the
 whole stream's gap ends before the loop's video branch.
+
+### UDP video lane (shadow probe)
+
+Roadmap M19, design and negotiation in docs/UDP-VIDEO.md. Off by default: host server option
+`enable-udp-video` `Y`; the viewer option `enable-udp-video` is on by default and only acts
+when a host offers. The video still goes over TCP; every Nth frame (`udp-video-shadow-every`,
+default 2) is also sent over UDP, and the viewer only measures it. These lines are logged
+whenever a lane exists, independent of `enable-latency-log` (the lane exists only to measure).
+
+```
+UDPVIDEO host conn=5 not offered (viewer v1): host option enable-udp-video is not Y
+UDPVIDEO host conn=5 offer lane=3f2a… mode=shadow addr=192.168.1.5:61234 every=2 viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 HELLO from 192.168.1.9:50511 lane=3f2a… at_us=41250
+UDPVIDEO host conn=5 active lane=3f2a… mode=shadow peer=192.168.1.9:50511 every=2 after_ms=47
+UDPVIDEO host conn=5 lane=3f2a… win_s=5.0 frames=150 keys=1 skipped=150 qdrop=0 dgrams=2210 kB=2950 send_ms=0.2/0.6/2.1 lag_ms=0.1/0.3/1.2 err=0 pings=25 refused=0
+UDPVIDEO host conn=5 stop lane=3f2a…: no HELLO from the viewer in 3 s: inbound UDP to this host looks blocked (…)
+UDPVIDEO host conn=5 closed lane=3f2a… state=Active
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=shadow host=192.168.1.5:61234 local=192.168.1.9:50511 every=2
+UDPVIDEO viewer peer=123456789 ready lane=3f2a… after_ms=2 hellos=1
+UDPVIDEO viewer peer=123456789 lane=3f2a… win_s=5.0 frames=150 lost=0 frag_miss=0 dgrams=2235/2235 loss_pct=0.00 reorder=0/0 dup=0 late=0 bad=0 drop=0/0/0/0 matched=150 tcp_first=3 unpaired=0 ahead_net_ms=1.8/6.5/24.0/-0.4 ahead_app_ms=1.1/5.9/22.7/-1.0 owd_var_ms=0.4/2.2/9.8 asm_ms=0.3/1.1/3.0 rtt_ms=2.1/4.0/7.5 pings=25/25 rx_err=0
+UDPVIDEO viewer peer=123456789 refused lane=3f2a…: session is not direct encrypted TCP
+UDPVIDEO viewer peer=123456789 handshake failed lane=3f2a…: no HELLO_ACK in 1000 ms after 50 HELLO (…)
+UDPVIDEO viewer peer=123456789 closed lane=3f2a…: host stopped: …
+```
+
+Host window line (sender thread, every 5 s while the lane is active, and once when it ends):
+
+| Field | Meaning |
+|---|---|
+| `win_s` | length of the window |
+| `frames`, `keys` | shadow copies sent, of them containing a key frame |
+| `skipped` | video frames the every-Nth rule did not copy |
+| `qdrop` | copies dropped because the sender's queue (4) was full: the sender thread fell behind |
+| `dgrams`, `kB` | datagrams and kB the socket took (UDP payload, headers not counted) |
+| `send_ms` | p50/p95/max (nearest rank) of one copy's serialize + seal + `send` of all its datagrams |
+| `lag_ms` | p50/p95/max from the tap to the sender thread taking the copy |
+| `err` | failed serializations, fragmentations and `send` calls; `first_err` is the first one |
+| `pings` | viewer pings answered; `refused`: datagrams dropped before or by the crypto (other source, bad tag, replay) |
+
+Viewer window line (every 5 s from the receive thread's window, combined in the io_loop with
+the pairing of the same 5 s):
+
+| Field | Meaning |
+|---|---|
+| `frames` | shadow frames completed |
+| `lost`, `frag_miss` | frames declared lost (a later frame completed 5 ms earlier, or 50 ms since its first fragment), and their missing fragments |
+| `dgrams` | datagrams received / expected from the lane seq span (pongs and HELLO_ACK share the seq, so a lost pong counts too) |
+| `loss_pct` | `1 - received/expected`, in % |
+| `reorder` | datagrams that arrived after a higher seq / largest seq distance |
+| `dup`, `late`, `bad` | duplicate fragments, fragments of a frame already complete or lost, inconsistent fragments |
+| `drop` | datagrams refused: malformed / replayed / failed authentication / bad inner part |
+| `matched` | frames whose UDP and TCP copies met (by display and pts) |
+| `tcp_first` | of those, how many times TCP handled its copy before UDP completed its own |
+| `unpaired` | UDP copies that found no TCP copy within 2 s |
+| `ahead_net_ms` | p50/p95/max/min of t(TCP copy handled in the io_loop) - t(UDP copy complete on the receive thread). Positive: UDP first. Upper bound: it credits UDP with the io_loop's scheduling delay |
+| `ahead_app_ms` | the same against the time the io_loop's UDP branch handled the copy: both copies pay the loop's delay. The number the M20 decision uses |
+| `owd_var_ms` | p50/p95/max of the one-way delay above the window's minimum (receive time on the viewer's lane clock minus `send_us` of the host's lane clock; the clock offset cancels) |
+| `asm_ms` | p50/p95/max first to last fragment of a frame |
+| `rtt_ms` | p50/p95/max of PING to PONG over the lane (200 ms interval) |
+| `pings` | sent / answered |
+| `rx_err` | receive errors other than the timeout |
+
+Reading them: `loss_pct`/`lost` near 0 and `ahead_app_ms` p95/max near 0 mean TCP loses
+nothing to retransmission on this link, and M20-M22 can wait. `ahead_app_ms` max spikes at the
+moments `LATENCY tcp` shows retransmissions (or `wait`/`send` spikes on the host) mean UDP would
+have delivered those frames earlier. Always note `every`: the copy itself loads the link.
 
 ### Viewer (Rust)
 

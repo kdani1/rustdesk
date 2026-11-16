@@ -468,6 +468,11 @@ pub struct Connection {
     terminal_generic_service: Option<Box<GenericService>>,
     // The reason `on_close` was first called with (the split session's sticky fallback).
     close_reason: String,
+    // Fork-only UDP video lane, shadow probe (docs/UDP-VIDEO.md): what the offer gate needs to
+    // know about the transport, the hook in front of every TCP video send, and the lane.
+    udp_gate: crate::udp_video::host::Gate,
+    udp_tap: Arc<crate::udp_video::host::ShadowTap>,
+    udp_video: Option<crate::udp_video::host::UdpVideoHost>,
 }
 
 /// The connection's part of a split session's video writes, run by the writer task.
@@ -475,10 +480,13 @@ struct SplitHooks {
     id: i32,
     video_ack_required: bool,
     sends: Arc<super::latency_stats::SplitSends>,
+    udp_tap: Arc<crate::udp_video::host::ShadowTap>,
 }
 
 impl crate::session_io::WriterHooks for SplitHooks {
-    fn video_dequeued(&mut self, msg: &Message, queued_at: Instant) {
+    fn video_dequeued(&mut self, msg: &Arc<Message>, queued_at: Instant) {
+        // The UDP shadow copy starts before the TCP write (one atomic load while no lane).
+        self.udp_tap.offer(msg);
         // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames.
         if !self.video_ack_required {
             if let Some(message::Union::VideoFrame(vf)) = &msg.union {
@@ -645,6 +653,17 @@ impl Connection {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tx_cloned = tx.clone();
+        let udp_gate = crate::udp_video::host::Gate {
+            direct_tcp: matches!(
+                transport,
+                super::TransportKind::Intranet
+                    | super::TransportKind::TcpPunch
+                    | super::TransportKind::Direct
+            ),
+            secured: stream.is_secured(),
+            local: stream.local_addr(),
+            peer: addr,
+        };
         let mut conn = Self {
             inner: ConnInner {
                 id,
@@ -746,6 +765,9 @@ impl Connection {
             conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
             conn_audit_two_factor: ConnAuditTwoFactor::None,
             close_reason: String::new(),
+            udp_gate,
+            udp_tap: Default::default(),
+            udp_video: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -872,6 +894,7 @@ impl Connection {
                                 id,
                                 video_ack_required: conn.video_ack_required,
                                 sends: sends.clone(),
+                                udp_tap: conn.udp_tap.clone(),
                             });
                             match conn.stream.split(video, hooks) {
                                 Ok(handle) => {
@@ -894,6 +917,9 @@ impl Connection {
                             }
                         }
                     }
+                }
+                if conn.is_authed_remote_conn() {
+                    conn.udp_video_offer().await;
                 }
             }
             tokio::select! {
@@ -1271,6 +1297,8 @@ impl Connection {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
                         }
                     }
+                    // The UDP shadow copy starts before the TCP send (one atomic load while no lane).
+                    conn.udp_tap.offer(&value);
                     let send_begin = Instant::now();
                     if let Err(err) = conn.stream.send(&value as &Message).await {
                         conn.on_close(&err.to_string(), false).await;
@@ -1365,6 +1393,7 @@ impl Connection {
                         break;
                     }
                     conn_stats.tick(conn.authorized);
+                    conn.udp_video_check().await;
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
                     }
@@ -4120,6 +4149,9 @@ impl Connection {
                             self.update_auto_disconnect_timer();
                         }
                     }
+                    Some(misc::Union::UdpVideoControl(c)) => {
+                        self.on_udp_video_control(&c).await;
+                    }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
                             self.inner.id,
@@ -5556,6 +5588,8 @@ impl Connection {
 
     async fn on_close(&mut self, reason: &str, lock: bool) {
         self.stop_microphone_forwarding("").await;
+        // The UDP lane's threads and socket end with it.
+        self.udp_video = None;
         if self.closed {
             return;
         }
@@ -5896,6 +5930,109 @@ impl Connection {
     #[inline]
     async fn send(&mut self, msg: Message) {
         allow_err!(self.stream.send_msg(msg).await);
+    }
+
+    /// After a remote-control login: offers a UDP video lane (shadow mode) when the viewer
+    /// advertised one and every gate passes; otherwise logs why not, once (docs/UDP-VIDEO.md).
+    async fn udp_video_offer(&mut self) {
+        let version = self.lr.udp_video_version;
+        if version == 0 || self.udp_video.is_some() {
+            // A stock viewer, or one with enable-udp-video=N: nothing to say.
+            return;
+        }
+        let id = self.inner.id;
+        let gate = if !cfg!(windows) {
+            Err("host is not Windows".to_owned())
+        } else if Config::get_option(keys::OPTION_ENABLE_UDP_VIDEO) != "Y" {
+            Err("host option enable-udp-video is not Y".to_owned())
+        } else if self.video_ack_required {
+            Err("the viewer acknowledges frames (web client)".to_owned())
+        } else {
+            crate::udp_video::host::offer_gate(&self.udp_gate)
+        };
+        let (local, viewer) = match gate {
+            Ok(v) => v,
+            Err(why) => {
+                log::info!("UDPVIDEO host conn={id} not offered (viewer v{version}): {why}");
+                return;
+            }
+        };
+        let every = Config::get_option(keys::OPTION_UDP_VIDEO_SHADOW_EVERY)
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (1..=60).contains(n))
+            .unwrap_or(crate::udp_video::host::DEFAULT_SHADOW_EVERY);
+        match crate::udp_video::host::UdpVideoHost::start(
+            id,
+            self.udp_tap.clone(),
+            local,
+            viewer,
+            every,
+        ) {
+            Ok((lane, offer)) => {
+                self.udp_video = Some(lane);
+                let mut misc = Misc::new();
+                misc.set_udp_video_offer(offer);
+                let mut msg = Message::new();
+                msg.set_misc(misc);
+                self.send(msg).await;
+            }
+            Err(why) => log::warn!("UDPVIDEO host conn={id} not offered: {why}"),
+        }
+    }
+
+    async fn on_udp_video_control(&mut self, c: &UdpVideoControl) {
+        let Some(lane) = self.udp_video.as_mut() else {
+            return;
+        };
+        if c.lane_id != lane.lane_id() {
+            return;
+        }
+        match c.kind.enum_value() {
+            Ok(udp_video_control::Kind::KindReady) => {
+                if let Err(why) = lane.on_ready(c.lane_id) {
+                    self.udp_video_stop(&why, true).await;
+                }
+            }
+            Ok(udp_video_control::Kind::KindRequestStop) => {
+                let why = format!("viewer asked: {}", c.reason);
+                self.udp_video_stop(&why, false).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Every second: ends a lane whose handshake timed out.
+    async fn udp_video_check(&mut self) {
+        if let Some(Err(why)) = self.udp_video.as_ref().map(|l| l.check()) {
+            self.udp_video_stop(&why, true).await;
+        }
+    }
+
+    async fn udp_video_stop(&mut self, why: &str, tell_viewer: bool) {
+        let Some(lane) = self.udp_video.take() else {
+            return;
+        };
+        let lane_id = lane.lane_id();
+        log::warn!(
+            "UDPVIDEO host conn={} stop lane={:016x}: {}",
+            self.inner.id,
+            lane_id,
+            why
+        );
+        drop(lane);
+        if tell_viewer {
+            let mut misc = Misc::new();
+            misc.set_udp_video_control(UdpVideoControl {
+                kind: udp_video_control::Kind::KindStop.into(),
+                lane_id,
+                reason: why.to_owned(),
+                ..Default::default()
+            });
+            let mut msg = Message::new();
+            msg.set_misc(misc);
+            self.send(msg).await;
+        }
     }
 
     /// File read jobs: `fs::handle_read_jobs` on the whole stream; split, the same steps with

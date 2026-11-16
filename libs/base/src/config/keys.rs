@@ -306,6 +306,17 @@ pub const OPTION_VIDEO_SNDBUF_KB: &str = "video-sndbuf-kb";
 // next connection; `rustdesk --option enable-split-session-io N` from a terminal session (never
 // split) turns it off. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
+// UDP video lane, shadow probe (roadmap M19, docs/UDP-VIDEO.md). The same key on both sides:
+// - Windows host, server option (Config), off by default: "Y" offers a UDP lane to a fork viewer
+//   that advertised one, after a remote-control login over direct, encrypted TCP with both
+//   addresses on the LAN. Video stays on TCP; a copy of every Nth frame also goes over UDP to be
+//   measured. Read at each login; `rustdesk --option enable-udp-video N` turns it off.
+// - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising the lane
+//   (and refuses an offer), so a reconnect gives a plain TCP session without touching the host.
+pub const OPTION_ENABLE_UDP_VIDEO: &str = "enable-udp-video";
+// Windows host, server option: shadow mode copies one frame in this many to UDP (1..=60). Empty
+// or invalid: 2. Read at each offer.
+pub const OPTION_UDP_VIDEO_SHADOW_EVERY: &str = "udp-video-shadow-every";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -380,6 +391,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
     OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
+    OPTION_ENABLE_UDP_VIDEO,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
     OPTION_PRE_ELEVATE_SERVICE,
