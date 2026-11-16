@@ -169,6 +169,7 @@ LATENCY client audio_policy=adaptive floor_ms=60
 audio trim 412ms to target 60ms, generation=3
 TRANSPORT viewer peer=123456789 type=TCP direct=true secured=true kcp=false rendezvous=rs.example.com:21116 connect_ms=412
 RACE site=connect tcp=ok@180 udp=err@3010 v6=pending webrtc=pending winner=TCP ms=180
+RACE site=start rule=relay_hold preferred=ok@640 tcp_punch_round=ok@95 winner=UDP ms=640
 ```
 
 | Line / field | Meaning |
@@ -183,7 +184,7 @@ RACE site=connect tcp=ok@180 udp=err@3010 v6=pending webrtc=pending winner=TCP m
 | `hw` | `true` for the `vram` path: frames reach the UI as GPU textures (the `hw` of the LATENCY line) |
 | `use_texture_render` | the viewer's texture-render setting. With `vram` and this off nothing is displayed. On desktop the RGBA path uses the texture renderer when this is on or the session shows more than one display, otherwise the soft renderer (`ui_take`, `ui_dropped`). |
 | `TRANSPORT viewer` | once per connection round, right after the connection is established: `type` the transport label, `direct` whether it is peer to peer, `secured` the encrypted handshake, `kcp` KCP over UDP, `rendezvous` the rendezvous server used, `connect_ms` from the start of `Client::start` (rendezvous, punching, race, secure handshake) |
-| `RACE` | one line per connection race. `site`: `start` (the preferred punch request against the TCP-punch-only request, `preferred` / `tcp_punch_round`), `connect` (the direct attempts after a punch: `tcp`, `udp`, `v6`, `webrtc`, then `relay` when the relay was requested afterwards), `relay_response` (`v6`, `relay`, `webrtc` after a relay answer). Each candidate: `ok@ms` / `err@ms`, milliseconds since the race started, or `pending` when the race ended before it finished (it was dropped). `winner` is the transport label of the result, `none` if all failed; `ms` the race's total time. |
+| `RACE` | one line per connection race. `site`: `start` (the preferred punch request against the TCP-punch-only request, `preferred` / `tcp_punch_round`), `connect` (the direct attempts after a punch: `tcp`, `udp`, `v6`, `webrtc`, then `relay` when the relay was requested afterwards), `relay_response` (`v6`, `relay`, `webrtc` after a relay answer). Each candidate: `ok@ms` / `err@ms`, milliseconds since the race started, or `pending` when the race ended before it finished (it was dropped). `winner` is the transport label of the result, `none` if all failed; `ms` the race's total time. `rule` (sites `start` and `relay_response` only): which race decided. `first`: the first success wins (the stock rule; at `start` with `enable-relay-hold` = `N`, at `relay_response` without a v6 attempt or with relay-only WebRTC). `relay_hold`: a relay result is held for `relay-fallback-delay` (default 2.5 s) while a direct attempt still runs (M8 2a; with WebRTC as before, now also without it). `prefer_udp` / `prefer_tcp`: `direct-transport-preference` is set (M8 2b); a direct result of the other kind is also held, for 300 ms, while the preferred kind still runs. A held candidate that loses shows as `ok@ms` before the winner's time. |
 
 ### Viewer: fps control
 

@@ -223,6 +223,9 @@ impl Drop for OffererGuard {
 #[derive(Clone)]
 struct RaceLog {
     site: &'static str,
+    /// Which race decided (`first`, `relay_hold`, `prefer_udp`, `prefer_tcp`), where the site
+    /// can use more than one; logged as `rule=` when set.
+    rule: Option<&'static str>,
     start: std::time::Instant,
     // (candidate, Some((ok, ms)) once it finished)
     results: Arc<Mutex<Vec<(&'static str, Option<(bool, u128)>)>>>,
@@ -232,6 +235,7 @@ impl RaceLog {
     fn new(site: &'static str) -> Self {
         Self {
             site,
+            rule: None,
             start: std::time::Instant::now(),
             results: Default::default(),
         }
@@ -280,8 +284,9 @@ impl RaceLog {
             .collect::<Vec<_>>()
             .join(" ");
         log::info!(
-            "RACE site={} {} winner={} ms={}",
+            "RACE site={}{} {} winner={} ms={}",
             self.site,
+            self.rule.map(|r| format!(" rule={r}")).unwrap_or_default(),
             candidates,
             if winner.is_empty() { "none" } else { winner },
             self.start.elapsed().as_millis()
@@ -403,6 +408,150 @@ async fn race_transports_prefer_webrtc<'a, T: 'a>(
             }
         }
     }
+}
+
+/// How much a connect-race result is worth, lowest first. See `race_transports_ranked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TransportRank {
+    /// Through hbbr (or a TURN-relayed WebRTC pair).
+    Relay,
+    /// A direct path, but not the kind `direct-transport-preference` asks for.
+    Direct,
+    /// A direct path of the preferred kind: wins outright.
+    Preferred,
+}
+
+/// How long a direct result of the non-preferred kind is held while a preferred attempt is still
+/// racing (M8 2b). Short on purpose: the preferred punch either lands within a few RTTs or not
+/// at all, and every millisecond here is connect time on networks where it never lands.
+const DIRECT_PREFERENCE_HOLD_MS: u64 = 300;
+
+/// Viewer option `direct-transport-preference` (M8 2b): which direct transport the `_start` race
+/// waits `DIRECT_PREFERENCE_HOLD_MS` for when another direct one lands first. Empty (the
+/// default) keeps the first-direct-wins race.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectPreference {
+    None,
+    /// KCP over UDP or IPv6, or a direct WebRTC pair.
+    Udp,
+    /// A TCP punch.
+    Tcp,
+}
+
+impl DirectPreference {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "udp" => Self::Udp,
+            "tcp" => Self::Tcp,
+            _ => Self::None,
+        }
+    }
+
+    fn from_config() -> Self {
+        Self::parse(&LocalConfig::get_option(
+            keys::OPTION_DIRECT_TRANSPORT_PREFERENCE,
+        ))
+    }
+
+    /// Rank of a connect result from its direct flag and transport label (the labels
+    /// `_start_inner` returns: TCP, UDP, IPv6, WebRTC, Relay, WebSocket).
+    fn rank(self, direct: bool, label: &str) -> TransportRank {
+        if !direct {
+            return TransportRank::Relay;
+        }
+        let preferred = match self {
+            Self::None => false,
+            Self::Udp => matches!(label, "UDP" | "IPv6" | "WebRTC"),
+            Self::Tcp => label == "TCP",
+        };
+        if preferred {
+            TransportRank::Preferred
+        } else {
+            TransportRank::Direct
+        }
+    }
+}
+
+/// A race with three outcomes instead of two (M8 2b): a `Preferred` result wins outright; a
+/// `Direct` one is held for `direct_window_ms` while anything is still racing; a `Relay` one for
+/// `relay_window_ms`, the same hold `race_transports_prefer_webrtc` gives a relay. A better
+/// result replaces a held one, and the hold never grows: a direct result arriving behind a held
+/// relay ends the race no later than the relay's own deadline. When nothing is left racing, the
+/// best result so far is taken; only if there is none does the race fail, with the last error.
+async fn race_transports_ranked<'a, T: 'a>(
+    futs: Vec<BoxFuture<'a, ResultType<T>>>,
+    relay_window_ms: u64,
+    direct_window_ms: u64,
+    rank: impl Fn(&T) -> TransportRank,
+) -> ResultType<T> {
+    use hbb_common::futures::stream::{FuturesUnordered, StreamExt};
+    let mut pending: FuturesUnordered<_> = futs.into_iter().collect();
+    let mut held: Option<(TransportRank, T)> = None;
+    let mut deadline: Option<Instant> = None;
+    let mut last_err: Option<hbb_common::anyhow::Error> = None;
+    loop {
+        if pending.is_empty() {
+            return match held {
+                Some((_, conn)) => Ok(conn),
+                None => Err(last_err.unwrap_or_else(|| anyhow!("no transport to race"))),
+            };
+        }
+        let current_deadline = deadline;
+        let hold_over = async move {
+            match current_deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            res = pending.next() => match res {
+                Some(Ok(conn)) => {
+                    let r = rank(&conn);
+                    if r == TransportRank::Preferred {
+                        return Ok(conn);
+                    }
+                    if held.as_ref().map_or(true, |(h, _)| r > *h) {
+                        let window = if r == TransportRank::Direct {
+                            direct_window_ms
+                        } else {
+                            relay_window_ms
+                        };
+                        let at = Instant::now() + Duration::from_millis(window);
+                        deadline = Some(deadline.map_or(at, |d| d.min(at)));
+                        held = Some((r, conn));
+                    }
+                }
+                Some(Err(e)) => last_err = Some(e),
+                None => {}
+            },
+            _ = hold_over => {
+                if let Some((_, conn)) = held.take() {
+                    return Ok(conn);
+                }
+                deadline = None;
+            }
+        }
+    }
+}
+
+/// M8 2a for races without WebRTC: a direct result wins outright, a relay result is held for
+/// `window_ms` while anything else still races. Unlike `race_transports_prefer_webrtc`, a race in
+/// which everything fails returns the last error unchanged, exactly as `select_ok` did, so the
+/// checks that match on the error text (offline auto-retry, `check_if_retry`, "Please try later")
+/// behave as with `enable-relay-hold` off.
+async fn race_transports_relay_hold<'a, T: 'a>(
+    futs: Vec<BoxFuture<'a, ResultType<T>>>,
+    window_ms: u64,
+    is_direct: impl Fn(&T) -> bool,
+) -> ResultType<T> {
+    race_transports_ranked(futs, window_ms, 0, move |r| {
+        if is_direct(r) {
+            TransportRank::Preferred
+        } else {
+            TransportRank::Relay
+        }
+    })
+    .await
 }
 
 // A peer decides how many ICE candidates it sends, and the rendezvous route that carries them is
@@ -649,20 +798,59 @@ impl Client {
             contained,
         )
         .boxed();
-        let race_log = RaceLog::new("start");
+        let mut race_log = RaceLog::new("start");
         let preferred_fut = race_log.track("preferred", preferred_fut);
         let fallback_fut = race_log.track("tcp_punch_round", fallback_fut);
-        if has_webrtc_offerer {
-            let res = race_transports_prefer_webrtc(
-                preferred_fut,
-                vec![fallback_fut],
-                Self::relay_fallback_delay_ms(),
-                |result| result.0 .1,
+        // Either round can end in a relay of its own once its direct attempts fail (`connect()`
+        // falls back to request_relay), so a fast relay from one round could preempt a direct
+        // punch still running in the other. M8 2a holds a relay result for the fallback delay
+        // whenever a direct attempt is still in flight, as the WebRTC race always did.
+        let relay_hold = has_webrtc_offerer || Self::relay_hold_enabled();
+        let preference = DirectPreference::from_config();
+        if preference != DirectPreference::None {
+            let relay_window = if relay_hold {
+                Self::relay_fallback_delay_ms()
+            } else {
+                0
+            };
+            race_log.rule = Some(if preference == DirectPreference::Udp {
+                "prefer_udp"
+            } else {
+                "prefer_tcp"
+            });
+            let res = race_transports_ranked(
+                vec![preferred_fut, fallback_fut],
+                relay_window,
+                DIRECT_PREFERENCE_HOLD_MS,
+                |result| preference.rank(result.0 .1, result.0 .4),
             )
             .await;
             race_log.finish(res.as_ref().map_or("", |r| r.0 .4));
             return res;
         }
+        if relay_hold {
+            race_log.rule = Some("relay_hold");
+            let res = if has_webrtc_offerer {
+                race_transports_prefer_webrtc(
+                    preferred_fut,
+                    vec![fallback_fut],
+                    Self::relay_fallback_delay_ms(),
+                    |result| result.0 .1,
+                )
+                .await
+            } else {
+                // No WebRTC in this race: keep select_ok's error text when both rounds fail.
+                race_transports_relay_hold(
+                    vec![preferred_fut, fallback_fut],
+                    Self::relay_fallback_delay_ms(),
+                    |result| result.0 .1,
+                )
+                .await
+            };
+            race_log.finish(res.as_ref().map_or("", |r| r.0 .4));
+            return res;
+        }
+        race_log.rule = Some("first");
         let connect_futures = vec![preferred_fut, fallback_fut];
         let res = select_ok(connect_futures).await;
         race_log.finish(res.as_ref().map_or("", |r| r.0 .0 .4));
@@ -721,6 +909,12 @@ impl Client {
             Ok(secs) if secs.is_finite() && secs > 0.0 => (secs * 1000.0).round() as u64,
             _ => Self::RELAY_FALLBACK_DELAY_MS,
         }
+    }
+
+    /// Viewer option `enable-relay-hold` (M8 2a, on unless "N"): hold a relay result for the
+    /// fallback delay while a direct attempt still races, also in races without WebRTC.
+    fn relay_hold_enabled() -> bool {
+        LocalConfig::get_option(keys::OPTION_ENABLE_RELAY_HOLD) != "N"
     }
 
     /// UDP-NAT-test wait when the TCP clock is implausible (see TCP_RTT_PLAUSIBLE_MIN). The
@@ -1131,7 +1325,7 @@ impl Client {
                         );
                         start = Instant::now();
                         let mut connect_futures = Vec::new();
-                        let race_log = RaceLog::new("relay_response");
+                        let mut race_log = RaceLog::new("relay_response");
                         if let Some(s) = ipv6.0 {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             if addr.port() > 0 {
@@ -1249,11 +1443,13 @@ impl Client {
                                 // Policy, not force_relay: under ws the offer is full ICE and a
                                 // direct path is exactly what the preference window exists for.
                                 connect_futures.push(webrtc_fut);
+                                race_log.rule = Some("first");
                                 select_ok(connect_futures).await.map(|r| r.0)
                             } else {
                                 // The peer answered WebRTC: prefer P2P. The relay result is held
                                 // for the preference window so WebRTC can win even though a relay
                                 // TCP connect completes much faster than ICE + DTLS setup.
+                                race_log.rule = Some("relay_hold");
                                 race_transports_prefer_webrtc(
                                     webrtc_fut,
                                     connect_futures,
@@ -1262,8 +1458,22 @@ impl Client {
                                 )
                                 .await
                             }
+                        } else if connect_futures.len() > 1 && Self::relay_hold_enabled() {
+                            // M8 2a: the futures are [v6 KCP, relay]. The relay's single TCP
+                            // connect nearly always beats punch_udp plus the KCP handshake, so a
+                            // working v6 path would lose; hold the relay result for the fallback
+                            // delay while the v6 attempt is still running. When both fail, the
+                            // error is select_ok's (the last one), not a "WebRTC failed" wrapper.
+                            race_log.rule = Some("relay_hold");
+                            race_transports_relay_hold(
+                                connect_futures,
+                                Self::relay_fallback_delay_ms(),
+                                |result| result.3,
+                            )
+                            .await
                         } else {
                             // Run all connection attempts concurrently, take the first success.
+                            race_log.rule = Some("first");
                             select_ok(connect_futures).await.map(|r| r.0)
                         };
                         race_log.finish(race_result.as_ref().map_or("", |r| r.2));
@@ -6655,5 +6865,243 @@ mod kx_tests {
         let (seen, decrypted) = handshake(KX_VERSION_LATEST, Some(0)).await;
         assert_eq!(seen.picked, 1);
         assert!(!seen.decrypted && !decrypted);
+    }
+}
+
+#[cfg(test)]
+mod direct_preference_latency_tests {
+    use super::{race_transports_ranked, race_transports_relay_hold, DirectPreference, TransportRank};
+    use hbb_common::{
+        anyhow::anyhow,
+        futures::future::{BoxFuture, FutureExt},
+        tokio,
+        tokio::time::{sleep, Duration, Instant},
+        ResultType,
+    };
+
+    // (label, direct)
+    type R = (&'static str, bool);
+
+    fn ok_after(ms: u64, label: &'static str, direct: bool) -> BoxFuture<'static, ResultType<R>> {
+        async move {
+            sleep(Duration::from_millis(ms)).await;
+            Ok((label, direct))
+        }
+        .boxed()
+    }
+
+    fn err_after(ms: u64) -> BoxFuture<'static, ResultType<R>> {
+        err_text_after(ms, "failed")
+    }
+
+    fn err_text_after(ms: u64, text: &'static str) -> BoxFuture<'static, ResultType<R>> {
+        async move {
+            sleep(Duration::from_millis(ms)).await;
+            Err(anyhow!(text))
+        }
+        .boxed()
+    }
+
+    fn rank_udp(r: &R) -> TransportRank {
+        DirectPreference::Udp.rank(r.1, r.0)
+    }
+
+    #[test]
+    fn latency_preference_parses_and_ranks() {
+        assert_eq!(DirectPreference::parse(""), DirectPreference::None);
+        assert_eq!(DirectPreference::parse(" UDP "), DirectPreference::Udp);
+        assert_eq!(DirectPreference::parse("tcp"), DirectPreference::Tcp);
+        assert_eq!(DirectPreference::parse("junk"), DirectPreference::None);
+        let udp = DirectPreference::Udp;
+        assert_eq!(udp.rank(true, "UDP"), TransportRank::Preferred);
+        assert_eq!(udp.rank(true, "IPv6"), TransportRank::Preferred);
+        assert_eq!(udp.rank(true, "WebRTC"), TransportRank::Preferred);
+        assert_eq!(udp.rank(true, "TCP"), TransportRank::Direct);
+        assert_eq!(udp.rank(false, "WebRTC"), TransportRank::Relay);
+        assert_eq!(udp.rank(false, "Relay"), TransportRank::Relay);
+        assert_eq!(DirectPreference::Tcp.rank(true, "TCP"), TransportRank::Preferred);
+        assert_eq!(DirectPreference::Tcp.rank(true, "UDP"), TransportRank::Direct);
+        assert_eq!(DirectPreference::None.rank(true, "UDP"), TransportRank::Direct);
+    }
+
+    // The case 2b exists for: the TCP round lands first, UDP a little later.
+    #[tokio::test]
+    async fn latency_udp_preferred_over_faster_tcp_within_hold() {
+        let got = race_transports_ranked(
+            vec![ok_after(150, "UDP", true), ok_after(10, "TCP", true)],
+            60_000,
+            1_000,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "UDP");
+    }
+
+    #[tokio::test]
+    async fn latency_tcp_taken_when_udp_misses_the_hold() {
+        let start = Instant::now();
+        let got = race_transports_ranked(
+            vec![ok_after(5_000, "UDP", true), ok_after(10, "TCP", true)],
+            60_000,
+            100,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "TCP");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    #[tokio::test]
+    async fn latency_tcp_taken_at_once_when_udp_fails() {
+        let start = Instant::now();
+        let got = race_transports_ranked(
+            vec![err_after(50), ok_after(10, "TCP", true)],
+            60_000,
+            60_000,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "TCP");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    // A direct result replaces a held relay, and its shorter hold ends the race.
+    #[tokio::test]
+    async fn latency_direct_replaces_held_relay() {
+        let start = Instant::now();
+        let got = race_transports_ranked(
+            vec![
+                ok_after(10, "Relay", false),
+                ok_after(50, "TCP", true),
+                ok_after(5_000, "UDP", true),
+            ],
+            60_000,
+            100,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "TCP");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    // The hold never grows past a deadline already set.
+    #[tokio::test]
+    async fn latency_direct_hold_does_not_extend_relay_deadline() {
+        let start = Instant::now();
+        let got = race_transports_ranked(
+            vec![
+                ok_after(10, "Relay", false),
+                ok_after(150, "TCP", true),
+                ok_after(5_000, "UDP", true),
+            ],
+            200,
+            60_000,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "TCP");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    #[tokio::test]
+    async fn latency_relay_taken_when_everything_direct_fails() {
+        let got = race_transports_ranked(
+            vec![ok_after(10, "Relay", false), err_after(50), err_after(80)],
+            60_000,
+            60_000,
+            rank_udp,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "Relay");
+    }
+
+    #[tokio::test]
+    async fn latency_all_failed_is_an_error() {
+        let got = race_transports_ranked(vec![err_after(10), err_after(20)], 100, 100, rank_udp)
+            .await;
+        assert!(got.is_err());
+    }
+
+    // M8 2a at the RelayResponse site: [v6 KCP, relay], the relay connects first.
+    #[tokio::test]
+    async fn latency_relay_response_holds_relay_for_v6() {
+        let got = race_transports_relay_hold(
+            vec![ok_after(300, "IPv6", true), ok_after(10, "Relay", false)],
+            60_000,
+            |r| r.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "IPv6");
+        let got = race_transports_relay_hold(
+            vec![err_after(300), ok_after(10, "Relay", false)],
+            60_000,
+            |r| r.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "Relay");
+    }
+
+    // M8 2a at the `_start` site: the TCP round's relay must not beat the UDP round's punch.
+    #[tokio::test]
+    async fn latency_start_round_relay_held_for_direct_round() {
+        let got = race_transports_relay_hold(
+            vec![ok_after(400, "UDP", true), ok_after(10, "Relay", false)],
+            60_000,
+            |r| r.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "UDP");
+    }
+
+    // A relay that lands after the direct attempt failed is taken at once, not after the window.
+    #[tokio::test]
+    async fn latency_relay_hold_takes_relay_once_direct_failed() {
+        let start = Instant::now();
+        let got = race_transports_relay_hold(
+            vec![err_after(10), ok_after(50, "Relay", false)],
+            60_000,
+            |r| r.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "Relay");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    // With everything failing, the error text is the plain last error, as select_ok returned it:
+    // Flutter's offline auto-retry and check_if_retry match on it.
+    #[tokio::test]
+    async fn latency_relay_hold_all_failed_keeps_last_error_text() {
+        let err = race_transports_relay_hold(
+            vec![
+                err_text_after(10, "Remote desktop is offline"),
+                err_text_after(30, "Remote desktop is offline"),
+            ],
+            60_000,
+            |r: &R| r.1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Remote desktop is offline");
+        let err = race_transports_relay_hold(
+            vec![
+                err_text_after(10, "Connection timed out"),
+                err_text_after(30, "Failed to connect via relay server: x"),
+            ],
+            60_000,
+            |r: &R| r.1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Failed to connect via relay server: x");
     }
 }

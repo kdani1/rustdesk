@@ -74,3 +74,5 @@ pub mod privacy_mode;
 pub mod virtual_display_manager;
 
 mod kcp_stream;
+// UDP video lane (M19 first half): staged, not wired into sessions yet. docs/UDP-VIDEO.md
+mod udp_video;
