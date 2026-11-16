@@ -201,6 +201,21 @@ fn run(hwnd: usize, sink: Sink, ready: mpsc::Sender<Result<u32, String>>) {
             swap: GetSystemMetrics(SM_SWAPBUTTON) != 0,
             ..Default::default()
         };
+        // Buttons already held now were pressed on the peer by the Flutter path, and Dart
+        // mutes its buttons from here on: this thread owns their release. (An extra release for
+        // a button the peer never saw pressed does nothing.)
+        for (vk, button) in [
+            (VK_LBUTTON, RawButton::Left),
+            (VK_RBUTTON, RawButton::Right),
+            (VK_MBUTTON, RawButton::Middle),
+            (VK_XBUTTON1, RawButton::Back),
+            (VK_XBUTTON2, RawButton::Forward),
+        ] {
+            // GetAsyncKeyState reports physical buttons; map them like the raw flags.
+            if (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 {
+                pump.pressed |= 1u8 << pump.logical(button) as u8;
+            }
+        }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             if msg.message == WM_STOP {

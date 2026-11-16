@@ -1608,6 +1608,10 @@ class InputModel {
         final canvasPosition = _pointerPositionForRemoteCanvas(e);
         handleMouse(_getMouseEvent(e, _kMouseEventMove), canvasPosition,
             edgeScroll: useEdgeScroll);
+      } else if (_relativeMouse.rawInputActive) {
+        // Raw input sends chord changes itself. Keep the mask current, so leaving raw mode
+        // with a button held does not turn the next move into a press of a stale button.
+        _lastButtons = e.buttons;
       }
     }
   }

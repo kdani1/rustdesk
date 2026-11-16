@@ -155,11 +155,16 @@ class _RemotePageState extends State<RemotePage>
       _tabStateSubscription =
           widget.tabController?.state.listen(_onMacOSTabStateChanged);
     } else if (isWindows) {
-      // A deselected tab gives up keyboard focus, so it stops counting as the session under
-      // the pointer (automatic game mode) and stops taking keys.
+      // A deselected tab gives up keyboard focus and relative mode: it stops counting as the
+      // session under the pointer (automatic game mode), stops taking keys, and its raw-input
+      // thread (keyed to the whole window) stops taking the mouse for a hidden session.
       _tabStateSubscription = widget.tabController?.state.listen((_) {
-        if (!_isSelectedTab && _rawKeyFocusNode.hasFocus) {
+        if (_isSelectedTab) return;
+        if (_rawKeyFocusNode.hasFocus) {
           _rawKeyFocusNode.unfocus();
+        }
+        if (_ffi.inputModel.relativeMouseMode.value) {
+          _ffi.inputModel.setRelativeMouseMode(false);
         }
       });
     }

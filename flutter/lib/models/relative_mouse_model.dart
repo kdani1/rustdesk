@@ -147,6 +147,9 @@ class RelativeMouseModel {
   // position-derived deltas, recenter and clip handling below stay off.
   bool _rawInputActive = false;
 
+  /// Windows raw input owns the buttons (Rust sends them from the raw packets).
+  bool get rawInputActive => _rawInputActive;
+
   /// Windows only. Returns the raw-input start result: 1 started, 0 this window is not in
   /// front or not under the cursor yet, -2 another session owns raw input, -1 unavailable
   /// (turned off, registration failed). On -1/-2 a manual enable uses the Flutter-based path.
