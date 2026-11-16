@@ -220,7 +220,8 @@ pub(super) struct LatencyStats {
     vfps: u32,
     vfchg: usize,
     // GPU scheduling priority of this capture loop (enable-host-gpu-priority /
-    // enable-host-dwm-mmcss, Windows): "on" or "off", set once at capture start.
+    // enable-host-dwm-mmcss, Windows): what was applied ("off", "gpu", "dwm", "gpu+dwm", with
+    // "-failed" parts), set once at capture start.
     gpuprio: &'static str,
 }
 

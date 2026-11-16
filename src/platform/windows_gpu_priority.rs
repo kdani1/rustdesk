@@ -168,11 +168,11 @@ static STATE: Mutex<State> = Mutex::new(State {
     dwm_mmcss: false,
 });
 
-/// Raises the process class to HIGH (ABOVE_NORMAL when refused). Returns the log text and the
-/// class it found when it changed it.
-fn raise_process_class() -> (String, Option<i32>) {
+/// Raises the process class to HIGH (ABOVE_NORMAL when refused). Returns the log text, the
+/// class it found when it changed it, and whether the class is now ABOVE_NORMAL or more.
+fn raise_process_class() -> (String, Option<i32>, bool) {
     let Some(kmt) = kmt() else {
-        return ("unavailable".to_owned(), None);
+        return ("unavailable".to_owned(), None, false);
     };
     let process = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
     let process = process.0 as *mut c_void;
@@ -181,11 +181,11 @@ fn raise_process_class() -> (String, Option<i32>) {
         previous = PRIORITY_CLASS_NORMAL;
     }
     if previous >= PRIORITY_CLASS_HIGH {
-        return (format!("kept:{}", class_name(previous)), None);
+        return (format!("kept:{}", class_name(previous)), None, true);
     }
     let status = unsafe { (kmt.set)(process, PRIORITY_CLASS_HIGH) };
     if status == 0 {
-        return ("high".to_owned(), Some(previous));
+        return ("high".to_owned(), Some(previous), true);
     }
     if previous < PRIORITY_CLASS_ABOVE_NORMAL {
         let fallback = unsafe { (kmt.set)(process, PRIORITY_CLASS_ABOVE_NORMAL) };
@@ -193,6 +193,7 @@ fn raise_process_class() -> (String, Option<i32>) {
             return (
                 format!("above_normal(high:{:#010x})", status as u32),
                 Some(previous),
+                true,
             );
         }
         return (
@@ -201,9 +202,11 @@ fn raise_process_class() -> (String, Option<i32>) {
                 status as u32, fallback as u32
             ),
             None,
+            false,
         );
     }
-    (format!("failed(high:{:#010x})", status as u32), None)
+    // Already ABOVE_NORMAL and HIGH refused: unchanged, but above normal.
+    (format!("failed(high:{:#010x})", status as u32), None, true)
 }
 
 fn restore_process_class(class: i32) -> String {
@@ -223,6 +226,7 @@ fn restore_process_class(class: i32) -> String {
 /// and DWM MMCSS. Created and dropped on the capture thread.
 pub struct HostGpuPriority {
     held: bool,
+    label: &'static str,
 }
 
 impl HostGpuPriority {
@@ -236,20 +240,26 @@ impl HostGpuPriority {
         #[cfg(feature = "hwcodec")]
         scrap::hwcodec::set_encode_gpu_thread_priority(if on { GPU_THREAD_PRIORITY } else { 0 });
         if !on && !dwm {
-            log::info!("LATENCY server gpu_priority display={display} off");
-            return Self { held: false };
+            // Nothing changed: only with latency logging on, so a default host logs as before.
+            if option_on(base::config::keys::OPTION_ENABLE_LATENCY_LOG) {
+                log::info!("LATENCY server gpu_priority display={display} off");
+            }
+            return Self {
+                held: false,
+                label: "off",
+            };
         }
         let mut state = STATE.lock().unwrap();
         state.holders += 1;
-        let (process, privilege) = if !on {
-            ("off".to_owned(), "-".to_owned())
+        let (process, privilege, process_raised) = if !on {
+            ("off".to_owned(), "-".to_owned(), false)
         } else if state.raised_from.is_some() {
-            ("held".to_owned(), "-".to_owned())
+            ("held".to_owned(), "-".to_owned(), true)
         } else {
             let privilege = enable_increase_base_priority();
-            let (text, raised_from) = raise_process_class();
+            let (text, raised_from, raised) = raise_process_class();
             state.raised_from = raised_from;
-            (text, privilege)
+            (text, privilege, raised)
         };
         let dwm_text = if !dwm {
             "off".to_owned()
@@ -265,10 +275,15 @@ impl HostGpuPriority {
                 }
             }
         };
+        let dwm_applied = dwm && state.dwm_mmcss;
         drop(state);
+        let mut capture_ok = false;
         let capture_text = if on {
             match capture(GPU_THREAD_PRIORITY) {
-                Some(hr) => format!("{GPU_THREAD_PRIORITY}:{:#010x}", hr as u32),
+                Some(hr) => {
+                    capture_ok = hr >= 0;
+                    format!("{GPU_THREAD_PRIORITY}:{:#010x}", hr as u32)
+                }
                 None => "n/a".to_owned(),
             }
         } else {
@@ -279,16 +294,15 @@ impl HostGpuPriority {
             if on { GPU_THREAD_PRIORITY } else { 0 },
             hags_state(),
         );
-        Self { held: true }
+        Self {
+            held: true,
+            label: label(on.then_some(process_raised || capture_ok), dwm.then_some(dwm_applied)),
+        }
     }
 
-    /// For the `gpuprio=` field of the `LATENCY server` line.
+    /// For the `gpuprio=` field of the `LATENCY server` line: what this capture start applied.
     pub fn label(&self) -> &'static str {
-        if self.held {
-            "on"
-        } else {
-            "off"
-        }
+        self.label
     }
 }
 
@@ -319,9 +333,37 @@ impl Drop for HostGpuPriority {
     }
 }
 
+/// `gpuprio=` text from what was asked and applied: `gpu` / `dwm` parts (joined by `+`), each
+/// `-failed` when its option is on but nothing took effect; `off` when neither option is on.
+/// `gpu` counts as applied when the process class is ABOVE_NORMAL or more, or the capture
+/// device's `SetGPUThreadPriority` succeeded.
+fn label(gpu: Option<bool>, dwm: Option<bool>) -> &'static str {
+    match (gpu, dwm) {
+        (None, None) => "off",
+        (Some(true), None) => "gpu",
+        (Some(false), None) => "gpu-failed",
+        (None, Some(true)) => "dwm",
+        (None, Some(false)) => "dwm-failed",
+        (Some(true), Some(true)) => "gpu+dwm",
+        (Some(true), Some(false)) => "gpu+dwm-failed",
+        (Some(false), Some(true)) => "gpu-failed+dwm",
+        (Some(false), Some(false)) => "gpu-failed+dwm-failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_gpu_priority_labels() {
+        assert_eq!(label(None, None), "off");
+        assert_eq!(label(Some(true), None), "gpu");
+        assert_eq!(label(Some(false), None), "gpu-failed");
+        assert_eq!(label(None, Some(true)), "dwm");
+        assert_eq!(label(Some(true), Some(true)), "gpu+dwm");
+        assert_eq!(label(Some(false), Some(true)), "gpu-failed+dwm");
+    }
 
     #[test]
     fn latency_gpu_priority_class_names() {

@@ -39,13 +39,22 @@ Jegyezd fel ezt is: hány „Set fps” sor van a Dell nézőnaplójában egy 5 
 A Windows ezt az értéket külön tárolja töltőn és akkumulátoron. Itt csak a töltős értéket
 kell átállítani. Az akkumulátoros maradhat a régi.
 
-Ellenőrzés: a `dell-diag.ps1` „power” részében látszik az aktív energiaséma. A sémák listáját
-így kérheted le:
+Ellenőrzés: nézd meg magát az Energiamód mezőt ugyanott (Beállítások > Rendszer > Tápellátás
+és akkumulátor). Az energiamód egy réteg az aktív energiaséma fölött, ezért a séma GUID-ja **nem
+változik** tőle: a `powercfg /getactivescheme`, a `powercfg /list` és a `dell-diag.ps1` „power”
+része átállítás után is ugyanazt a sémát (pl. Kiegyensúlyozott) mutatja. Ebből tehát nem derül
+ki, hogy a mód átállt-e.
+
+Ha parancssorból akarod ellenőrizni, a rétegek a registryben látszanak:
 
 ```powershell
-powercfg /getactivescheme
-powercfg /list
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes' |
+    Select-Object ActiveOverlayAcPowerScheme, ActiveOverlayDcPowerScheme
 ```
+
+Az `ActiveOverlayAcPowerScheme` a töltős érték. „Legjobb teljesítmény” mellett általában
+`ded574b5-45a0-4f42-8737-46345c09c238`. Csupa nulla vagy hiányzó érték: kiegyensúlyozott
+(alapértelmezett). Ha más GUID-ot látsz, az Energiamód mező a mérvadó.
 
 **Visszaállítás:** ugyanott válaszd vissza a korábbi módot (általában „Kiegyensúlyozott”).
 
@@ -124,19 +133,26 @@ a jelentésük alapján keresd meg őket:
 |---|---|---|
 | Roaming Aggressiveness | `1. Lowest` | ritkábban keres más hozzáférési pontot, ritkábban akad meg pár száz ms-ra |
 | MIMO Power Save Mode | `No SMPS` | az adapter nem kapcsol le antennákat energiatakarékosságból |
-| Preferred Band | `3. Prefer 6GHz band`, ha a router tud 6 GHz-et; különben `2. Prefer 5GHz band` | ne a zsúfolt 2,4 GHz-es sávra csatlakozzon |
+| Preferred Band | az az érték, amelynek a szövege `Prefer 5GHz band` (vagy `Prefer 6GHz band`, ha az adapter és a router is tud 6 GHz-et) | ne a zsúfolt 2,4 GHz-es sávra csatlakozzon |
+
+A Preferred Band értékei előtt sorszám áll, és a sorszám adapterenként más lehet. Intelnél
+általában `1. No Preference`, `2. Prefer 2.4GHz band`, `3. Prefer 5GHz band`, 6E adapteren
+`4. Prefer 6GHz band` is. Ne a sorszám alapján válassz, hanem a szöveg alapján, a 3a lista
+`ValidDisplayValues` oszlopából. A `2.` általában a 2,4 GHz-et jelenti, vagyis épp az
+ellenkezőjét annak, amit szeretnénk.
 
 Az Alzán (Realtek 8851BE) a nevek mások. A listában keress hasonló jelentésűeket: roaming
 érzékenység vagy agresszivitás (a legalacsonyabbra), energiatakarékos mód (ki), előnyben
 részesített sáv (5 GHz). Amit nem találsz, azt hagyd ki.
 
 Beállítás PowerShellben. A `-DisplayName` és a `-DisplayValue` pontosan az legyen, amit a 3a
-lista mutat:
+lista mutat. A Preferred Band sorát előbb vesd össze a 3a listával: a minta a szokásos Intel
+szöveget használja (`3. Prefer 5GHz band`). Ha nálad más a sorszám vagy a szöveg, azt írd be.
 
 ```powershell
 Set-NetAdapterAdvancedProperty -Name "Wi-Fi" -DisplayName "Roaming Aggressiveness" -DisplayValue "1. Lowest"
 Set-NetAdapterAdvancedProperty -Name "Wi-Fi" -DisplayName "MIMO Power Save Mode" -DisplayValue "No SMPS"
-Set-NetAdapterAdvancedProperty -Name "Wi-Fi" -DisplayName "Preferred Band" -DisplayValue "2. Prefer 5GHz band"
+Set-NetAdapterAdvancedProperty -Name "Wi-Fi" -DisplayName "Preferred Band" -DisplayValue "3. Prefer 5GHz band"
 ```
 
 Grafikus felületen is beállíthatod: Eszközkezelő > Hálózati adapterek > Wi-Fi adapter >
@@ -260,7 +276,9 @@ Get-ChildItem "$env:APPDATA\RustDesk\log" -Recurse -Filter *.log | Sort-Object L
 Minden lépés után:
 
 1. A Dellen futtasd a `dell-diag.ps1`-et munkamenet közben, és hasonlítsd össze a
-   `dell-diag-elotte.txt`-vel. Nézd az energiasémát, a CPU-t és a dekóder-sorokat.
+   `dell-diag-elotte.txt`-vel. Nézd az energiasémát, a CPU-t és a dekóder-sorokat. Az
+   energiamódot ebből nem látod (1. lépés): azt a Beállításokban vagy az
+   `ActiveOverlayAcPowerScheme` értékben nézd.
 2. Számold meg a „Set fps” sorokat egy ugyanolyan hosszú, hasonló munkamenetben. Kevesebb a jobb.
 3. Az 5. lépés után mérj LAN-on kívülről is: egyszer telefonos hotspotról, egyszer egy másik
    otthoni hálózatról. Mindkét helyzetben jegyezd fel:

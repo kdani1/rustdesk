@@ -79,7 +79,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
 | `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused a rate and was reset to `nvenc-nominal-fps`). When the encoder refuses a rate and also the reset to nominal (in practice only the NVENC SDK driver, whose Reconfigure can fail), it keeps the last applied value, the rate the encoder is stuck at, until the capture restarts; a warning `virtual fps: ... stays at N fps until restart` marks this. Either way later cap changes are not applied until the capture restarts. |
 | `vfchg` | how often `vfps` changed in the window (each one is an IDR-free nvenc reconfigure with the next frame) |
-| `gpuprio` | Windows host (roadmap M17): `on` when this capture loop holds the GPU priority guard (`enable-host-gpu-priority=Y` and/or `enable-host-dwm-mmcss=Y` at its start), `off` otherwise and on other platforms. Labels A/B windows; the return codes are in the `LATENCY server gpu_priority` line of the same capture start (below). |
+| `gpuprio` | Windows host (roadmap M17): what this capture loop's start applied. `off`: neither `enable-host-gpu-priority` nor `enable-host-dwm-mmcss` was `Y` (also on other platforms). `gpu`: GPU priority on and in effect (process class `high`/`above_normal`/`held`/`kept:…`, or `SetGPUThreadPriority` on the capture device returned success); `gpu-failed`: the option is on but neither took effect. `dwm`: `DwmEnableMMCSS(TRUE)` succeeded (or was already on); `dwm-failed`: the option is on but the call failed or is unavailable. Both options on: the parts joined by `+` (`gpu+dwm`, `gpu-failed+dwm`, `gpu+dwm-failed`, `gpu-failed+dwm-failed`). Labels A/B windows; the return codes are in the `LATENCY server gpu_priority` line of the same capture start (below). |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
 `rmerge`, `refine` and `vfchg` are only counted while logging is on, like the other fields;
@@ -743,10 +743,10 @@ gpu_priority encoder=hevc_nvenc thread=7 hr=0x00000000
 | Field | Meaning |
 |---|---|
 | `display` | the capture loop's display index |
-| `off` | both options off: nothing changed (hwcodec is told 0, its own devices stay at their default) |
+| `off` | both options off: nothing changed (hwcodec is told 0, its own devices stay at their default). Logged only with `enable-latency-log=Y`, so a host with every option at its default logs as before; the other `gpu_priority` lines are always logged |
 | `process` | the D3DKMT class: `high` (raised), `above_normal(high:<NTSTATUS>)` (HIGH refused, e.g. `0xc0000061` privilege not held; ABOVE_NORMAL set), `failed(...)` (both refused, class unchanged), `kept:<class>` (already HIGH or more, unchanged and not restored), `held` (an earlier capture loop of this process already raised it), `unavailable` (gdi32 lacks the D3DKMT exports), `off` (only `enable-host-dwm-mmcss` is on) |
 | `privilege` | `SeIncreaseBasePriorityPrivilege`: `ok`, `not_held` (the token lacks it: a portable instance under a normal user), `failed(<HRESULT>)`, `-` (not tried: `held` or `off`) |
-| `capture` | `7:<HRESULT>` from `SetGPUThreadPriority(7)` on the capture device, `n/a` for capturers without a D3D device in this process (GDI fallback, magnifier, portable service, camera), `off` |
+| `capture` | `7:<HRESULT>` from `SetGPUThreadPriority(7)` on the capture device, `n/a` for capturers that do not capture through a D3D device in this process (GDI fallback, also after DXGI recovery ran out or with DirectX capture turned off by option; magnifier, portable service, camera), `off` |
 | `encoder` | the GPU thread priority hwcodec gives encoder-owned D3D11 devices opened from now on (7 or 0). Each such device logs its own `gpu_priority encoder=<name> thread=7 hr=<HRESULT>` line (hwcodec log, no `LATENCY` prefix); none when the encoder uses the capture device (VRAM path) |
 | `hags` | hardware-accelerated GPU scheduling from `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` `HwSchMode`: `on` (2), `off` (1), `default` (no value: the system and driver default applies; check Settings > Display > Graphics), `?` |
 | `dwm_mmcss` | `DwmEnableMMCSS(TRUE)` HRESULT, `held` (already on in this process), `unavailable`, `off` |
@@ -758,13 +758,16 @@ Gate (roadmap M17), on Alza with a GPU-bound game at about 99% GPU (the game's o
 counter visible), a 60 fps session from the Dell over LAN, 2-3 minutes per run, the same scene:
 
 1. `enable-host-gpu-priority` empty (baseline), reconnect, play; then `Y`, reconnect, play.
-   Compare from the `LATENCY server` lines (filter by `gpuprio=`): `encode` p95/max, `grab`
+   Compare from the `LATENCY server` lines (filter by `gpuprio=`: `off` against `gpu`): `encode` p95/max, `grab`
    p95, `age` p95 and `fps`. Target: encode p95 from the measured 10-16 ms toward ~3 ms
    (estimate). The game's fps must not drop materially (more than about 5%).
 2. Check the `gpu_priority` line: `process=high` and `capture=7:0x00000000`. With
-   `above_normal(...)` or `privilege=not_held` the run measures less than intended.
-3. Only then `enable-host-dwm-mmcss=Y` on top (same comparison). Without a measurable gain,
-   leave it off.
+   `above_normal(...)` or `privilege=not_held` the run measures less than intended; with
+   `gpuprio=gpu-failed` nothing took effect, so the run is not a GPU-priority run. `capture=n/a`
+   means the capture ran through GDI (the `gdi: true` line): that run measures a different
+   capture path, repeat it with DXGI capture.
+3. Only then `enable-host-dwm-mmcss=Y` on top (same comparison, `gpu` against `gpu+dwm`).
+   Without a measurable gain, leave it off. A DWM-only run is labelled `dwm`.
 4. Note `hags=`: with HAGS on, Sunshine uses REALTIME for NVENC; this build never does. If HIGH
    shows no effect with HAGS on, a run with HAGS off (owner's setting, reboot) tells whether
    HAGS is the reason.
