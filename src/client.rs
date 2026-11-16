@@ -534,6 +534,26 @@ async fn race_transports_ranked<'a, T: 'a>(
     }
 }
 
+/// M8 2a for races without WebRTC: a direct result wins outright, a relay result is held for
+/// `window_ms` while anything else still races. Unlike `race_transports_prefer_webrtc`, a race in
+/// which everything fails returns the last error unchanged, exactly as `select_ok` did, so the
+/// checks that match on the error text (offline auto-retry, `check_if_retry`, "Please try later")
+/// behave as with `enable-relay-hold` off.
+async fn race_transports_relay_hold<'a, T: 'a>(
+    futs: Vec<BoxFuture<'a, ResultType<T>>>,
+    window_ms: u64,
+    is_direct: impl Fn(&T) -> bool,
+) -> ResultType<T> {
+    race_transports_ranked(futs, window_ms, 0, move |r| {
+        if is_direct(r) {
+            TransportRank::Preferred
+        } else {
+            TransportRank::Relay
+        }
+    })
+    .await
+}
+
 // A peer decides how many ICE candidates it sends, and the rendezvous route that carries them is
 // reachable without a prior punch, so these sites would otherwise let someone else set how much
 // this machine writes to its log file. One line a minute each, carrying the suppressed count.
@@ -810,13 +830,23 @@ impl Client {
         }
         if relay_hold {
             race_log.rule = Some("relay_hold");
-            let res = race_transports_prefer_webrtc(
-                preferred_fut,
-                vec![fallback_fut],
-                Self::relay_fallback_delay_ms(),
-                |result| result.0 .1,
-            )
-            .await;
+            let res = if has_webrtc_offerer {
+                race_transports_prefer_webrtc(
+                    preferred_fut,
+                    vec![fallback_fut],
+                    Self::relay_fallback_delay_ms(),
+                    |result| result.0 .1,
+                )
+                .await
+            } else {
+                // No WebRTC in this race: keep select_ok's error text when both rounds fail.
+                race_transports_relay_hold(
+                    vec![preferred_fut, fallback_fut],
+                    Self::relay_fallback_delay_ms(),
+                    |result| result.0 .1,
+                )
+                .await
+            };
             race_log.finish(res.as_ref().map_or("", |r| r.0 .4));
             return res;
         }
@@ -1432,11 +1462,10 @@ impl Client {
                             // M8 2a: the futures are [v6 KCP, relay]. The relay's single TCP
                             // connect nearly always beats punch_udp plus the KCP handshake, so a
                             // working v6 path would lose; hold the relay result for the fallback
-                            // delay while the v6 attempt is still running.
-                            let v6_fut = connect_futures.remove(0);
+                            // delay while the v6 attempt is still running. When both fail, the
+                            // error is select_ok's (the last one), not a "WebRTC failed" wrapper.
                             race_log.rule = Some("relay_hold");
-                            race_transports_prefer_webrtc(
-                                v6_fut,
+                            race_transports_relay_hold(
                                 connect_futures,
                                 Self::relay_fallback_delay_ms(),
                                 |result| result.3,
@@ -6841,9 +6870,7 @@ mod kx_tests {
 
 #[cfg(test)]
 mod direct_preference_latency_tests {
-    use super::{
-        race_transports_prefer_webrtc, race_transports_ranked, DirectPreference, TransportRank,
-    };
+    use super::{race_transports_ranked, race_transports_relay_hold, DirectPreference, TransportRank};
     use hbb_common::{
         anyhow::anyhow,
         futures::future::{BoxFuture, FutureExt},
@@ -6864,9 +6891,13 @@ mod direct_preference_latency_tests {
     }
 
     fn err_after(ms: u64) -> BoxFuture<'static, ResultType<R>> {
+        err_text_after(ms, "failed")
+    }
+
+    fn err_text_after(ms: u64, text: &'static str) -> BoxFuture<'static, ResultType<R>> {
         async move {
             sleep(Duration::from_millis(ms)).await;
-            Err(anyhow!("failed"))
+            Err(anyhow!(text))
         }
         .boxed()
     }
@@ -7000,18 +7031,16 @@ mod direct_preference_latency_tests {
     // M8 2a at the RelayResponse site: [v6 KCP, relay], the relay connects first.
     #[tokio::test]
     async fn latency_relay_response_holds_relay_for_v6() {
-        let got = race_transports_prefer_webrtc(
-            ok_after(300, "IPv6", true),
-            vec![ok_after(10, "Relay", false)],
+        let got = race_transports_relay_hold(
+            vec![ok_after(300, "IPv6", true), ok_after(10, "Relay", false)],
             60_000,
             |r| r.1,
         )
         .await
         .unwrap();
         assert_eq!(got.0, "IPv6");
-        let got = race_transports_prefer_webrtc(
-            err_after(300),
-            vec![ok_after(10, "Relay", false)],
+        let got = race_transports_relay_hold(
+            vec![err_after(300), ok_after(10, "Relay", false)],
             60_000,
             |r| r.1,
         )
@@ -7023,14 +7052,56 @@ mod direct_preference_latency_tests {
     // M8 2a at the `_start` site: the TCP round's relay must not beat the UDP round's punch.
     #[tokio::test]
     async fn latency_start_round_relay_held_for_direct_round() {
-        let got = race_transports_prefer_webrtc(
-            ok_after(400, "UDP", true),
-            vec![ok_after(10, "Relay", false)],
+        let got = race_transports_relay_hold(
+            vec![ok_after(400, "UDP", true), ok_after(10, "Relay", false)],
             60_000,
             |r| r.1,
         )
         .await
         .unwrap();
         assert_eq!(got.0, "UDP");
+    }
+
+    // A relay that lands after the direct attempt failed is taken at once, not after the window.
+    #[tokio::test]
+    async fn latency_relay_hold_takes_relay_once_direct_failed() {
+        let start = Instant::now();
+        let got = race_transports_relay_hold(
+            vec![err_after(10), ok_after(50, "Relay", false)],
+            60_000,
+            |r| r.1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0, "Relay");
+        assert!(start.elapsed() < Duration::from_millis(2_000));
+    }
+
+    // With everything failing, the error text is the plain last error, as select_ok returned it:
+    // Flutter's offline auto-retry and check_if_retry match on it.
+    #[tokio::test]
+    async fn latency_relay_hold_all_failed_keeps_last_error_text() {
+        let err = race_transports_relay_hold(
+            vec![
+                err_text_after(10, "Remote desktop is offline"),
+                err_text_after(30, "Remote desktop is offline"),
+            ],
+            60_000,
+            |r: &R| r.1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Remote desktop is offline");
+        let err = race_transports_relay_hold(
+            vec![
+                err_text_after(10, "Connection timed out"),
+                err_text_after(30, "Failed to connect via relay server: x"),
+            ],
+            60_000,
+            |r: &R| r.1,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Failed to connect via relay server: x");
     }
 }

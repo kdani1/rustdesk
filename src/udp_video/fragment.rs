@@ -355,15 +355,33 @@ impl Reassembler {
         self.events.drain(..).collect()
     }
 
-    /// When `poll` next has something to do, if anything is pending.
+    /// When `poll` next has something to do, if anything is pending. Computed exactly as
+    /// `release` decides, so a `poll` at this instant always makes progress: a receive loop that
+    /// sleeps until it never spins. An instant in the past means "poll now".
     pub fn next_deadline(&self) -> Option<Instant> {
         let c = self.config;
         self.displays
             .iter()
             .filter_map(|d| {
-                let oldest = d.pending.iter().map(|p| p.first_at).min()?;
-                let mut at = oldest + c.frame_timeout;
-                if let Some(done) = d.pending.iter().filter_map(|p| p.completed_at).min() {
+                let head = d.pending.first().filter(|p| p.frame_id == d.next_id);
+                // A complete or corrupt head is released by the next poll, whatever the time.
+                if let Some(h) = head.filter(|h| h.completed_at.is_some() || h.corrupt) {
+                    return Some(h.first_at);
+                }
+                // Same start as `release`: the head's own first fragment when it is present,
+                // otherwise the oldest later fragment.
+                let started = match head {
+                    Some(h) => h.first_at,
+                    None => d.pending.iter().map(|p| p.first_at).min()?,
+                };
+                let mut at = started + c.frame_timeout;
+                if let Some(done) = d
+                    .pending
+                    .iter()
+                    .filter(|p| p.frame_id != d.next_id)
+                    .filter_map(|p| p.completed_at)
+                    .min()
+                {
                     at = at.min(done + c.gap_grace);
                 }
                 Some(at)
@@ -659,6 +677,35 @@ mod latency_tests {
         assert_eq!(s.frames_gated, 1);
         assert_eq!(s.frames_completed, 3);
         assert_eq!(r.stats(), &LossStats::default());
+    }
+
+    // Reordered first fragments: frame 11 starts before frame 10, the head. The deadline must
+    // follow the head's own start, as `release` does, or a loop sleeping until it would spin.
+    #[test]
+    fn deadline_follows_head_start_when_reordered() {
+        let mut r = Reassembler::new(Default::default());
+        r.start_display(0, 10);
+        let t0 = Instant::now();
+        let first_only = |r: &mut Reassembler, id: u32, t: Instant| {
+            let f = frame_bytes(3_000, id as u8);
+            let (h, p) = fragment(&f, meta(id, 0), 1000).unwrap().into_iter().next().unwrap();
+            r.push(&h, p, t);
+        };
+        first_only(&mut r, 11, t0);
+        first_only(&mut r, 10, t0 + Duration::from_millis(3));
+        assert_eq!(r.next_deadline(), Some(t0 + Duration::from_millis(53)));
+        assert!(r.poll(t0 + Duration::from_millis(50)).is_empty());
+        // Every poll at the deadline makes progress or moves the deadline forward.
+        let mut now = t0 + Duration::from_millis(50);
+        let mut rounds = 0;
+        while let Some(at) = r.next_deadline() {
+            rounds += 1;
+            assert!(rounds < 10, "poll at next_deadline made no progress");
+            now = now.max(at);
+            let ev = r.poll(now);
+            assert!(!ev.is_empty() || r.next_deadline().map_or(true, |n| n > at));
+        }
+        assert_eq!(r.stats().frames_lost, 2);
     }
 
     #[test]
