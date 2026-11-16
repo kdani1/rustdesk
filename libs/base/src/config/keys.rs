@@ -311,10 +311,11 @@ pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
 // - Windows host, server option (Config), off by default. Offered to a fork viewer that
 //   advertised a lane, after a remote-control login over direct, encrypted TCP with both
 //   addresses on the LAN:
-//   "Y": live (M20): video frames go over UDP, everything else stays on TCP; falls back to TCP
-//        video in the same session on loss, socket errors or silence. Needs a viewer of lane v2;
-//        an older fork viewer gets no offer.
-//   "shadow": video stays on TCP; a copy of every Nth frame also goes over UDP to be measured.
+//   "live": live (M20): video frames go over UDP, everything else stays on TCP; falls back to
+//        TCP video in the same session on loss, socket errors or silence. Needs a viewer of
+//        lane v3; an older fork viewer gets no offer.
+//   "shadow" or "Y" (M19's value, still shadow): video stays on TCP; a copy of every Nth frame
+//        also goes over UDP to be measured.
 //   Read at each login; `rustdesk --option enable-udp-video N` turns it off.
 // - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising the lane
 //   (and refuses an offer), so a reconnect gives a plain TCP session without touching the host.

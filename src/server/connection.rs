@@ -5985,10 +5985,10 @@ impl Connection {
         let gate = match udp::mode_from_option(&option) {
             _ if !cfg!(windows) => Err("host is not Windows".to_owned()),
             None => Err(format!(
-                "host option enable-udp-video is \"{option}\" (Y: live, shadow: shadow)"
+                "host option enable-udp-video is \"{option}\" (live: live, shadow or Y: shadow)"
             )),
             Some(Mode::Live) if version < udp::VIEWER_LIVE_VERSION => Err(
-                "the viewer's lane has no live mode (enable-udp-video=shadow for a probe)"
+                "the viewer's lane has no live mode with EPOCH markers (an older build; enable-udp-video=shadow for a probe)"
                     .to_owned(),
             ),
             _ if self.video_ack_required => {
@@ -6010,11 +6010,27 @@ impl Connection {
             &Config::get_option(keys::OPTION_UDP_VIDEO_TIMEOUT_MS),
         );
         let hooks = (mode == Mode::Live).then(|| {
+            // A tail loss key frame, as `refresh_video_display`, from the lane's sender thread.
+            let server = self.server.clone();
+            let source = self.video_source();
             Arc::new(udp::LiveHooks {
                 fetched: Box::new(move |display, queued| {
                     video_service::notify_video_frame_fetched(display, id, Some(queued))
                 }),
                 sent: Box::new(|msg, send| super::latency_stats::on_video_send(msg, send)),
+                keyframe: Box::new(move |display| {
+                    super::latency_stats::on_refresh_request(source, display);
+                    video_service::refresh();
+                    if let Some(s) = server.upgrade() {
+                        if let Ok(s) = s.read() {
+                            s.set_video_service_opt(
+                                Some((source, display)),
+                                video_service::OPTION_REFRESH,
+                                super::service::SERVICE_OPTION_VALUE_TRUE,
+                            );
+                        }
+                    }
+                }),
             })
         });
         match udp::UdpVideoHost::start(id, self.udp_tap.clone(), local, viewer, params, hooks) {
@@ -6079,7 +6095,7 @@ impl Connection {
     /// Every second: ends a lane whose handshake timed out or (live) that went silent or whose
     /// socket fails; makes the next offer after a fallback when its time has come.
     async fn udp_video_check(&mut self) {
-        if let Some(Err(why)) = self.udp_video.as_ref().map(|l| l.check()) {
+        if let Some(Err(why)) = self.udp_video.as_mut().map(|l| l.check()) {
             self.udp_video_stop(&why, true).await;
         }
         if self.udp_video.is_none() && self.udp_retry_at.map_or(false, |at| Instant::now() >= at)

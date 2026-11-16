@@ -3,7 +3,7 @@
 Status: **M20 done: live mode.** A fork viewer and a fork host on the same LAN negotiate a
 UDP lane after login. In **shadow mode** (M19, host option `enable-udp-video=shadow`) the host
 sends a copy of every Nth video frame over it and the viewer only measures it. In **live mode**
-(M20, `enable-udp-video=Y`) the video frames go over UDP only and the viewer decodes them;
+(M20, `enable-udp-video=live`) the video frames go over UDP only and the viewer decodes them;
 control, input, audio, cursor and clipboard stay on the session stream (TCP), and any trouble
 puts the video back on TCP in the same session. Off by default on the host. Roadmap:
 `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), M24 (internet).
@@ -73,9 +73,13 @@ A shadow-mode (M19) receiver drops type 7 as an unknown type, and an M19 host ne
   frame, measure only).
 - `epoch`: the tap bumps it on every SwitchDisplay that passes it, so the viewer can hold frames
   of a display change it has not read on TCP yet (the review's fix). Live: the ACTIVE marker
-  carries the epoch at that point and the viewer counts the SwitchDisplays it reads after it
-  (every SwitchDisplay travels on the video channel, through the tap). A video-service restart
-  without a SwitchDisplay does not bump it and needs not: its first frame is a key frame.
+  carries the epoch at that point, and an active live tap writes `UdpVideoControl{KindEpoch,
+  epoch}` right before each SwitchDisplay that passes it; the viewer takes the marker's epoch
+  at the next SwitchDisplay it reads. Not every SwitchDisplay passes the tap: the connection
+  sends one directly when it answers a display switch or a message query (Flutter multi-window),
+  so counting all SwitchDisplays would leave the viewer an epoch ahead and every frame `stale`
+  (the M20 review's finding). A video-service restart without a SwitchDisplay does not bump it
+  and needs not: its first frame is a key frame.
 - `fec_group` / `fec_parity`: always 0 now. With FEC the last data shard of a block must be
   padded to the shard length; today the last fragment is simply shorter.
 - The payload of a frame is the serialized `Message{VideoFrame}`, unchanged, so the viewer's
@@ -118,7 +122,8 @@ Overhead per video datagram: 48 B. Budgets are whole UDP payloads:
 - Frames leave in `frame_id` order as soon as complete (no jitter buffer).
 - The oldest missing frame is declared lost when a later frame completed `gap_grace` (5 ms)
   ago, or its first fragment (or the oldest later one, if none of it arrived) is older than
-  `frame_timeout` (50 ms). A fragment more than `max_ahead` (64) frames ahead declares the
+  `frame_timeout` (50 ms by default; live 80 ms, shadow 500 ms). A fragment more than
+  `max_ahead` (64) frames ahead declares the
   backlog lost at once. Consecutive losses merge into one `Lost{from, to}` event.
 - After a loss, complete frames are dropped (`frames_gated`) until a `KEY` or
   `RECOVERY_POINT` frame, so the decoder never gets a frame whose reference is missing. The
@@ -133,9 +138,11 @@ Overhead per video datagram: 48 B. Budgets are whole UDP payloads:
 ### Pacing
 
 Token bucket: up to `burst` bytes at once (8 LAN datagrams to start), the rest at
-`max(1.5 x bitrate, frame_bytes / (0.5 x frame interval))`, so a frame, an IDR included, is out
-within half a frame interval. `wait_until` sleeps and spins the last millisecond; the live
-sender should use a high-resolution waitable timer on Windows.
+`max(1.5 x bitrate, frame_bytes / min(0.5 x frame interval, 25 ms))`, so a frame, an IDR
+included, is out within half a frame interval and never takes longer than 25 ms (`MAX_SPREAD`;
+at 10 fps or on an idle desktop the interval estimate nears 100 ms, and a 50 ms spread would
+reach the live reassembly timeout). `wait_until` sleeps and spins the last millisecond; the
+live sender uses a high-resolution waitable timer on Windows.
 
 ## Shadow probe (M19 second half)
 
@@ -143,16 +150,18 @@ sender should use a high-resolution waitable timer on Windows.
 
 | Key | Side | Default | Meaning |
 |---|---|---|---|
-| `enable-udp-video` | host, server option (Config) | off | `Y`: live mode (M20) to a viewer of lane v2; `shadow`: shadow mode to any lane viewer. Anything else: no offer. Read at each login (and each retry). |
+| `enable-udp-video` | host, server option (Config) | off | `live`: live mode (M20) to a viewer of lane v3; `shadow` or `Y` (M19's value): shadow mode to any lane viewer. Anything else: no offer. Read at each login (and each retry). |
 | `enable-udp-video` | viewer, local option (LocalConfig) | on | `N` stops advertising and refuses offers: the next connection is plain TCP, without touching the host. |
 | `udp-video-shadow-every` | host, server option | `2` | Shadow: one frame in N per display is copied to UDP (1..=60). Read at each offer. |
 | `udp-video-burst` | host, server option | `8` | Live: datagrams per paced burst (1..=64; `0` = unpaced, a frame at once). Read at each offer. |
 | `udp-video-timeout-ms` | host, server option | `1000` | Live: no datagram from the other end this long ends the lane (200..=10000). Sent in the offer; the viewer uses the same value. Read at each offer. |
 
 `rustdesk.exe --option enable-udp-video shadow` (or `Y`) on the host (elevated, installed)
-turns it on, `N` off; it applies from the next login. **Note:** in M19 builds `Y` meant shadow;
-since M20 it means live. With the option off the host costs one relaxed atomic load per video
-item and the viewer one `Option` check per frame.
+turns the probe on, `live` live mode, `N` off; it applies from the next login. **Note:** `Y`
+means shadow, as in M19 (the first M20 build took it as live; the review moved live to its own
+value, so a host set up for the probe never goes live with a newer build). With the option off
+the host costs one relaxed atomic load per video item and the viewer one `Option` check per
+frame.
 
 ### Negotiation (fork-only tags)
 
@@ -161,13 +170,17 @@ Tag plan of the fork: Misc 1001 `pointer_captured`; the lane uses LoginRequest 1
 free Misc tag is 1005.
 
 1. **Viewer -> host:** `LoginRequest.udp_video_version` (1001), set by a Windows viewer for
-   remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 since
-   M20 (live too). Stock hosts ignore the field. A host with `Y` offers live mode to v2 only;
-   a v1 viewer gets a `not offered` line instead. The lane wire and offer version stay 1.
+   remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 by the
+   first M20 build (live without EPOCH markers), 3 since the M20 review (live with them). Stock
+   hosts ignore the field. A host with `live` offers live mode to v3 only; an older viewer gets
+   a `not offered` line instead. Shadow offers have version 1, live offers version 2 (EPOCH
+   markers); the viewer refuses a live offer of version 1 (the first M20 host). The datagram
+   wire version stays 1.
 2. **Host gate**, checked once a remote-control session is authorized (right after the split,
    when split session I/O is on). A viewer that sent 0 gets nothing and no log line; one that
    advertised gets either an offer or one `not offered` line with the reason:
-   - Windows host, `enable-udp-video` = `Y`, the viewer does not ack frames (web client);
+   - Windows host, `enable-udp-video` = `live` or `shadow`/`Y`, the viewer does not ack frames
+     (web client);
    - transport from `create_tcp_connection`'s explicit `TransportInfo`: `Intranet`, `Direct` or
      `TcpPunch` only (never KCP, WebRTC or relay: the Stream variant is not trusted, a KCP
      session is a `Stream::Tcp` too);
@@ -282,8 +295,8 @@ The log lines are in docs/LATENCY-METRICS.md, "UDP video lane (shadow probe)".
 - The viewer holds UDP frames (up to 32) until it read ACTIVE. All TCP frames before ACTIVE
   were handled before it, so the first UDP frame, a P-frame referencing the last TCP frame,
   decodes into a valid chain: no key frame is needed for the switch (the review's hold fix).
-  Frames of a newer epoch are held until the viewer read the SwitchDisplay that bumped it;
-  frames of an older epoch are dropped (`stale`).
+  Frames of a newer epoch are held until the viewer read the SwitchDisplay that bumped it (the
+  one right after a `KindEpoch` marker); frames of an older epoch are dropped (`stale`).
 - UDP frames enter the same `handle_video_frame` as TCP frames: decoder queue or key frame
   path, `VideoCounters`, the M4 present pacer, M5 fps control (queue overflow refreshes) and
   the latency stats (`net+server` uses the frame's own timestamps, whichever way it came). The
@@ -292,16 +305,28 @@ The log lines are in docs/LATENCY-METRICS.md, "UDP video lane (shadow probe)".
 ### Loss: key frames, never a broken reference
 
 - The receive thread reassembles with the loss gate on and every display starting at frame 0:
-  after a loss (`Lost{from,to}`: 50 ms after a frame's first fragment, 5 ms after a later frame
-  completed, a frame id gap, a frame that does not parse) nothing of that display reaches the
-  io_loop until a `KEY` (or, later, `RECOVERY_POINT`) frame. The io_loop marks the display
-  broken, drops anything but a key frame for it, and sends `UdpVideoFeedback{request_keyframe,
-  display, lost_from, lost_to}` over TCP (at most one per display per 100 ms).
+  after a loss (`Lost{from,to}`: 80 ms after a frame's first fragment, above the pacer's 25 ms
+  longest spread plus Wi-Fi jitter; 5 ms after a later frame completed; a frame id gap; a frame
+  that does not parse) nothing of that display reaches the io_loop until a `KEY` (or, later,
+  `RECOVERY_POINT`) frame. A loss followed in the same poll by a key frame of its display (the
+  key frame overtook the gap) is reported repaired and asks nothing.
+- The io_loop marks the display broken (also when the 32-frame hold buffer drops one of its
+  frames), drops anything but a key frame for it, and sends `UdpVideoFeedback{request_keyframe,
+  display, lost_from, lost_to}` over TCP at once. While the display waits, further losses ask
+  nothing (the key frame asked for repairs them too); if no key frame came 250 ms after the
+  last request (the key frame or the request was lost), the request is repeated, driven by a
+  50 ms tick from the receive thread.
+- **Tail loss**: a frame lost whole with no later frame of its display (one small update on an
+  otherwise static screen) shows the viewer no gap. The host's sender thread watches each
+  display's newest frame (sent, or dropped from the full queue): not settled by the ACKs 200 ms
+  (plus the ACK round-trip baseline) after it went out, with nothing newer sent, it asks the
+  capture loop for a key frame itself (`tail_kf`), once per newest frame id.
 - The host answers through the refresh path of the display: with `enable-refresh-keyframe=Y`
   (M13) a forced key frame on the running encoder (merged with others, at most one per 200 ms,
   3 within 3 s escalate to a restart); otherwise a capture restart (`SWITCH`) for every viewer.
   The offer logs which. Live mode is meant to run with M13 on.
-- The host counts the requests: 4 within 5 s end the lane (sustained loss).
+- The host counts the requests and its tail loss key frames: 4 within 5 s end the lane
+  (sustained loss).
 
 ### Back-pressure: the send window
 
@@ -315,8 +340,10 @@ keeps taking the newest image, as with TCP. A frame dropped anywhere on the way 
 ### Pacing
 
 The sender thread sends each frame in bursts of `udp-video-burst` datagrams (8, about 11 KB),
-spaced by the token bucket at `max(1.5 x the measured bitrate, frame bytes / half the frame
-interval)`, so even an IDR is out within half a frame period (the roadmap allows two). Waits
+spaced by the token bucket at `max(1.5 x the measured bitrate, frame bytes / min(half the frame
+interval, 25 ms))`, so even an IDR is out within half a frame period (the roadmap allows two)
+and within 25 ms, well inside the viewer's 80 ms reassembly timeout also at a low frame rate.
+Waits
 use a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10
 1803+) for all but the last 0.5 ms, then a spin. The frame interval is an EWMA of the frames'
 queue times, the bitrate the bytes sent over the last second. Every datagram is still sealed
@@ -347,12 +374,14 @@ row, sustained loss (above), or the viewer asks (`KindRequestStop`). It then:
 3. offers a new lane after 30 s and after 120 s, then stays on TCP for the session.
 
 The viewer asks for the stop when a display stays broken 1 s after a loss, frames wait 1 s for
-ACTIVE, the host is silent for `timeout_ms`, or 5 receive errors come in a row. It stops
+ACTIVE or for the SwitchDisplay of their epoch, frames arrive for 1 s but only of an ended
+epoch (none reaches the decoder), the host is silent for `timeout_ms`, or 5 receive errors come
+in a row. It stops
 receiving at once but keeps the lane's state until the in-band STOP: a display whose last UDP
 frame did not reach the decoder takes TCP frames only from a key frame (`tcp_drop`), the others
 go on without a gap. A TCP frame that comes while a lane is active (never, by construction) is
 treated the same way. A STOP before ACTIVE (handshake timeout) goes out at once, as in shadow
-mode. Kill switches: host `enable-udp-video` empty or `shadow` (next login), viewer
+mode. Kill switches: host `enable-udp-video` empty, `shadow` or `Y` (next login), viewer
 `enable-udp-video=N` and a reconnect (needs no access to the host).
 
 ### Compatibility
@@ -360,8 +389,11 @@ mode. Kill switches: host `enable-udp-video` empty or `shadow` (next login), vie
 - Stock viewers never advertise, so stock hosts' and stock viewers' sessions are untouched.
 - An M19 viewer (v1) gets no live offer; it takes `shadow` offers as before. An M19 host offers
   only shadow mode, which this viewer takes.
-- Every new field (`timeout_ms`, `epoch`, `last_frames`, `in_band`, Misc 1004) is fork-only and
-  sent only on a negotiated lane.
+- The first M20 build (viewer v2, live offers of version 1, no EPOCH markers): this host offers
+  it no live lane, and this viewer refuses that host's live offers (a `KindRequestStop` with
+  the reason); shadow works both ways.
+- Every new field (`timeout_ms`, `epoch`, `last_frames`, `in_band`, `KindEpoch`, Misc 1004) is
+  fork-only and sent only on a negotiated lane.
 
 ### Left out of M20
 

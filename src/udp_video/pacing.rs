@@ -3,8 +3,11 @@
 //! A frame of N datagrams sent back to back is a burst the Wi-Fi AP or a switch queue may drop
 //! the tail of, and TCP's congestion control is no longer there to spread it. The pacer is a
 //! token bucket: up to `burst_bytes` go out at once, the rest at `rate`. The target rate is
-//! `max(1.5 x video bitrate, frame_bytes / (0.5 x frame interval))`, so a frame is always out
-//! within half a frame interval, an IDR included (the udp-video design, step 4).
+//! `max(1.5 x video bitrate, frame_bytes / min(0.5 x frame interval, MAX_SPREAD))`, so a frame
+//! is always out within half a frame interval, an IDR included (the udp-video design, step 4),
+//! and never takes longer than [`MAX_SPREAD`]: at a low frame rate (an idle desktop that sends
+//! only on change) the viewer's live reassembly timeout must still cover the whole frame plus
+//! jitter.
 //!
 //! The pacer only computes when to send; the live sender thread (M20) waits with a [`Waiter`]:
 //! a high-resolution waitable timer on Windows (1803+) for all but the last half millisecond,
@@ -16,10 +19,14 @@ use std::time::{Duration, Instant};
 /// Initial burst: 8 LAN datagrams, about 11 KB.
 pub const DEFAULT_BURST_PACKETS: usize = 8;
 
+/// Longest a paced frame takes from its first datagram to its last (bucket backlog aside);
+/// well below the viewer's live reassembly timeout (`viewer::LIVE_FRAME_TIMEOUT`, 80 ms).
+pub const MAX_SPREAD: Duration = Duration::from_millis(25);
+
 /// The pacing rate for the current bitrate and frame, in bytes per second.
 pub fn target_rate(bitrate_bps: u64, frame_bytes: usize, frame_interval: Duration) -> f64 {
     let by_bitrate = 1.5 * bitrate_bps as f64 / 8.0;
-    let half = frame_interval.as_secs_f64() * 0.5;
+    let half = (frame_interval.as_secs_f64() * 0.5).min(MAX_SPREAD.as_secs_f64());
     let by_frame = if half > 0.0 {
         frame_bytes as f64 / half
     } else {
@@ -245,6 +252,10 @@ mod latency_tests {
         let r = target_rate(20_000_000, 300_000, iv);
         assert!((r - 300_000.0 / 0.0083335).abs() / r < 1e-3);
         assert!(target_rate(0, 1, Duration::ZERO).is_infinite());
+        // 10 fps or an idle desktop (interval EWMA near 100 ms): the frame term spreads a
+        // 300 KB frame over MAX_SPREAD, not over 50 ms.
+        let r = target_rate(1_000_000, 300_000, Duration::from_millis(100));
+        assert!((r - 300_000.0 / MAX_SPREAD.as_secs_f64()).abs() / r < 1e-6);
     }
 
     #[test]

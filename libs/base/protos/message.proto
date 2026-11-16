@@ -85,7 +85,8 @@ message LoginRequest {
   bytes hwid = 14;
   string avatar = 17;
   // Fork-only (docs/UDP-VIDEO.md): the highest UDP video lane version this viewer supports,
-  // 0 or absent = none, 1 = shadow mode only, 2 = live mode too. Stock hosts ignore it, so
+  // 0 or absent = none, 1 = shadow mode only, 2 = live mode of the first M20 build (no EPOCH
+  // marker; offered no live lane any more), 3 = live mode with EPOCH. Stock hosts ignore it, so
   // they never offer a lane.
   uint32 udp_video_version = 1001;
 }
@@ -902,7 +903,7 @@ message UdpVideoOffer {
     // measured and dropped by the viewer (M19).
     ModeShadow = 1;
     // Video frames go over UDP only (M20); everything else stays on the session stream.
-    // Offered only to a viewer that advertised udp_video_version >= 2.
+    // Offered (as lane version 2) only to a viewer that advertised udp_video_version >= 3.
     ModeLive = 2;
   }
   uint32 version = 1;
@@ -936,12 +937,16 @@ message UdpVideoControl {
     KindStop = 3;
     // Viewer -> host: please close the lane (handshake failed, offer refused, viewer closing).
     KindRequestStop = 4;
+    // Live mode (lane v2), host -> viewer, right before a SwitchDisplay of the video stream:
+    // the next SwitchDisplay the viewer reads makes `epoch` current. A SwitchDisplay without
+    // this marker (one the host sent outside the video stream) leaves the epoch alone.
+    KindEpoch = 5;
   }
   Kind kind = 1;
   uint64 lane_id = 2;
   string reason = 3;
-  // KindActive: the epoch byte of the UDP frames that follow; bumped once per SwitchDisplay
-  // the viewer reads after this marker.
+  // KindActive: the epoch byte of the UDP frames that follow. KindEpoch: the epoch that the
+  // SwitchDisplay right after the marker starts.
   uint32 epoch = 4;
   // KindStop of a live lane: the id of the last frame given to UDP, per display that had any.
   repeated UdpVideoLastFrame last_frames = 5;

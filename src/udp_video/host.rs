@@ -20,9 +20,9 @@
 //! The connection's video path asks [`VideoTap::route`] about every video item before its TCP
 //! send. While no lane is active and no marker is pending that is one relaxed atomic load and
 //! the item goes to TCP. Shadow: the item goes to TCP and every Nth frame is also copied to
-//! UDP. Live: video frames go to UDP only, everything else (SwitchDisplay) to TCP; the ACTIVE
-//! and STOP markers are written to TCP in the order of the video stream, so the viewer knows
-//! exactly which frames came which way. The tap never blocks: a full queue drops the frame
+//! UDP. Live: video frames go to UDP only, everything else (SwitchDisplay) to TCP; the ACTIVE,
+//! EPOCH and STOP markers are written to TCP in the order of the video stream, so the viewer
+//! knows exactly which frames came which way and which SwitchDisplay starts a new epoch. The tap never blocks: a full queue drops the frame
 //! (`qdrop`; in live mode the viewer sees the gap as a loss and asks for a key frame).
 //!
 //! Live mode keeps the capture loop's "newest frame wins" back-pressure: the connection no
@@ -59,10 +59,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Lane (wire and offer) version this build speaks.
+/// Lane (wire and offer) version of a shadow offer.
 pub const LANE_VERSION: u32 = 1;
-/// `LoginRequest.udp_video_version` of a viewer that takes live offers (1: shadow only).
-pub const VIEWER_LIVE_VERSION: u32 = 2;
+/// Offer version of a live lane: v2 has the EPOCH marker (M20 review). The first M20 build
+/// offered live lanes as v1 without it; this viewer refuses those.
+pub const LIVE_LANE_VERSION: u32 = 2;
+/// `LoginRequest.udp_video_version` of a viewer that takes live offers of [`LIVE_LANE_VERSION`]
+/// (1: shadow only; 2: the first M20 build, which bumps its epoch on every SwitchDisplay and is
+/// offered no live lane).
+pub const VIEWER_LIVE_VERSION: u32 = 3;
 /// From the offer to the viewer's READY.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default of `udp-video-shadow-every`: half the frames, so the extra Wi-Fi load stays at half
@@ -80,7 +85,8 @@ pub const WINDOW_FRAMES: u32 = 3;
 /// A frame held back by the window counts as fetched after this anyway (lost ACKs must not
 /// stall the capture loop; silence ends the lane after `timeout`).
 pub const WINDOW_WAIT_MAX: Duration = Duration::from_millis(100);
-/// This many key frame requests (losses) within `KF_WINDOW` end a live lane: sustained loss.
+/// This many key frames for losses (the viewer's requests and tail losses) within `KF_WINDOW`
+/// end a live lane: sustained loss.
 pub const KF_MAX: usize = 4;
 pub const KF_WINDOW: Duration = Duration::from_secs(5);
 /// Added to the QoS delay sample when the viewer lost frames since the last sample.
@@ -95,6 +101,10 @@ const QUEUE: usize = 4;
 const LIVE_QUEUE: usize = 8;
 /// Lanes are offered on LAN paths only.
 const PATH: PathClass = PathClass::Lan;
+/// Live: a display's newest frame not settled by the viewer's ACKs this long (plus the ACK round
+/// trip baseline) after it went out, with nothing newer sent, is a tail loss: no later frame
+/// shows the viewer the gap, so the host asks the capture loop for a key frame itself.
+pub const TAIL_LOSS_AFTER: Duration = Duration::from_millis(200);
 const LOG_EVERY: Duration = Duration::from_secs(5);
 /// The QoS baseline (minimum ACK round trip) is the lower of this window's and the last one's.
 const BASE_WINDOW: Duration = Duration::from_secs(10);
@@ -150,11 +160,13 @@ pub fn offer_gate(g: &Gate) -> Result<(IpAddr, IpAddr), String> {
     Ok((local, peer))
 }
 
-/// The lane mode the host option asks for: "Y" live, "shadow" shadow, anything else none.
+/// The lane mode the host option asks for: "live" live; "shadow" or "Y" shadow (M19 used `Y`
+/// for the probe, so a host set up for it does not go live with a newer build); anything else
+/// none.
 pub fn mode_from_option(v: &str) -> Option<Mode> {
     match v {
-        "Y" => Some(Mode::Live),
-        "shadow" => Some(Mode::Shadow),
+        "live" => Some(Mode::Live),
+        "shadow" | "Y" => Some(Mode::Shadow),
         _ => None,
     }
 }
@@ -200,6 +212,9 @@ pub struct LiveHooks {
     pub fetched: Box<dyn Fn(usize, Instant) + Send + Sync>,
     /// `latency_stats::on_video_send`: the `send` field of the `LATENCY server` line.
     pub sent: Box<dyn Fn(&Message, Duration) + Send + Sync>,
+    /// A key frame of `display`, as for the viewer's request (`refresh_video_display`): called
+    /// by the sender thread on a tail loss.
+    pub keyframe: Box<dyn Fn(usize) + Send + Sync>,
 }
 
 /// Reports a live frame as fetched when dropped, whichever way: sent and inside the window,
@@ -240,6 +255,10 @@ struct DispWin {
     settled: Option<u32>,
     lost_total: Option<u32>,
     pending: Option<(Fetched, Instant)>,
+    /// When the newest id went out (or was dropped by a full queue): the tail loss clock.
+    newest_at: Option<Instant>,
+    /// The newest id a tail loss key frame was already asked for.
+    tail_fixed: Option<u32>,
 }
 
 impl DispWin {
@@ -250,6 +269,15 @@ impl DispWin {
             (Some(s), None) => s.wrapping_add(1),
             (Some(s), Some(t)) => (s.wrapping_sub(t) as i32).max(0) as u32,
         }
+    }
+
+    /// `id` is the newest frame of the display (sent, or dropped by a full queue). Never moves
+    /// back: the sender may still finish an older id after the tap dropped a newer one.
+    fn on_newest(&mut self, id: u32, now: Instant) {
+        if self.last_sent.map_or(true, |s| id_after(id, s)) {
+            self.last_sent = Some(id);
+        }
+        self.newest_at = Some(now);
     }
 }
 
@@ -328,6 +356,10 @@ struct Shared {
     skipped: AtomicU64,
     qdrop: AtomicU64,
     kf_req: AtomicU64,
+    /// Live: key frames asked for on a tail loss; `tail_new` is drained by `check` into the
+    /// sustained-loss count, `tail_kf` by the log line.
+    tail_kf: AtomicU64,
+    tail_new: AtomicU64,
     /// Lane clock, ms + 1, of the last datagram from the viewer that opened (0: none yet).
     last_rx_ms: AtomicU64,
     /// Set by the sender when the socket keeps failing: the lane must end.
@@ -348,6 +380,8 @@ impl Shared {
             skipped: AtomicU64::new(0),
             qdrop: AtomicU64::new(0),
             kf_req: AtomicU64::new(0),
+            tail_kf: AtomicU64::new(0),
+            tail_new: AtomicU64::new(0),
             last_rx_ms: AtomicU64::new(0),
             fatal: Mutex::new(None),
             live: Mutex::new(Live::default()),
@@ -598,9 +632,13 @@ impl VideoTap {
                         }),
                     };
                     // A refused job drops its `Fetched`, which reports the frame as fetched;
-                    // its id is never sent, so the viewer sees a loss.
+                    // its id is never sent, so the viewer sees a loss when a later frame comes,
+                    // and the tail loss check repairs it when none does.
                     if tx.try_send(job).is_err() {
                         shared.qdrop.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut live) = shared.live.lock() {
+                            live.disp(display).on_newest(frame_id, Instant::now());
+                        }
                     }
                     route.tcp = false;
                 }
@@ -609,8 +647,25 @@ impl VideoTap {
                 if matches!(m.union, Some(misc::Union::SwitchDisplay(_))) =>
             {
                 // Live: the viewer holds UDP frames of the new epoch until it read this
-                // SwitchDisplay on TCP. Shadow: it only travels along.
+                // SwitchDisplay on TCP. Shadow: it only travels along. The connection also
+                // sends SwitchDisplay outside the video channel (display switch, message query),
+                // which never passes here, so an active live lane writes EPOCH right before
+                // this one: the viewer bumps its epoch only for a SwitchDisplay after that
+                // marker. Before ACTIVE no marker is needed: ACTIVE carries the bumped epoch.
                 t.epoch = t.epoch.wrapping_add(1);
+                if let TapMode::Live {
+                    lane_id,
+                    announced: true,
+                    ..
+                } = &t.mode
+                {
+                    route.before.push(control_msg(UdpVideoControl {
+                        kind: udp_video_control::Kind::KindEpoch.into(),
+                        lane_id: *lane_id,
+                        epoch: t.epoch as u32,
+                        ..Default::default()
+                    }));
+                }
             }
             _ => {}
         }
@@ -797,7 +852,10 @@ impl UdpVideoHost {
             Mode::Live => udp_video_offer::Mode::ModeLive,
         };
         let offer = UdpVideoOffer {
-            version: LANE_VERSION,
+            version: match params.mode {
+                Mode::Shadow => LANE_VERSION,
+                Mode::Live => LIVE_LANE_VERSION,
+            },
             mode: mode.into(),
             lane_id,
             secret: secret.to_vec().into(),
@@ -896,13 +954,22 @@ impl UdpVideoHost {
     }
 
     /// Called every second: Err(reason) when the lane must end (handshake timeout; live: the
-    /// viewer silent for `timeout`, the socket failing).
-    pub fn check(&self) -> Result<(), String> {
+    /// viewer silent for `timeout`, the socket failing, sustained tail losses).
+    pub fn check(&mut self) -> Result<(), String> {
         match self.state {
             State::Offered if self.offered_at.elapsed() >= HANDSHAKE_TIMEOUT => {}
             State::Active if self.params.mode == Mode::Live => {
                 if let Some(e) = self.shared.fatal.lock().ok().and_then(|f| f.clone()) {
                     return Err(e);
+                }
+                let tails = self.shared.tail_new.swap(0, Ordering::Relaxed);
+                if tails > 0 {
+                    if let Some(n) = self.count_kf(tails as usize, Instant::now()) {
+                        return Err(format!(
+                            "sustained loss: {n} key frames in {} s (last: tail losses)",
+                            KF_WINDOW.as_secs()
+                        ));
+                    }
                 }
                 if let Some(silent) = self.shared.silent_for() {
                     if silent >= self.params.timeout {
@@ -944,19 +1011,9 @@ impl UdpVideoHost {
             return Ok(None);
         }
         self.shared.kf_req.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
-        self.kf_reqs.push_back(now);
-        while let Some(t) = self.kf_reqs.front() {
-            if now.saturating_duration_since(*t) > KF_WINDOW {
-                self.kf_reqs.pop_front();
-            } else {
-                break;
-            }
-        }
-        if self.kf_reqs.len() >= KF_MAX {
+        if let Some(n) = self.count_kf(1, Instant::now()) {
             return Err(format!(
-                "sustained loss: {} key frame requests in {} s (last: display {} frames {}..={})",
-                self.kf_reqs.len(),
+                "sustained loss: {n} key frames in {} s (last: request for display {} frames {}..={})",
                 KF_WINDOW.as_secs(),
                 f.display,
                 f.lost_from,
@@ -964,6 +1021,22 @@ impl UdpVideoHost {
             ));
         }
         Ok(Some(f.display.max(0) as usize))
+    }
+
+    /// Counts `n` key frames for losses; Some(count within `KF_WINDOW`) when that is sustained
+    /// loss.
+    fn count_kf(&mut self, n: usize, now: Instant) -> Option<usize> {
+        for _ in 0..n.min(KF_MAX) {
+            self.kf_reqs.push_back(now);
+        }
+        while let Some(t) = self.kf_reqs.front() {
+            if now.saturating_duration_since(*t) > KF_WINDOW {
+                self.kf_reqs.pop_front();
+            } else {
+                break;
+            }
+        }
+        (self.kf_reqs.len() >= KF_MAX).then_some(self.kf_reqs.len())
     }
 
     /// The delay sample for `video_qos` while the lane is live: the TCP probe's own delay plus
@@ -1255,7 +1328,10 @@ fn send_loop(
                     // Before the first datagram: an ACK for this frame may come back while its
                     // last bursts are still being paced, and must not be clamped below it.
                     if let Ok(mut live) = shared.live.lock() {
-                        live.disp(job.display).last_sent = Some(frame_id);
+                        let d = live.disp(job.display);
+                        if d.last_sent.map_or(true, |s| id_after(frame_id, s)) {
+                            d.last_sent = Some(frame_id);
+                        }
                     }
                     let sent =
                         send_live(sender, p, &mut w, &job, frame_id, clock, |d| socket.send(d));
@@ -1285,6 +1361,13 @@ fn send_loop(
         }
         if pacing.is_some() {
             expire_window(shared);
+            if let Some(hooks) = &hooks {
+                for display in tail_losses(shared, Instant::now()) {
+                    shared.tail_kf.fetch_add(1, Ordering::Relaxed);
+                    shared.tail_new.fetch_add(1, Ordering::Relaxed);
+                    (hooks.keyframe)(display as usize);
+                }
+            }
         }
         if last_log.elapsed() >= LOG_EVERY {
             log_window(
@@ -1322,7 +1405,7 @@ fn on_live_sent(shared: &Shared, display: u8, frame_id: u32, fetched: Option<Fet
         return;
     };
     let d = live.disp(display);
-    d.last_sent = Some(frame_id);
+    d.on_newest(frame_id, Instant::now());
     let inflight = d.inflight();
     // An older held frame goes now: only the newest waits.
     let older = d.pending.take();
@@ -1336,6 +1419,29 @@ fn on_live_sent(shared: &Shared, display: u8, frame_id: u32, fetched: Option<Fet
         live.win_wait.push_duration(since.elapsed());
         drop(f);
     }
+}
+
+/// Displays with a tail loss: the newest frame went out `TAIL_LOSS_AFTER` (plus the ACK round
+/// trip baseline) ago, nothing newer followed, and the viewer has not settled it. Each newest id
+/// is reported once; the key frame that repairs it is a newer id.
+fn tail_losses(shared: &Shared, now: Instant) -> Vec<u8> {
+    let Ok(mut live) = shared.live.lock() else {
+        return Vec::new();
+    };
+    let after = TAIL_LOSS_AFTER + Duration::from_micros(live.baseline().unwrap_or(0) as u64);
+    let mut out = Vec::new();
+    for d in live.displays.iter_mut() {
+        let (Some(newest), Some(at)) = (d.last_sent, d.newest_at) else {
+            continue;
+        };
+        let unsettled = d.settled.map_or(true, |s| id_after(newest, s));
+        if unsettled && d.tail_fixed != Some(newest) && now.saturating_duration_since(at) >= after
+        {
+            d.tail_fixed = Some(newest);
+            out.push(d.display);
+        }
+    }
+    out
 }
 
 /// Releases frames the window held longer than `WINDOW_WAIT_MAX`.
@@ -1524,7 +1630,7 @@ fn log_window(
                 let l = &mut *guard;
                 let base = l.baseline();
                 let s = format!(
-                    " paced_ms={} win_wait_ms={} win_to={} inflight_max={} acks={} ack_rtt_ms={} base_ms={} vlost={} kf_req={}",
+                    " paced_ms={} win_wait_ms={} win_to={} inflight_max={} acks={} ack_rtt_ms={} base_ms={} vlost={} kf_req={} tail_kf={}",
                     w.paced.ms3(),
                     l.win_wait.ms3(),
                     l.win_timeouts,
@@ -1534,6 +1640,7 @@ fn log_window(
                     base.map_or("-".to_owned(), |b| format!("{:.1}", b as f64 / 1000.0)),
                     l.lost_win,
                     take(&shared.kf_req),
+                    take(&shared.tail_kf),
                 );
                 l.win_wait = Samples::default();
                 l.rtt = Samples::default();
@@ -1609,6 +1716,7 @@ pub(crate) mod latency_tests {
         let hooks = Arc::new(LiveHooks {
             fetched: Box::new(move |d, _| f2.lock().unwrap().push(d)),
             sent: Box::new(|_, _| {}),
+            keyframe: Box::new(|_| {}),
         });
         (hooks, fetched)
     }
@@ -1665,8 +1773,10 @@ pub(crate) mod latency_tests {
 
     #[test]
     fn latency_params_and_mode_options() {
-        assert_eq!(mode_from_option("Y"), Some(Mode::Live));
+        assert_eq!(mode_from_option("live"), Some(Mode::Live));
         assert_eq!(mode_from_option("shadow"), Some(Mode::Shadow));
+        // M19's value keeps meaning shadow: a newer build never goes live without a new opt-in.
+        assert_eq!(mode_from_option("Y"), Some(Mode::Shadow));
         assert_eq!(mode_from_option(""), None);
         assert_eq!(mode_from_option("N"), None);
         let p = Params::from_options(Mode::Live, "", "", "");
@@ -1755,8 +1865,15 @@ pub(crate) mod latency_tests {
         );
         let r = tap.route(&video(0, 1, false), now);
         assert!(!r.tcp && r.before.is_empty());
+        // The SwitchDisplay stays on TCP, right after an EPOCH marker with the new epoch.
         let r = tap.route(&switch_display(), now);
-        assert!(r.tcp && r.before.is_empty());
+        assert!(r.tcp);
+        assert_eq!(r.before.len(), 1);
+        let c = control_of(&r.before[0]);
+        assert_eq!(
+            (c.kind.enum_value(), c.lane_id, c.epoch),
+            (Ok(udp_video_control::Kind::KindEpoch), 77, 1)
+        );
         assert!(!tap.route(&video(1, 2, true), now).tcp);
         assert!(!tap.route(&video(0, 3, false), now).tcp);
         let jobs: Vec<(u8, Option<u32>, u8, u8)> = rx
@@ -1859,6 +1976,34 @@ pub(crate) mod latency_tests {
     }
 
     /// The QoS signal: excess over the baseline round trip and a loss penalty, once per sample.
+    /// A newest frame the viewer never settles is a tail loss once it is `TAIL_LOSS_AFTER` old,
+    /// reported once per newest id; a settled one is not; an older id finishing late (the tap
+    /// dropped a newer one meanwhile) never moves the newest back.
+    #[test]
+    fn latency_live_tail_loss_once_per_newest() {
+        let shared = Shared::new(LaneClock::new());
+        let t0 = Instant::now();
+        {
+            let mut live = shared.live.lock().unwrap();
+            let d = live.disp(0);
+            d.on_newest(4, t0);
+            d.settled = Some(3);
+            d.on_newest(3, t0);
+            assert_eq!(d.last_sent, Some(4));
+            let d = live.disp(1);
+            d.on_newest(0, t0);
+            d.settled = Some(0);
+            // Display 2's first frame never arrived: no ACK settles anything.
+            live.disp(2).on_newest(0, t0);
+        }
+        assert!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER / 2).is_empty());
+        assert_eq!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER), vec![0, 2]);
+        assert!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER * 3).is_empty());
+        // The repairing key frame is a newer id: its own tail is watched again.
+        shared.live.lock().unwrap().disp(0).on_newest(5, t0);
+        assert_eq!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER), vec![0]);
+    }
+
     #[test]
     fn latency_live_qos_excess() {
         let mut l = Live::default();

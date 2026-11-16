@@ -1,7 +1,8 @@
 //! Viewer end of the UDP video lane: shadow probe (M19) and live video (M20).
 //!
-//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 2: live
-//!   mode too) on Windows, for remote control, unless `enable-udp-video` is `N`.
+//! - The viewer advertises `LoginRequest.udp_video_version` ([`advertised_version`], 3: live
+//!   mode with EPOCH markers too) on Windows, for remote control, unless `enable-udp-video` is
+//!   `N`.
 //! - On the host's offer, [`ViewerLane::on_offer`] checks it and starts a [`UdpVideoClient`]:
 //!   a socket bound to the session's own local TCP address (never the wildcard), connected to
 //!   the host's offered address, and one receive thread. The thread sends HELLO every 20 ms for
@@ -15,11 +16,13 @@
 //!   the io_loop until a key frame), reports losses, ACKs every display's progress over UDP
 //!   (the host's send window and QoS signal), and gives up when the host is silent for the
 //!   offer's `timeout_ms`. The io_loop ([`ViewerLane`]) holds UDP frames until it read the
-//!   ACTIVE marker and the SwitchDisplay of their epoch on TCP, feeds them to the same video
-//!   frame handling as TCP frames (decoder queue, M4 pacer, M5 fps control, latency stats),
-//!   asks the host for a key frame on loss (`UdpVideoFeedback`), and asks it to stop the lane
-//!   (`KindRequestStop`) when a display stays broken for 1 s, frames wait for ACTIVE for 1 s,
-//!   or the thread gave up. The host's in-band STOP says which frames went over UDP last, so
+//!   ACTIVE marker and the SwitchDisplay of their epoch (the one right after an EPOCH marker)
+//!   on TCP, feeds them to the same video frame handling as TCP frames (decoder queue, M4
+//!   pacer, M5 fps control, latency stats), asks the host for a key frame while a display is
+//!   broken (`UdpVideoFeedback`: at once, then again every `KF_RETRY` until one arrives), and
+//!   asks it to stop the lane (`KindRequestStop`) when a display stays broken for 1 s, frames
+//!   are held (for ACTIVE or a SwitchDisplay) for 1 s, frames arrive for 1 s but only of an
+//!   ended epoch, or the thread gave up. The host's in-band STOP says which frames went over UDP last, so
 //!   the TCP stream after it is decoded only from a key frame if any of them did not arrive.
 //!
 //! Dropping the client (STOP from the host, a refused handshake, the end of the io_loop round)
@@ -28,7 +31,9 @@
 use super::{
     crypto::{Role, SECRET_LEN},
     fragment::{Event, LossStats, ReassemblyConfig},
-    host::{DEFAULT_TIMEOUT, TIMEOUT_RANGE_MS, VIEWER_LIVE_VERSION},
+    host::{
+        DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_LIVE_VERSION,
+    },
     lane::{DropStats, LaneReceiver, LaneSender, Received},
     net::{self, LaneClock, ReadTimeout},
     packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, VIDEO_OVERHEAD},
@@ -72,8 +77,13 @@ const HOLD_MAX: usize = 32;
 /// Live: a display broken this long after a loss (no key frame), or frames waiting this long
 /// for ACTIVE, and the viewer asks the host to stop the lane.
 pub const WATCHDOG: Duration = Duration::from_secs(1);
-/// Live: key frame requests per display at most this often (the host merges them anyway).
-const KF_REQ_SPACING: Duration = Duration::from_millis(100);
+/// Live: while a display waits for a key frame, the request is repeated this long after the
+/// last one (the key frame or its request may be lost too). Losses in between ask nothing: the
+/// key frame already asked for repairs them. About 2.5x the usual request-to-IDR time on a LAN.
+const KF_RETRY: Duration = Duration::from_millis(250);
+/// Live: a frame not complete this long after its first fragment is lost. Above the pacer's
+/// longest spread (`pacing::MAX_SPREAD`, 25 ms) with room for Wi-Fi jitter.
+pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 
 /// The lane version to advertise in the login request, 0 for none.
 pub fn advertised_version(conn_type: ConnType) -> u32 {
@@ -139,12 +149,17 @@ pub enum ViewerEvent {
     Frame(ShadowFrame),
     Live(LiveFrame),
     /// Live: frames `from..=to` of `display` will never come; nothing of that display comes
-    /// until a key frame.
+    /// until a key frame. `repaired`: a key frame of the display completed in the same poll and
+    /// is its next event, so nothing needs asking.
     Lost {
         display: u8,
         from: u32,
         to: u32,
+        repaired: bool,
     },
+    /// Live: every `ACK_EVERY` (50 ms) while the lane is up; the io_loop repeats key frame
+    /// requests on it.
+    Tick,
     /// Live: the thread gave up on the lane (silence, socket errors) and stopped.
     Failed(String),
     Window(Box<RecvWindow>),
@@ -176,14 +191,21 @@ pub struct Accepted {
 
 /// Checks an offer against what this build speaks and the session's own local address.
 pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted, String> {
-    if offer.version != super::host::LANE_VERSION {
-        return Err(format!("version {} unsupported", offer.version));
-    }
     let live = match offer.mode.enum_value() {
         Ok(udp_video_offer::Mode::ModeShadow) => false,
         Ok(udp_video_offer::Mode::ModeLive) => true,
         _ => return Err(format!("mode {:?} unsupported", offer.mode)),
     };
+    // Live needs the EPOCH markers of lane v2: an older live host marks no SwitchDisplay, and
+    // this viewer bumps its epoch only for marked ones.
+    let want = if live { LIVE_LANE_VERSION } else { LANE_VERSION };
+    if offer.version != want {
+        return Err(format!(
+            "{} lane version {} unsupported (want {want})",
+            if live { "live" } else { "shadow" },
+            offer.version
+        ));
+    }
     let secret: [u8; SECRET_LEN] = offer
         .secret
         .as_ref()
@@ -294,6 +316,7 @@ fn recv_loop(
         // host's first.
         ReassemblyConfig {
             first_frame_id: Some(0),
+            frame_timeout: LIVE_FRAME_TIMEOUT,
             ..Default::default()
         }
     } else {
@@ -420,7 +443,18 @@ fn recv_loop(
             }
         }
         let mut changed: Vec<u8> = Vec::new();
-        for ev in lane_rx.poll(Instant::now()) {
+        let events = lane_rx.poll(Instant::now());
+        // A loss followed in the same poll by a key frame of its display (that frame overtook
+        // the gap, which is why it was declared lost) is already repaired.
+        let repaired: Vec<bool> = (0..events.len())
+            .map(|i| match &events[i] {
+                Event::Lost { display, .. } => events[i + 1..].iter().any(|e| {
+                    matches!(e, Event::Frame(f) if f.display == *display && f.flags & FLAG_KEY != 0)
+                }),
+                Event::Frame(_) => false,
+            })
+            .collect();
+        for (ev, repaired) in events.into_iter().zip(repaired) {
             match ev {
                 Event::Frame(f) => {
                     win.transit
@@ -453,6 +487,7 @@ fn recv_loop(
                                     display: f.display,
                                     from: f.frame_id,
                                     to: f.frame_id,
+                                    repaired: false,
                                 }
                             }
                         }
@@ -481,7 +516,13 @@ fn recv_loop(
                     if !changed.contains(&display) {
                         changed.push(display);
                     }
-                    if tx.send(ViewerEvent::Lost { display, from, to }).is_err() {
+                    let ev = ViewerEvent::Lost {
+                        display,
+                        from,
+                        to,
+                        repaired,
+                    };
+                    if tx.send(ev).is_err() {
                         return;
                     }
                 }
@@ -512,6 +553,9 @@ fn recv_loop(
                 };
                 send(&mut lane_tx, &Inner::Ack(ack));
                 win.acks += 1;
+            }
+            if periodic && tx.send(ViewerEvent::Tick).is_err() {
+                return;
             }
         }
         let now = Instant::now();
@@ -572,7 +616,10 @@ struct LiveDisp {
     delivered: Option<u32>,
     /// Since the loss that broke this display; frames are dropped until a key frame.
     awaiting: Option<Instant>,
+    /// The last key frame request while awaiting.
     last_req: Option<Instant>,
+    /// The first frames lost since `awaiting` (what the requests report).
+    lost: (u32, u32),
 }
 
 /// Live: the io_loop's state of a live lane, kept after the client closed until the host's
@@ -585,6 +632,10 @@ struct LiveLane {
     epoch: u8,
     held: VecDeque<LiveFrame>,
     held_since: Option<Instant>,
+    /// The EPOCH marker read on TCP: the next SwitchDisplay makes this epoch current.
+    next_epoch: Option<u8>,
+    /// Since frames arrive only of an epoch that has ended (none reached the decoder since).
+    stale_since: Option<Instant>,
     /// The receive side is gone (REQUEST_STOP sent); waiting for the in-band STOP.
     closed: bool,
     displays: Vec<LiveDisp>,
@@ -598,6 +649,8 @@ impl LiveLane {
             epoch: 0,
             held: VecDeque::new(),
             held_since: None,
+            next_epoch: None,
+            stale_since: None,
             closed: false,
             displays: Vec::new(),
         }
@@ -612,6 +665,7 @@ impl LiveLane {
                     delivered: None,
                     awaiting: None,
                     last_req: None,
+                    lost: (0, 0),
                 });
                 self.displays.len() - 1
             }
@@ -634,6 +688,8 @@ struct LiveStats {
     stale: u64,
     gated: u64,
     kf_req: u64,
+    /// Losses a key frame right behind them repaired (no request).
+    lost_fixed: u64,
     tcp_drop: u64,
 }
 
@@ -784,6 +840,11 @@ impl ViewerLane {
                     }
                     self.release_held();
                 }
+                Ok(udp_video_control::Kind::KindEpoch) => {
+                    if let Some(l) = self.live.as_mut() {
+                        l.next_epoch = Some(c.epoch as u8);
+                    }
+                }
                 Ok(udp_video_control::Kind::KindStop) => self.finish_live(c),
                 _ => {}
             }
@@ -836,11 +897,16 @@ impl ViewerLane {
         }
     }
 
-    /// A SwitchDisplay was read on TCP: UDP frames of the next epoch may be shown now.
+    /// A SwitchDisplay was read on TCP. After an EPOCH marker it starts the marker's epoch: UDP
+    /// frames of it may be shown now. Without one it is a SwitchDisplay the host sent outside
+    /// the video stream (display switch answer, message query), which its tap never counted.
     pub fn on_switch_display(&mut self) {
         if let Some(l) = self.live.as_mut() {
-            if l.active && !l.closed {
-                l.epoch = l.epoch.wrapping_add(1);
+            if !l.active || l.closed {
+                return;
+            }
+            if let Some(epoch) = l.next_epoch.take() {
+                l.epoch = epoch;
                 self.release_held();
             }
         }
@@ -872,9 +938,12 @@ impl ViewerLane {
         if !l.active || epoch_ahead(f.epoch, l.epoch) {
             if l.held.len() >= HOLD_MAX {
                 if let Some(old) = l.held.pop_front() {
-                    // A dropped frame breaks its display's chain.
+                    // A dropped frame breaks its display's chain: a loss, asked for like one.
                     let d = l.disp(old.display);
-                    d.awaiting.get_or_insert_with(Instant::now);
+                    if d.awaiting.is_none() {
+                        d.awaiting = Some(Instant::now());
+                        d.lost = (old.frame_id, old.frame_id);
+                    }
                 }
             }
             l.held.push_back(f);
@@ -886,6 +955,7 @@ impl ViewerLane {
         if f.epoch != l.epoch {
             // From before a SwitchDisplay already read: that stream has ended.
             self.stats.stale += 1;
+            l.stale_since.get_or_insert_with(Instant::now);
             return;
         }
         let d = l.disp(f.display);
@@ -895,7 +965,10 @@ impl ViewerLane {
         }
         if f.key {
             d.awaiting = None;
+            d.last_req = None;
         }
+        l.stale_since = None;
+        let d = l.disp(f.display);
         d.delivered = Some(f.frame_id);
         self.stats.delivered += 1;
         self.ready.push_back(f.vf);
@@ -964,29 +1037,57 @@ impl ViewerLane {
             }
             ViewerEvent::Live(f) => {
                 self.udp_bytes += f.bytes;
+                // A hold overflow may break a display: asked for below.
                 self.on_live_frame(f);
-                None
+                self.next_request(lane_id, Instant::now())
             }
-            ViewerEvent::Lost { display, from, to } => {
+            ViewerEvent::Lost {
+                display,
+                from,
+                to,
+                repaired,
+            } => {
                 let now = Instant::now();
                 let l = self.live.as_mut()?;
-                let d = l.disp(display);
-                d.awaiting.get_or_insert(now);
-                if d.last_req
-                    .map_or(false, |t| now.saturating_duration_since(t) < KF_REQ_SPACING)
-                {
+                if repaired {
+                    // The key frame behind it is the display's next event.
+                    self.stats.lost_fixed += 1;
                     return None;
                 }
-                d.last_req = Some(now);
-                self.stats.kf_req += 1;
-                Some(keyframe_request(lane_id, display, from, to))
+                let d = l.disp(display);
+                if d.awaiting.is_none() {
+                    d.awaiting = Some(now);
+                    d.lost = (from, to);
+                }
+                // A display already waiting asks nothing new: the key frame it asked for
+                // repairs this loss too; `KF_RETRY` covers a lost key frame or request.
+                self.next_request(lane_id, now)
             }
+            ViewerEvent::Tick => self.next_request(lane_id, Instant::now()),
             ViewerEvent::Failed(why) => self.request_stop(&why),
             ViewerEvent::Window(w) => {
                 self.log_window(lane_id, *w);
                 None
             }
         }
+    }
+
+    /// Live: the key frame request due now, if any: a broken display that has not asked yet,
+    /// or whose last request is `KF_RETRY` old. One per call (the next event or tick, 50 ms at
+    /// most, takes the next display).
+    fn next_request(&mut self, lane_id: u64, now: Instant) -> Option<Message> {
+        let l = self.live.as_mut()?;
+        if l.closed {
+            return None;
+        }
+        let d = l.displays.iter_mut().find(|d| {
+            d.awaiting.is_some()
+                && d.last_req
+                    .map_or(true, |t| now.saturating_duration_since(t) >= KF_RETRY)
+        })?;
+        d.last_req = Some(now);
+        self.stats.kf_req += 1;
+        Some(keyframe_request(lane_id, d.display, d.lost.0, d.lost.1))
     }
 
     /// Every status tick (1 s): the live watchdog. Returns the stop request to send, if any.
@@ -997,11 +1098,29 @@ impl ViewerLane {
         }
         let now = Instant::now();
         if let Some(since) = l.held_since {
-            if !l.active && now.saturating_duration_since(since) >= WATCHDOG {
-                return self.request_stop(&format!(
-                    "UDP frames waited {} ms for the ACTIVE marker",
-                    now.saturating_duration_since(since).as_millis()
-                ));
+            let held = now.saturating_duration_since(since);
+            if held >= WATCHDOG {
+                let why = if l.active {
+                    format!(
+                        "UDP frames waited {} ms for the SwitchDisplay of their epoch (at {})",
+                        held.as_millis(),
+                        l.epoch
+                    )
+                } else {
+                    format!("UDP frames waited {} ms for the ACTIVE marker", held.as_millis())
+                };
+                return self.request_stop(&why);
+            }
+        }
+        if let Some(since) = l.stale_since {
+            let stale = now.saturating_duration_since(since);
+            if stale >= WATCHDOG {
+                let why = format!(
+                    "UDP frames arrive but only of an ended epoch, none shown for {} ms (at {})",
+                    stale.as_millis(),
+                    l.epoch
+                );
+                return self.request_stop(&why);
             }
         }
         let broken = l.displays.iter().find_map(|d| {
@@ -1078,7 +1197,7 @@ impl ViewerLane {
         if self.live.is_some() {
             let s = std::mem::take(&mut self.stats);
             log::info!(
-                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} tcp_drop={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={}",
+                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={}",
                 self.peer,
                 w.span.as_secs_f64(),
                 l.frames_completed,
@@ -1103,6 +1222,7 @@ impl ViewerLane {
                 s.stale,
                 s.gated,
                 s.kf_req,
+                s.lost_fixed,
                 s.tcp_drop,
                 w.transit.above_min().ms3(),
                 w.assembly.ms3(),
@@ -1180,7 +1300,7 @@ mod latency_tests {
     }
 
     #[test]
-    fn check_offer_rules() {
+    fn latency_check_offer_rules() {
         let local: SocketAddr = "192.168.1.9:50123".parse().unwrap();
         let a = check_offer(&offer(), local).unwrap();
         assert_eq!(a.local, "192.168.1.9".parse::<IpAddr>().unwrap());
@@ -1188,6 +1308,9 @@ mod latency_tests {
         assert_eq!((a.every, a.live, a.timeout), (2, false, DEFAULT_TIMEOUT));
         let mut live = offer();
         live.mode = udp_video_offer::Mode::ModeLive.into();
+        // A live offer of lane v1 (the first M20 host, no EPOCH markers) is refused.
+        assert!(check_offer(&live, local).is_err());
+        live.version = LIVE_LANE_VERSION;
         live.timeout_ms = 400;
         let a = check_offer(&live, local).unwrap();
         assert_eq!((a.live, a.timeout), (true, Duration::from_millis(400)));
@@ -1387,8 +1510,20 @@ mod latency_tests {
         lane.on_live_frame(live_frame(0, 2, 4, true));
         lane.on_live_frame(live_frame(0, 3, 2, false));
         assert!(ready_ids(&mut lane).is_empty());
+        assert!(lane.live.as_ref().unwrap().stale_since.is_some());
+        // A SwitchDisplay without an EPOCH marker (sent outside the video stream, which the
+        // host's tap never counts) leaves the epoch alone.
+        lane.on_switch_display();
+        assert!(ready_ids(&mut lane).is_empty());
+        assert_eq!(lane.live.as_ref().unwrap().epoch, 3);
+        lane.on_control(&ctl(udp_video_control::Kind::KindEpoch, 4));
+        assert!(ready_ids(&mut lane).is_empty());
         lane.on_switch_display();
         assert_eq!(ready_ids(&mut lane), vec![2]);
+        assert!(lane.live.as_ref().unwrap().stale_since.is_none());
+        // The marker is used once.
+        lane.on_switch_display();
+        assert_eq!(lane.live.as_ref().unwrap().epoch, 4);
         assert_eq!((lane.stats.stale, lane.stats.held), (1, 3));
         // A loss on display 0: P-frames are dropped until a key frame.
         lane.live.as_mut().unwrap().disp(0).awaiting = Some(Instant::now());
@@ -1449,20 +1584,37 @@ mod latency_tests {
         lane.live = Some(LiveLane::new(5));
         lane.on_control(&ctl(udp_video_control::Kind::KindActive, 0));
         assert!(lane.tick().is_none());
-        // A loss: one key frame request, the next within the spacing is merged.
-        let req = lane.on_event(ViewerEvent::Lost {
+        // A loss a key frame right behind it repaired asks nothing and breaks nothing.
+        let lost = |from: u32, to: u32, repaired: bool| ViewerEvent::Lost {
             display: 0,
-            from: 3,
-            to: 4,
-        });
-        assert!(req.is_some());
-        assert!(lane
-            .on_event(ViewerEvent::Lost {
-                display: 0,
-                from: 6,
-                to: 6,
-            })
-            .is_none());
+            from,
+            to,
+            repaired,
+        };
+        assert!(lane.on_event(lost(1, 1, true)).is_none());
+        assert!(lane.live.as_mut().unwrap().disp(0).awaiting.is_none());
+        assert_eq!(lane.stats.lost_fixed, 1);
+        // A loss: one key frame request at once; a later loss while waiting asks nothing.
+        let req = lane.on_event(lost(3, 4, false)).expect("request");
+        let Some(message::Union::Misc(m)) = &req.union else {
+            panic!("no misc")
+        };
+        let Some(base::message_proto::misc::Union::UdpVideoFeedback(f)) = &m.union else {
+            panic!("no feedback")
+        };
+        assert_eq!((f.display, f.lost_from, f.lost_to), (0, 3, 4));
+        assert!(lane.on_event(lost(6, 6, false)).is_none());
+        assert!(lane.on_event(ViewerEvent::Tick).is_none());
+        // No key frame within KF_RETRY: the next tick asks again, still for the first loss.
+        let d = lane.live.as_mut().unwrap().disp(0);
+        d.last_req = Some(Instant::now() - KF_RETRY);
+        assert!(lane.on_event(ViewerEvent::Tick).is_some());
+        assert!(lane.on_event(ViewerEvent::Tick).is_none());
+        assert_eq!(lane.stats.kf_req, 2);
+        // The key frame ends the wait; a new loss then asks at once.
+        lane.on_live_frame(live_frame(0, 7, 0, true));
+        assert_eq!(ready_ids(&mut lane), vec![7]);
+        assert!(lane.on_event(lost(8, 8, false)).is_some());
         lane.live.as_mut().unwrap().disp(0).awaiting = Some(Instant::now() - WATCHDOG);
         let stop = lane.tick().expect("watchdog");
         let Some(message::Union::Misc(m)) = &stop.union else {
@@ -1487,5 +1639,69 @@ mod latency_tests {
         }];
         lane.on_control(&stop);
         assert_eq!(lane.tcp_await_key, vec![0]);
+    }
+
+    fn live_lane_with_client() -> ViewerLane {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let a = Accepted {
+            local: lo,
+            host: SocketAddr::new(lo, 9),
+            secret: [1u8; SECRET_LEN],
+            every: 1,
+            live: true,
+            timeout: DEFAULT_TIMEOUT,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut lane = ViewerLane::default();
+        let (client, _) = UdpVideoClient::start(&a, 5, tx).unwrap();
+        lane.client = Some(client);
+        lane.live = Some(LiveLane::new(5));
+        lane
+    }
+
+    /// A full hold buffer drops its oldest frame as a loss and asks for a key frame for it.
+    #[test]
+    fn latency_viewer_live_hold_overflow_requests() {
+        let mut lane = live_lane_with_client();
+        for id in 0..HOLD_MAX as u32 {
+            assert!(lane
+                .on_event(ViewerEvent::Live(live_frame(0, id, 0, id == 0)))
+                .is_none());
+        }
+        let req = lane
+            .on_event(ViewerEvent::Live(live_frame(0, HOLD_MAX as u32, 0, false)))
+            .expect("request for the dropped frame");
+        let Some(message::Union::Misc(m)) = &req.union else {
+            panic!("no misc")
+        };
+        let Some(base::message_proto::misc::Union::UdpVideoFeedback(f)) = &m.union else {
+            panic!("no feedback")
+        };
+        assert_eq!((f.display, f.lost_from, f.lost_to), (0, 0, 0));
+        // After ACTIVE the rest is gated until the key frame asked for.
+        lane.on_control(&ctl(udp_video_control::Kind::KindActive, 0));
+        assert!(ready_ids(&mut lane).is_empty());
+        assert_eq!(lane.stats.gated, HOLD_MAX as u64);
+    }
+
+    /// Frames that arrive only of an ended epoch, or wait for a SwitchDisplay, for a second
+    /// stop the lane.
+    #[test]
+    fn latency_viewer_live_stale_and_held_watchdog() {
+        let mut lane = live_lane_with_client();
+        lane.on_control(&ctl(udp_video_control::Kind::KindActive, 3));
+        lane.on_live_frame(live_frame(0, 0, 2, true));
+        assert!(lane.tick().is_none());
+        lane.live.as_mut().unwrap().stale_since = Some(Instant::now() - WATCHDOG);
+        assert!(lane.tick().is_some());
+        assert!(lane.live.as_ref().unwrap().closed);
+
+        let mut lane = live_lane_with_client();
+        lane.on_control(&ctl(udp_video_control::Kind::KindActive, 3));
+        lane.on_live_frame(live_frame(0, 0, 4, true));
+        assert!(lane.tick().is_none());
+        lane.live.as_mut().unwrap().held_since = Some(Instant::now() - WATCHDOG);
+        assert!(lane.tick().is_some());
+        assert!(lane.live.as_ref().unwrap().closed);
     }
 }
