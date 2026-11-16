@@ -3981,7 +3981,8 @@ class QualityMonitorData {
     if (sum != null && paint != null) sum += paint;
     return 'Lat: net+srv ~${f(l?['net'])} | queue ${f(l?['queue'])} | '
         'dec ${f(l?['dec'])} | ui ${f(l?['ui'])} | take ${f(take)} | '
-        'paint ${f(paint)} | total ~${f(sum)} ms';
+        'paint ${f(paint)} | total ~${f(sum)} ms | '
+        'fps dec ${f(l?['dfps'])} / shown ${f(l?['sfps'])} (skip ${f(l?['skip'])})';
   }
 }
 

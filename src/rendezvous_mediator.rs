@@ -34,7 +34,9 @@ use base::config::keys::*;
 
 use crate::{
     check_port,
-    server::{check_zombie, new as new_server, ConnectionMeta, ServerPtr},
+    server::{
+        check_zombie, new as new_server, ConnectionMeta, ServerPtr, TransportInfo, TransportKind,
+    },
 };
 
 type Message = RendezvousMessage;
@@ -1028,6 +1030,7 @@ impl RendezvousMediator {
                 peer_addr,
                 true,
                 meta,
+                TransportInfo::new(TransportKind::WebRtc),
             )
             .await
             {
@@ -1400,6 +1403,7 @@ async fn direct_server(server: ServerPtr) {
                             addr,
                             false,
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
+                            TransportInfo::new(TransportKind::Direct),
                         )
                         .await
                     );
@@ -1488,7 +1492,20 @@ async fn udp_nat_listen(
         // The KCP session is up: from here it is a connection like any other and the connection
         // layer's own limits apply to it, so the place goes back for the next punch.
         drop(slot);
-        crate::server::create_tcp_connection(server, stream.1, peer_addr_v4, true, meta).await?;
+        let kind = if hbb_common::try_into_v4(peer_addr).is_ipv6() {
+            TransportKind::KcpIpv6
+        } else {
+            TransportKind::KcpUdp
+        };
+        crate::server::create_tcp_connection(
+            server,
+            stream.1,
+            peer_addr_v4,
+            true,
+            meta,
+            TransportInfo::new(kind),
+        )
+        .await?;
         Ok(())
     };
     func.await.map_err(|e: anyhow::Error| {
@@ -1668,8 +1685,15 @@ async fn serve_punched(
     meta: ConnectionMeta,
 ) {
     log::info!("Punched tcp hole to {peer_addr}, connected on the punch itself");
-    if let Err(err) =
-        crate::server::create_tcp_connection(server, stream, peer_addr, true, meta).await
+    if let Err(err) = crate::server::create_tcp_connection(
+        server,
+        stream,
+        peer_addr,
+        true,
+        meta,
+        TransportInfo::with_detail(TransportKind::TcpPunch, "dialed"),
+    )
+    .await
     {
         log::warn!("Failed to serve the connection punched to {peer_addr}: {err}");
     }
@@ -1691,7 +1715,9 @@ async fn accept_punched_connection(
             else {
                 return;
             };
-            if let Err(err) = create_tcp_connection(server, stream, addr, true, meta).await {
+            let transport = TransportInfo::with_detail(TransportKind::TcpPunch, "accepted");
+            if let Err(err) = create_tcp_connection(server, stream, addr, true, meta, transport).await
+            {
                 log::warn!("Failed to serve the connection from {addr}: {err}");
             }
         }

@@ -202,6 +202,41 @@ pub const OPTION_ENABLE_WLAN_STREAMING_MODE: &str = "enable-wlan-streaming-mode"
 // before login, so file-transfer, port-forward and terminal connections from LAN peers are marked
 // too (known limit). Applies from the next connection.
 pub const OPTION_ENABLE_LAN_QOS: &str = "enable-lan-qos";
+// Windows host, server option: "N" restores the relative frame pacing of the capture loop (sleep
+// for what is left of the frame period, so every iteration's oversleep adds up). On by default:
+// absolute deadlines (next tick += frame period, a new schedule from now when more than one
+// period late, no catch-up burst), and DXGI waits ceil(period) + 2 ms for a new image instead of
+// the period truncated to ms. A change applies from the next capture restart. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_CAPTURE_DEADLINE_PACING: &str = "enable-capture-deadline-pacing";
+// Viewer, local option: present pacing, "always show the newest frame". Every frame is still
+// decoded, but a stale one is not handed to the UI while a newer one waits; the soft renderer
+// replaces a buffer Flutter has not fetched yet instead of dropping the newer frame. On by
+// default on Windows ("N" turns it off); off by default elsewhere ("Y" turns it on). Read when a
+// display's video thread starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_VIEWER_PRESENT_PACING: &str = "enable-viewer-present-pacing";
+// Viewer, local option: gentle fps control. The fps the viewer asks the host for follows the
+// decoder thread's measured load with hysteresis, steps of x0.85 down and +max(3, 10%) up, and
+// a floor of min(custom fps, 24) (10 only after 10 s of measured capacity below it), instead of
+// the legacy controller, which halves the fps down to 1 on queue growth. Same message to the
+// host (custom_fps). On by default on Windows ("N" restores the legacy controller); off by
+// default elsewhere ("Y" turns it on). Read when a connection starts. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_GENTLE_FPS_CONTROL: &str = "enable-gentle-fps-control";
+// Windows viewer, local option: "N" leaves the viewer at normal priority (on by default). While a
+// remote-control or camera session is open, its io_loop thread and each display's decoder thread
+// run at THREAD_PRIORITY_ABOVE_NORMAL, and the process at ABOVE_NORMAL_PRIORITY_CLASS (only raised
+// from NORMAL or lower, restored when the last such session ends) with EcoQoS/power throttling
+// turned off. Read when a session round or a video thread starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_VIEWER_PRIORITY_BOOST: &str = "enable-viewer-priority-boost";
+// Viewer, local option: playback buffer target for received audio, in ms. Empty: adaptive target
+// clamp(p95 of the audio arrival lateness over 20 s + 20 ms, 60, 300) ms, raised by 20 ms per
+// output underrun during a network stall (decays 10 ms per 15 s without one); buffered audio that
+// stays above target + 20 ms for 2 s is trimmed down to the target. A number N > 0: the same with
+// N ms as the lower bound. "0": the legacy rule (trim at most every 12 s, nothing below 600 ms).
+// Default adaptive on Windows; elsewhere empty means "0" (set a number to turn it on). Read when
+// the audio format of a session starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_AUDIO_TARGET_MS: &str = "audio-target-ms";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -270,6 +305,10 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_KEEP_AWAKE_DURING_OUTGOING_SESSIONS,
     OPTION_ENABLE_RAW_RELATIVE_MOUSE,
     OPTION_ENABLE_AUTO_GAME_MODE,
+    OPTION_ENABLE_VIEWER_PRESENT_PACING,
+    OPTION_ENABLE_GENTLE_FPS_CONTROL,
+    OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
+    OPTION_AUDIO_TARGET_MS,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
     OPTION_PRE_ELEVATE_SERVICE,

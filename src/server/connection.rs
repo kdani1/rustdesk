@@ -531,6 +531,7 @@ impl Connection {
         server: super::ServerPtrWeak,
         meta: super::ConnectionMeta,
         unauthorized: UnauthorizedID,
+        transport: super::TransportKind,
     ) {
         let super::ConnectionMeta {
             control_permissions,
@@ -714,6 +715,7 @@ impl Connection {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         std::thread::spawn(move || Self::handle_input(_rx_input, tx_cloned));
         let mut second_timer = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));
+        let mut conn_stats = super::latency_stats::ConnStats::new(id, transport.label());
 
         #[cfg(feature = "unix-file-copy-paste")]
         let rx_clip_holder;
@@ -738,6 +740,8 @@ impl Connection {
         }
 
         loop {
+            // Ends the busy time of the branch that ran last (also after its `continue`).
+            conn_stats.end();
             tokio::select! {
                 // biased; // video has higher priority // causing test_delay_timer failed while transferring big file
 
@@ -753,6 +757,7 @@ impl Connection {
                     break;
                 }
                 Some(data) = rx_from_cm.recv() => {
+                    conn_stats.begin("cm");
                     match data {
                         ipc::Data::Authorize => {
                             conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
@@ -1027,6 +1032,7 @@ impl Connection {
                     }
                 },
                 res = conn.stream.next() => {
+                    conn_stats.begin("read");
                     if let Some(res) = res {
                         match res {
                             Err(err) => {
@@ -1037,6 +1043,7 @@ impl Connection {
                                 last_recv_time = Instant::now();
                                 conn.session_last_recv_time.as_mut().map(|t| *t.lock().unwrap() = Instant::now());
                                 if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
+                                    conn_stats.on_message(&msg_in);
                                     if !conn.on_message(msg_in).await {
                                         break;
                                     }
@@ -1056,6 +1063,7 @@ impl Connection {
                     }
                 },
                 _ = conn.file_timer.tick() => {
+                    conn_stats.begin("file");
                     if !conn.read_jobs.is_empty() {
                         conn.send_to_cm(ipc::Data::FileTransferLog(("transfer".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));
                         match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {
@@ -1074,6 +1082,7 @@ impl Connection {
                     }
                 }
                 Ok(conns) = hbbs_rx.recv() => {
+                    conn_stats.begin("hbbs");
                     if conns.contains(&id) {
                         conn.send_close_reason_no_retry("Closed manually by web console").await;
                         conn.on_close("web console", true).await;
@@ -1081,6 +1090,7 @@ impl Connection {
                     }
                 }
                 Some((instant, value)) = rx_video.recv() => {
+                    conn_stats.begin("video");
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
@@ -1091,9 +1101,12 @@ impl Connection {
                         conn.on_close(&err.to_string(), false).await;
                         break;
                     }
-                    super::latency_stats::on_video_send(&value, send_begin.elapsed());
+                    let send = send_begin.elapsed();
+                    super::latency_stats::on_video_send(&value, send);
+                    conn_stats.on_video_send(send);
                 },
                 Some((instant, value)) = rx.recv() => {
+                    conn_stats.begin("rx");
                     let latency = instant.elapsed().as_millis() as i64;
                     #[allow(unused_mut)]
                     let mut msg = value;
@@ -1155,6 +1168,7 @@ impl Connection {
                     }
                 },
                 Some(data) = rx_from_authed.recv() => {
+                    conn_stats.begin("authed");
                     match data {
                         #[cfg(all(target_os = "windows", feature = "flutter"))]
                         ipc::Data::PrinterData(data) => {
@@ -1168,6 +1182,8 @@ impl Connection {
                     }
                 }
                 _ = second_timer.tick() => {
+                    conn_stats.begin("second");
+                    conn_stats.tick(conn.authorized);
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
                     }
@@ -1186,6 +1202,7 @@ impl Connection {
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
+                    conn_stats.begin("test_delay");
                     if last_recv_time.elapsed() >= SEC30 {
                         conn.on_close("Timeout", true).await;
                         break;
@@ -1207,16 +1224,19 @@ impl Connection {
                         }
                     }
                 }
-                clip_file = rx_clip.recv() => match clip_file {
-                    Some(_clip) => {
-                        #[cfg(feature = "unix-file-copy-paste")]
-                        if crate::is_support_file_copy_paste(&conn.lr.version)
-                        {
-                            conn.handle_file_clip(_clip).await;
+                clip_file = rx_clip.recv() => {
+                    conn_stats.begin("clip");
+                    match clip_file {
+                        Some(_clip) => {
+                            #[cfg(feature = "unix-file-copy-paste")]
+                            if crate::is_support_file_copy_paste(&conn.lr.version)
+                            {
+                                conn.handle_file_clip(_clip).await;
+                            }
                         }
-                    }
-                    None => {
-                        //
+                        None => {
+                            //
+                        }
                     }
                 },
             }
@@ -4550,6 +4570,9 @@ impl Connection {
     }
 
     fn refresh_video_display(&self, display: Option<usize>) {
+        if let Some(display) = display {
+            super::latency_stats::on_refresh_request(self.video_source(), display);
+        }
         video_service::refresh();
         self.server.upgrade().map(|s| {
             s.read().unwrap().set_video_service_opt(
@@ -7333,8 +7356,15 @@ mod test {
             let addr: SocketAddr = format!("192.0.2.{}:1", i + 1).parse().unwrap();
             let server = server.clone();
             handshakes.push(tokio::spawn(async move {
-                crate::server::create_tcp_connection(server, served, addr, true, Default::default())
-                    .await
+                crate::server::create_tcp_connection(
+                    server,
+                    served,
+                    addr,
+                    true,
+                    Default::default(),
+                    crate::server::TransportInfo::new(crate::server::TransportKind::Direct),
+                )
+                .await
             }));
         }
         for _ in 0..200 {
@@ -7354,6 +7384,7 @@ mod test {
             addr,
             true,
             Default::default(),
+            crate::server::TransportInfo::new(crate::server::TransportKind::Direct),
         )
         .await;
         assert!(refused.is_err());
@@ -7396,8 +7427,15 @@ mod test {
         let (mut controller, (accepted, addr)) = (controller.unwrap(), accepted.unwrap());
         let served = Stream::Tcp(hbb_common::tcp::FramedStream::from(accepted, addr));
         let handshake = tokio::spawn(async move {
-            crate::server::create_tcp_connection(server, served, addr, true, Default::default())
-                .await
+            crate::server::create_tcp_connection(
+                server,
+                served,
+                addr,
+                true,
+                Default::default(),
+                crate::server::TransportInfo::new(crate::server::TransportKind::Direct),
+            )
+            .await
         });
         let n = MAX_UNAUTHORIZED_MESSAGE + 1;
         controller

@@ -57,6 +57,10 @@ impl TraitCapturer for Capturer {
         self.inner.set_gdi()
     }
 
+    fn last_present_age(&self) -> Option<Duration> {
+        self.inner.last_present_age()
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice {
         self.inner.device()

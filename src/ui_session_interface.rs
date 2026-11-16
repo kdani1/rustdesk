@@ -1789,6 +1789,12 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     fn send(&self, data: Data) {
         if let Some(sender) = self.sender.read().unwrap().as_ref() {
+            if let Data::Message(msg) = &data {
+                crate::client::latency::on_input_queued(
+                    crate::client::latency::stream_key(&self.sender),
+                    msg,
+                );
+            }
             sender.send(data).ok();
         }
     }

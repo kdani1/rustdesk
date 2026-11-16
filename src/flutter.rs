@@ -258,6 +258,9 @@ struct RgbaData {
     // We must check the `rgba_valid` before reading [rgba].
     data: Vec<u8>,
     valid: bool,
+    // Flutter started reading the valid buffer (`session_get_rgba_size`, the first call it
+    // makes for an `EventToUI::Rgba`): it must not be swapped until `next_rgba`.
+    fetched: bool,
     ui_handoff: Option<crate::client::latency::UiHandoff>,
 }
 
@@ -1084,8 +1087,11 @@ impl InvokeUiSession for FlutterHandler {
 
     #[inline]
     fn get_rgba(&self, _display: usize) -> *const u8 {
-        if let Some(rgba_data) = self.display_rgbas.read().unwrap().get(&_display) {
+        if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&_display) {
             if rgba_data.valid {
+                // Also here: with several UI sessions, one may have read the size before this
+                // buffer became valid.
+                rgba_data.fetched = true;
                 return rgba_data.data.as_ptr();
             }
         }
@@ -1097,6 +1103,7 @@ impl InvokeUiSession for FlutterHandler {
         let ui_handoff =
             if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&_display) {
                 rgba_data.valid = false;
+                rgba_data.fetched = false;
                 rgba_data.ui_handoff.take()
             } else {
                 None
@@ -1198,10 +1205,24 @@ impl FlutterHandler {
         let mut rgba_write_lock = self.display_rgbas.write().unwrap();
         if let Some(rgba_data) = rgba_write_lock.get_mut(&display) {
             if rgba_data.valid {
+                // Present pacing: "the newest wins". While Flutter has not started reading the
+                // pending buffer, put this newer frame in its place; the event posted for it
+                // is still queued, so no new one is posted. Same size only, as Flutter reads
+                // the size first.
+                if crate::client::is_present_pacing_thread()
+                    && !rgba_data.fetched
+                    && rgba_data.data.len() == rgba.raw.len()
+                {
+                    std::mem::swap::<Vec<u8>>(&mut rgba.raw, &mut rgba_data.data);
+                    rgba_data.ui_handoff = crate::client::latency::ui_handoff();
+                    crate::client::latency::mark_ui_replaced();
+                    return;
+                }
                 crate::client::latency::mark_ui_dropped();
                 return;
             } else {
                 rgba_data.valid = true;
+                rgba_data.fetched = false;
                 rgba_data.ui_handoff = crate::client::latency::ui_handoff();
             }
             // Return the rgba buffer to the video handler for reusing allocated rgba buffer.
@@ -1712,10 +1733,16 @@ pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         return session
             .display_rgbas
-            .read()
+            .write()
             .unwrap()
-            .get(&display)
-            .map_or(0, |rgba| rgba.data.len());
+            .get_mut(&display)
+            .map_or(0, |rgba| {
+                // Flutter reads this buffer from now until `next_rgba`.
+                if rgba.valid {
+                    rgba.fetched = true;
+                }
+                rgba.data.len()
+            });
     }
     0
 }

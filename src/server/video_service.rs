@@ -64,6 +64,14 @@ use std::{
 
 pub const OPTION_REFRESH: &'static str = "refresh";
 
+// `bail!("SWITCH")` that names its reason for the `LATENCY switch` line (latency_stats.rs).
+macro_rules! bail_switch {
+    ($reason:expr) => {{
+        super::latency_stats::note_switch($reason);
+        bail!("SWITCH");
+    }};
+}
+
 #[cfg(windows)]
 const DXGI_RECOVERY_LIMIT: usize = 3;
 #[cfg(windows)]
@@ -313,7 +321,14 @@ pub fn new(source: VideoSource, idx: usize) -> GenericService {
         #[cfg(windows)]
         dxgi_recovery_state: Arc::new(Mutex::new(DxgiRecoveryState::new())),
     };
-    GenericService::run(&vs, run);
+    let (source, display) = (vs.source, vs.idx);
+    GenericService::run(&vs, move |vs: VideoService| {
+        let res = run(vs);
+        if let Err(err) = &res {
+            super::latency_stats::on_restart(source, display, err);
+        }
+        res
+    });
     vs.sp
 }
 
@@ -736,11 +751,24 @@ fn run(vs: VideoService) -> ResultType<()> {
     let capture_width = c.width;
     let capture_height = c.height;
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
-    let mut latency_stats = super::latency_stats::LatencyStats::new(display_idx);
+    let mut latency_stats =
+        super::latency_stats::LatencyStats::new(vs.source, display_idx, encoder.bitrate());
+    // Absolute frame deadlines instead of sleeping for the rest of each period (Windows only).
+    #[cfg(windows)]
+    let deadline_pacing =
+        Config::get_option(base::config::keys::OPTION_ENABLE_CAPTURE_DEADLINE_PACING) != "N";
+    #[cfg(not(windows))]
+    let deadline_pacing = false;
+    // Only the in-process DXGI capturer gets the longer wait: the portable service takes the
+    // timeout as its own frame period, GDI, magnifier and camera capturers ignore it.
+    let dxgi_wait_margin =
+        deadline_pacing && vs.source.is_monitor() && !last_portable_service_running;
+    let mut next_tick = Instant::now();
 
     while sp.ok() {
         #[cfg(windows)]
         check_uac_switch(c.privacy_mode_id, c._capturer_privacy_mode_id)?;
+        let quality_before = quality;
         check_qos(
             &mut encoder,
             &mut quality,
@@ -750,12 +778,15 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut second_instant,
             &sp.name(),
         )?;
+        if quality != quality_before && encoder.support_changing_quality() {
+            latency_stats.on_quality(encoder.bitrate());
+        }
         if sp.is_option_true(OPTION_REFRESH) {
             if vs.source.is_monitor() {
                 let _ = try_broadcast_display_changed(&sp, display_idx, &c, true);
             }
             log::info!("switch to refresh");
-            bail!("SWITCH");
+            bail_switch!("refresh");
         }
         if codec_format != Encoder::negotiated_codec() {
             log::info!(
@@ -763,22 +794,22 @@ fn run(vs: VideoService) -> ResultType<()> {
                 codec_format,
                 Encoder::negotiated_codec()
             );
-            bail!("SWITCH");
+            bail_switch!("codec");
         }
         #[cfg(windows)]
         if last_portable_service_running != crate::portable_service::client::running() {
             log::info!("switch due to portable service running changed");
-            bail!("SWITCH");
+            bail_switch!("portable_service");
         }
         if Encoder::use_i444(&encoder_cfg) != use_i444 {
             log::info!("switch due to i444 changed");
-            bail!("SWITCH");
+            bail_switch!("i444");
         }
         #[cfg(all(windows, feature = "vram"))]
         if c.is_gdi() && encoder.input_texture() {
             log::info!("changed to gdi when using vram");
             VRamEncoder::set_fallback_gdi(sp.name(), true);
-            bail!("SWITCH");
+            bail_switch!("gdi_vram");
         }
         if vs.source.is_monitor() {
             check_privacy_mode_changed(&sp, display_idx, &c)?;
@@ -804,7 +835,11 @@ fn run(vs: VideoService) -> ResultType<()> {
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
         let grab_begin = Instant::now();
-        let res = match c.frame(spf) {
+        let res = match c.frame(if dxgi_wait_margin {
+            dxgi_frame_timeout(spf)
+        } else {
+            spf
+        }) {
             Ok(frame) => {
                 let grab_done = Instant::now();
                 repeat_encode_counter = 0;
@@ -844,7 +879,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                                         .unwrap()
                                         .insert(screenshot_key, screenshot);
                                     _raii.try_vram = false;
-                                    bail!("SWITCH");
+                                    bail_switch!("screenshot");
                                 }
                             }
                         };
@@ -852,7 +887,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             handle_screenshot(screenshot, msg, w, h, data);
                         });
                         if restore_vram {
-                            bail!("SWITCH");
+                            bail_switch!("screenshot");
                         }
                     }
 
@@ -868,11 +903,18 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut first_frame,
                         capture_width,
                         capture_height,
+                        &mut latency_stats,
                     )?;
+                    // The frame no longer borrows the capturer; the age is of the frame just encoded.
+                    #[cfg(windows)]
+                    let age = c.last_present_age();
+                    #[cfg(not(windows))]
+                    let age = None;
                     latency_stats.on_frame(
                         grab_done.saturating_duration_since(grab_begin),
                         grab_done.elapsed(),
                         !send_conn_ids.is_empty(),
+                        age,
                     );
                     frame_controller.set_send(now, send_conn_ids);
                     send_counter += 1;
@@ -890,6 +932,9 @@ fn run(vs: VideoService) -> ResultType<()> {
             Err(err) => Err(err),
         };
 
+        // No new image within the capturer's timeout, which under deadline pacing is longer
+        // than spf (`dxgi_frame_timeout`).
+        let idle = matches!(res, Err(ref e) if e.kind() == WouldBlock);
         match res {
             Err(ref e) if e.kind() == WouldBlock => {
                 latency_stats.on_idle();
@@ -938,6 +983,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut first_frame,
                             capture_width,
                             capture_height,
+                            &mut latency_stats,
                         )?;
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
@@ -965,7 +1011,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             log::debug!(
                                 "dxgi access lost, restart capture: attempt {attempt}, error: {err:?}"
                             );
-                            bail!("SWITCH");
+                            bail_switch!("dxgi_access_lost");
                         }
                         log::warn!(
                             "dxgi access lost after {DXGI_RECOVERY_LIMIT} restarts in {} seconds, fall back to gdi: {err:?}",
@@ -1006,17 +1052,42 @@ fn run(vs: VideoService) -> ResultType<()> {
         );
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
-        let elapsed = now.elapsed();
-        // may need to enable frame(timeout)
-        log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
-        if elapsed < spf {
-            latency_stats.on_sleep(spf - elapsed);
-            std::thread::sleep(spf - elapsed);
+        if deadline_pacing {
+            next_tick += spf;
+            let now = Instant::now();
+            if now < next_tick {
+                latency_stats.on_sleep(next_tick - now);
+                std::thread::sleep(next_tick - now);
+            } else if idle {
+                // Late only by the capturer's longer timeout, with no frame to catch up on:
+                // follow it without counting a re-anchor.
+                next_tick = now;
+            } else if now - next_tick > spf {
+                // More than one period late (a long wait, a stall, a camera slower than the
+                // target): start a new schedule from now rather than bursting frames to catch up.
+                next_tick = now;
+                latency_stats.on_reanchor();
+            }
+        } else {
+            let elapsed = now.elapsed();
+            // may need to enable frame(timeout)
+            log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
+            if elapsed < spf {
+                latency_stats.on_sleep(spf - elapsed);
+                std::thread::sleep(spf - elapsed);
+            }
         }
-        latency_stats.tick(spf);
+        latency_stats.tick(spf, deadline_pacing);
     }
 
     Ok(())
+}
+
+// How long DXGI may wait for a new image under deadline pacing: ceil(spf) + 2 ms. The plain spf
+// truncated to ms (16 ms at 60 fps) is shorter than the present interval (16.67 ms), so a loop
+// that keeps pace with vsync would time out just before the next present and skip a tick.
+fn dxgi_frame_timeout(spf: Duration) -> Duration {
+    Duration::from_millis(((spf.as_micros() + 999) / 1000) as u64 + 2)
 }
 
 struct Raii {
@@ -1228,7 +1299,7 @@ fn check_change_scale(hardware: bool) -> ResultType<()> {
     if old_scale != new_scale {
         log::info!("switch due to scale changed, {old_scale} -> {new_scale}");
         // switch is not a must, but it is better to do so.
-        bail!("SWITCH");
+        bail_switch!("scale");
     }
     Ok(())
 }
@@ -1249,7 +1320,7 @@ fn check_privacy_mode_changed(
         }
         log::info!("switch due to privacy mode changed");
         try_broadcast_display_changed(&sp, display_idx, ci, true).ok();
-        bail!("SWITCH");
+        bail_switch!("privacy_mode");
     }
     Ok(())
 }
@@ -1266,12 +1337,13 @@ fn handle_one_frame(
     first_frame: &mut bool,
     width: usize,
     height: usize,
+    latency_stats: &mut super::latency_stats::LatencyStats,
 ) -> ResultType<HashSet<i32>> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
         if sps.has_subscribes() {
             log::info!("switch due to new subscriber");
-            bail!("SWITCH");
+            bail_switch!("new_subscriber");
         }
         Ok(())
     })?;
@@ -1290,7 +1362,11 @@ fn handle_one_frame(
                 .unwrap()
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
+            latency_stats.on_encoded(&msg);
             send_conn_ids = sp.send_video_frame(msg);
+            if !send_conn_ids.is_empty() {
+                latency_stats.on_sent();
+            }
         }
         Err(e) => {
             *encode_fail_counter += 1;
@@ -1310,14 +1386,14 @@ fn handle_one_frame(
                 if encoder.is_hardware() {
                     encoder.disable();
                     log::error!("switch due to encoding fails, first frame: {first}, error: {e:?}");
-                    bail!("SWITCH");
+                    bail_switch!("encode_fail");
                 }
             }
             match e.to_string().as_str() {
                 scrap::codec::ENCODE_NEED_SWITCH => {
                     encoder.disable();
                     log::error!("switch due to encoder need switch");
-                    bail!("SWITCH");
+                    bail_switch!("encoder_need_switch");
                 }
                 _ => {}
             }
@@ -1379,7 +1455,7 @@ fn try_broadcast_display_changed(
                 sps.send_shared(msg_out.clone());
                 Ok(())
             })?;
-            bail!("SWITCH");
+            bail_switch!("display_changed");
         }
     }
     Ok(())
@@ -1456,13 +1532,13 @@ fn check_qos(
             // Now only vaapi doesn't support changing quality
             if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
                 log::info!("switch to change quality");
-                bail!("SWITCH");
+                bail_switch!("quality");
             }
         }
     }
     if client_record != video_qos.record() {
         log::info!("switch due to record changed");
-        bail!("SWITCH");
+        bail_switch!("record");
     }
     if second_instant.elapsed() > Duration::from_secs(1) {
         *second_instant = Instant::now();

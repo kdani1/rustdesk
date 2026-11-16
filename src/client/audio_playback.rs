@@ -40,6 +40,12 @@ pub(super) struct AudioPlaybackRecovery {
 
 pub(super) struct AudioPlaybackStatus {
     pub(super) ready: AtomicBool,
+    // Output callbacks that ran short of buffered audio after one that had enough: the start
+    // of each audible gap. Taken by the `LATENCY client audio` line.
+    pub(super) underruns: AtomicUsize,
+    // The same underruns, minus those of a callback that lost the buffer lock (not a low
+    // level). Taken by the adaptive audio target (`audio_target`), which they raise.
+    pub(super) target_underruns: AtomicUsize,
     contentions: AtomicUsize,
     contention_log_throttle: LogThrottle,
     buffer_poisoned: AtomicBool,
@@ -49,6 +55,8 @@ impl Default for AudioPlaybackStatus {
     fn default() -> Self {
         Self {
             ready: AtomicBool::new(false),
+            underruns: AtomicUsize::new(0),
+            target_underruns: AtomicUsize::new(0),
             contentions: AtomicUsize::new(0),
             contention_log_throttle: LogThrottle::new(AUDIO_PLAYBACK_LOG_INTERVAL),
             buffer_poisoned: AtomicBool::new(false),
@@ -78,6 +86,8 @@ pub(super) struct AudioPlaybackWriter {
     recovery: AudioPlaybackRecovery,
     pub(super) status: std::sync::Arc<AudioPlaybackStatus>,
     buffer_failed: bool,
+    // The previous callback found all the audio it asked for.
+    fed: bool,
 }
 
 impl AudioPlaybackWriter {
@@ -97,25 +107,27 @@ impl AudioPlaybackWriter {
             recovery,
             status: Default::default(),
             buffer_failed: false,
+            fed: false,
         })
     }
 
-    fn read_buffer(&mut self, requested_samples: usize) -> usize {
+    /// None when the buffer could not be read (lock contention or a failed buffer).
+    fn read_buffer(&mut self, requested_samples: usize) -> Option<usize> {
         if self.buffer_failed {
-            return 0;
+            return None;
         }
         let mut buffer = match self.audio_buffer.try_lock() {
             Ok(buffer) => buffer,
             Err(TryLockError::WouldBlock) => {
                 // Keep queued PCM and its generation for the next successful read.
                 self.status.contentions.fetch_add(1, Ordering::Relaxed);
-                return 0;
+                return None;
             }
             Err(TryLockError::Poisoned(_)) => {
                 self.buffer_failed = true;
                 self.status.ready.store(false, Ordering::Release);
                 self.status.buffer_poisoned.store(true, Ordering::Relaxed);
-                return 0;
+                return None;
             }
         };
         let generation = self.discontinuity_generation.load(Ordering::Relaxed);
@@ -127,7 +139,7 @@ impl AudioPlaybackWriter {
             self.recovery.begin_discontinuity();
             self.observed_discontinuity_generation = generation;
         }
-        samples
+        Some(samples)
     }
 
     pub(super) fn write_output<T>(&mut self, output: &mut [T])
@@ -139,8 +151,17 @@ impl AudioPlaybackWriter {
             .store(!self.buffer_failed, Ordering::Release);
         let requested_samples = output.len().min(self.buffered_input.len());
         let channel_count = self.recovery.channels;
-        let available_samples = self.read_buffer(requested_samples);
+        let read = self.read_buffer(requested_samples);
+        let available_samples = read.unwrap_or(0);
         let available_frames = available_samples / channel_count;
+        let starved = available_frames < output.len() / channel_count;
+        if starved && self.fed {
+            self.status.underruns.fetch_add(1, Ordering::Relaxed);
+            if read.is_some() {
+                self.status.target_underruns.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.fed = !starved;
         for (frame_index, output_frame) in output.chunks_mut(channel_count).enumerate() {
             let input = if frame_index < available_frames {
                 let start = frame_index * channel_count;

@@ -229,12 +229,22 @@ fn host_priority_boost_enabled() -> bool {
 /// all-core build delayed frames by up to 1.9 s). Not HIGH: a game on this machine must keep
 /// its share. Called at --server start and on every hardware capture start, so a changed
 /// option applies from the next capture restart.
+///
+/// A portable or not-installed instance runs the server inside the viewer's process, so this
+/// and `ViewerProcessBoost` share one priority class: with the boost off it leaves a class the
+/// viewer boost raised alone, and the viewer boost does not restore over a class raised here.
 pub fn raise_server_priority() {
     use windows::Win32::System::Threading::{
         GetCurrentProcess, SetPriorityClass, ABOVE_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
     };
-    let class = if host_priority_boost_enabled() {
+    let boost = host_priority_boost_enabled();
+    let viewer = VIEWER_PROCESS_STATE.lock().unwrap();
+    SERVER_PRIORITY_RAISED.store(boost, std::sync::atomic::Ordering::Relaxed);
+    let class = if boost {
         ABOVE_NORMAL_PRIORITY_CLASS
+    } else if viewer.raised_class.is_some() {
+        // The last viewer session restores the class.
+        return;
     } else {
         NORMAL_PRIORITY_CLASS
     };
@@ -242,6 +252,10 @@ pub fn raise_server_priority() {
         log::warn!("server process priority unchanged: {e}");
     }
 }
+
+// `raise_server_priority` last set ABOVE_NORMAL (enable-host-priority-boost on).
+static SERVER_PRIORITY_RAISED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The calling thread's MMCSS "Capture" registration; reverted when dropped.
 pub struct MmcssCapture(Option<windows::Win32::Foundation::HANDLE>);
@@ -272,6 +286,188 @@ impl Drop for MmcssCapture {
                 windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
             };
         }
+    }
+}
+
+/// Whether the viewer raises its threads and process while a session is open (local option
+/// enable-viewer-priority-boost, on by default).
+pub fn viewer_priority_boost_enabled() -> bool {
+    hbb_common::config::LocalConfig::get_option(
+        base::config::keys::OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
+    ) != "N"
+}
+
+/// The calling thread's raised priority; the previous one is restored when dropped.
+pub struct ViewerThreadBoost(Option<i32>);
+
+/// Raises the calling thread (a viewer session's io_loop or a display's decoder thread) to
+/// THREAD_PRIORITY_ABOVE_NORMAL, so a CPU-loaded viewer keeps decoding, reading the socket and
+/// answering TestDelay. `thread` and `display` only label the log line, once per call.
+pub fn viewer_thread_boost(thread: &str, display: Option<usize>) -> ViewerThreadBoost {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    // GetThreadPriority's failure value (MAXLONG).
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
+    let display = display.map(|d| format!(" display={d}")).unwrap_or_default();
+    if !viewer_priority_boost_enabled() {
+        log::info!("LATENCY client priority thread={thread}{display} prio=off");
+        return ViewerThreadBoost(None);
+    }
+    let previous = unsafe { GetThreadPriority(GetCurrentThread()) };
+    if previous == THREAD_PRIORITY_ERROR_RETURN || previous >= THREAD_PRIORITY_ABOVE_NORMAL.0 {
+        log::info!("LATENCY client priority thread={thread}{display} prio=kept:{previous}");
+        return ViewerThreadBoost(None);
+    }
+    match unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } {
+        Ok(()) => {
+            log::info!("LATENCY client priority thread={thread}{display} prio=above_normal");
+            ViewerThreadBoost(Some(previous))
+        }
+        Err(e) => {
+            log::warn!("LATENCY client priority thread={thread}{display} prio=failed ({e})");
+            ViewerThreadBoost(None)
+        }
+    }
+}
+
+impl Drop for ViewerThreadBoost {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY,
+        };
+        if let Some(previous) = self.0.take() {
+            let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY(previous)) };
+        }
+    }
+}
+
+/// What the first `ViewerProcessBoost` changed, undone by the last one.
+#[derive(Default)]
+struct ViewerProcessState {
+    holders: usize,
+    raised_class: Option<u32>,
+    throttling: Option<windows::Win32::System::Threading::PROCESS_POWER_THROTTLING_STATE>,
+}
+
+static VIEWER_PROCESS_STATE: Mutex<ViewerProcessState> = Mutex::new(ViewerProcessState {
+    holders: 0,
+    raised_class: None,
+    throttling: None,
+});
+
+/// One open viewer session's share of the process boost (released when dropped).
+pub struct ViewerProcessBoost(());
+
+/// Counted process boost while remote-control or camera sessions are open: the first holder
+/// raises the process to ABOVE_NORMAL_PRIORITY_CLASS (only from NORMAL or lower; a class someone
+/// set higher is kept) and opts it out of EcoQoS / power throttling (execution speed), the last
+/// one restores both. None when enable-viewer-priority-boost is "N".
+pub fn viewer_process_boost() -> Option<ViewerProcessBoost> {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, GetPriorityClass, GetProcessInformation, ProcessPowerThrottling,
+        SetPriorityClass, SetProcessInformation, ABOVE_NORMAL_PRIORITY_CLASS,
+        BELOW_NORMAL_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+    if !viewer_priority_boost_enabled() {
+        return None;
+    }
+    let mut state = VIEWER_PROCESS_STATE.lock().unwrap();
+    state.holders += 1;
+    if state.holders > 1 {
+        return Some(ViewerProcessBoost(()));
+    }
+    let process = unsafe { GetCurrentProcess() };
+    let class = unsafe { GetPriorityClass(process) };
+    let raisable = [
+        NORMAL_PRIORITY_CLASS.0,
+        BELOW_NORMAL_PRIORITY_CLASS.0,
+        IDLE_PRIORITY_CLASS.0,
+    ];
+    let class_result = if raisable.contains(&class) {
+        match unsafe { SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS) } {
+            Ok(()) => {
+                state.raised_class = Some(class);
+                "above_normal".to_owned()
+            }
+            Err(e) => format!("failed({e})"),
+        }
+    } else {
+        format!("kept:{class:#x}")
+    };
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    // Older Windows cannot read the state back: then it was the default (system-managed).
+    let mut previous = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ..Default::default()
+    };
+    let _ = unsafe {
+        GetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &mut previous as *mut _ as *mut _,
+            size,
+        )
+    };
+    let opt_out = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let ecoqos_result = match unsafe {
+        SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            &opt_out as *const _ as *const _,
+            size,
+        )
+    } {
+        Ok(()) => {
+            state.throttling = Some(previous);
+            "opt_out".to_owned()
+        }
+        Err(e) => format!("failed({e})"),
+    };
+    log::info!("LATENCY client priority process={class_result} ecoqos={ecoqos_result}");
+    Some(ViewerProcessBoost(()))
+}
+
+impl Drop for ViewerProcessBoost {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, GetPriorityClass, ProcessPowerThrottling, SetPriorityClass,
+            SetProcessInformation, ABOVE_NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS,
+            PROCESS_POWER_THROTTLING_STATE,
+        };
+        let mut state = VIEWER_PROCESS_STATE.lock().unwrap();
+        state.holders = state.holders.saturating_sub(1);
+        if state.holders > 0 {
+            return;
+        }
+        let process = unsafe { GetCurrentProcess() };
+        let mut class_result = "restored";
+        if let Some(class) = state.raised_class.take() {
+            // Only undo our own change: a class set since then by someone else stays, and so
+            // does the in-process server's boost (`raise_server_priority`).
+            if SERVER_PRIORITY_RAISED.load(std::sync::atomic::Ordering::Relaxed) {
+                class_result = "kept_server";
+            } else if unsafe { GetPriorityClass(process) } == ABOVE_NORMAL_PRIORITY_CLASS.0 {
+                let _ = unsafe { SetPriorityClass(process, PROCESS_CREATION_FLAGS(class)) };
+            }
+        }
+        if let Some(previous) = state.throttling.take() {
+            let _ = unsafe {
+                SetProcessInformation(
+                    process,
+                    ProcessPowerThrottling,
+                    &previous as *const _ as *const _,
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+        }
+        log::info!("LATENCY client priority process={class_result}");
     }
 }
 

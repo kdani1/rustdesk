@@ -101,6 +101,8 @@ pub struct Remote<T: InvokeUiSession> {
     elevation_requested: bool,
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
+    // Gentle fps control (`enable-gentle-fps-control`); when off, `fps_control` is the legacy one.
+    gentle_fps: GentleFpsControl,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
@@ -156,6 +158,7 @@ impl<T: InvokeUiSession> Remote<T> {
             elevation_requested: false,
             peer_info: Default::default(),
             video_threads: Default::default(),
+            gentle_fps: GentleFpsControl::new(gentle_fps_control_enabled()),
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
@@ -190,6 +193,16 @@ impl<T: InvokeUiSession> Remote<T> {
         #[cfg(target_os = "windows")]
         let _wlan_hold = (self.handler.is_default() || self.handler.is_view_camera())
             .then(|| crate::platform::windows_wlan::hold(crate::platform::windows_wlan::Side::Viewer));
+        // Viewer priority boost for this session round: this thread (it runs only this io_loop,
+        // whichever path spawned it) and the counted process boost, both undone on return.
+        #[cfg(target_os = "windows")]
+        let _priority_boost =
+            (self.handler.is_default() || self.handler.is_view_camera()).then(|| {
+                (
+                    crate::platform::windows::viewer_thread_boost("io_loop", None),
+                    crate::platform::windows::viewer_process_boost(),
+                )
+            });
         let mut received = false;
         let conn_type = if self.handler.is_file_transfer() {
             ConnType::FILE_TRANSFER
@@ -201,6 +214,7 @@ impl<T: InvokeUiSession> Remote<T> {
             ConnType::default()
         };
 
+        let connect_start = Instant::now();
         match Client::start(
             &self.handler.get_id(),
             key,
@@ -227,6 +241,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
+                log::info!(
+                    "TRANSPORT viewer peer={} type={} direct={} secured={} kcp={} rendezvous={} connect_ms={}",
+                    self.handler.get_id(),
+                    stream_type,
+                    direct,
+                    is_secured,
+                    kcp.is_some(),
+                    rendezvous_server,
+                    connect_start.elapsed().as_millis()
+                );
                 if !is_secured
                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
@@ -402,7 +426,12 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
-                            self.fps_control(direct, fps.clone());
+                            let show_quality_monitor = self.handler.lc.read().unwrap().get_toggle_option("show-quality-monitor");
+                            let measuring = client::latency::is_measuring(show_quality_monitor);
+                            // FPSCTL every tick only with enable-latency-log, not for the overlay alone.
+                            let latency_log = measuring && client::latency::is_log_enabled();
+                            let counts = self.video_threads.iter().map(|(k, v)| (*k, v.counters.take())).collect::<HashMap<_, _>>();
+                            self.fps_control(direct, fps.clone(), &counts, elapsed, latency_log);
                             let chroma = self.chroma.read().unwrap().clone();
                             let chroma = match chroma {
                                 Some(Chroma::I444) => "4:4:4",
@@ -415,11 +444,13 @@ impl<T: InvokeUiSession> Remote<T> {
                             } else {
                                 Some(self.video_format.clone())
                             };
-                            let show_quality_monitor = self.handler.lc.read().unwrap().get_toggle_option("show-quality-monitor");
                             let latency = client::latency::refresh_streams(
-                                self.video_threads.iter().map(|(display, v)| (*display, client::latency::stream_key(&v.video_queue))),
-                                show_quality_monitor,
+                                self.video_threads.iter().map(|(display, v)| (*display, client::latency::stream_key(&v.video_queue), counts.get(display).copied())),
+                                Duration::from_millis(elapsed as u64),
+                                stream_type,
+                                measuring,
                             );
+                            client::latency::refresh_input(client::latency::stream_key(&self.handler.sender), measuring, stream_type);
                             self.handler.update_quality_status(QualityStatus {
                                 speed: Some(speed),
                                 fps,
@@ -432,6 +463,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
+                client::latency::remove_input(client::latency::stream_key(&self.handler.sender));
                 self.microphone_request = None;
                 self.microphone_active = false;
                 self.microphone_id = None;
@@ -912,11 +944,20 @@ impl<T: InvokeUiSession> Remote<T> {
                                 *v.discard_queue.write().unwrap() = true;
                             }
                         }
+                        Some(misc::Union::Option(ref o)) if o.custom_fps > 0 => {
+                            if self.gentle_fps.on_custom_fps_sent(o.custom_fps as usize) {
+                                self.handler.lc.write().unwrap().last_auto_fps = None;
+                            }
+                        }
                         _ => {}
                     },
                     _ => {}
                 }
                 allow_err!(peer.send(&msg).await);
+                client::latency::on_input_written(
+                    client::latency::stream_key(&self.handler.sender),
+                    &msg,
+                );
             }
             Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {
                 log::info!("send files, is remote {}", is_remote);
@@ -1530,8 +1571,25 @@ impl<T: InvokeUiSession> Remote<T> {
 
     // Currently, this function only considers decoding speed and queue length, not network delay.
     // The controlled end can consider auto fps as the maximum decoding fps.
+    //
+    // `counts` (this tick's `VideoCounters`, `tick_ms` long) and `log` (`enable-latency-log` on:
+    // an FPSCTL line every tick) only feed the FPSCTL / "Set fps" log lines of this legacy
+    // controller (measurement, see docs/LATENCY-METRICS.md); its decision does not read them.
+    // With `enable-gentle-fps-control` on, `fps_control_gentle` decides instead.
     #[inline]
-    fn fps_control(&mut self, direct: bool, real_fps_map: HashMap<usize, i32>) {
+    fn fps_control(
+        &mut self,
+        direct: bool,
+        real_fps_map: HashMap<usize, i32>,
+        counts: &HashMap<usize, client::VideoCountersTick>,
+        tick_ms: u128,
+        log: bool,
+    ) {
+        if self.gentle_fps.enabled {
+            self.fps_control_gentle(direct, counts, tick_ms, log);
+            return;
+        }
+        let log_tick_ms = log.then_some(tick_ms);
         self.video_threads.iter_mut().for_each(|(k, v)| {
             let real_fps = real_fps_map.get(k).cloned().unwrap_or_default();
             if real_fps == 0 {
@@ -1561,6 +1619,15 @@ impl<T: InvokeUiSession> Remote<T> {
             .min()
             .flatten();
         let Some(min_decode_fps) = min_decode_fps else {
+            if let Some(tick_ms) = log_tick_ms {
+                log::info!(
+                    "FPSCTL tick_ms={} direct={} custom={} decision=none (no decode_fps yet) |{}",
+                    tick_ms,
+                    direct,
+                    custom_fps,
+                    self.fps_control_displays(counts, &HashMap::new())
+                );
+            }
             return;
         };
         let mut limited_fps = if direct {
@@ -1573,10 +1640,13 @@ impl<T: InvokeUiSession> Remote<T> {
         }
         let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps.clone();
         let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
+        // What the trend check below saw per display, for the log lines: (len, decode_fps).
+        let mut seen: HashMap<usize, (usize, Option<usize>)> = HashMap::new();
         let mut fps_trending = |display: usize| {
             let thread = self.video_threads.get_mut(&display)?;
             let ctl = &mut thread.fps_control;
             let len = thread.video_queue.read().unwrap().len();
+            seen.insert(display, (len, *thread.decode_fps.read().unwrap()));
             let decode_fps = thread.decode_fps.read().unwrap().clone()?;
             let last_auto_fps = last_auto_fps.clone().unwrap_or(custom_fps as _);
             if ctl.inactive_counter > inactive_threshold {
@@ -1598,13 +1668,28 @@ impl<T: InvokeUiSession> Remote<T> {
             None
         };
         let trendings: Vec<_> = displays.iter().map(|k| fps_trending(*k)).collect();
+        let trend_of = displays
+            .iter()
+            .zip(trendings.iter())
+            .filter_map(|(d, t)| seen.get(d).map(|(len, fps)| (*d, (*len, *fps, *t))))
+            .collect::<HashMap<_, _>>();
         let should_decrease = trendings.iter().any(|v| *v == Some(false));
         let should_increase = !should_decrease && trendings.iter().any(|v| *v == Some(true));
+        let mut decision = "keep";
+        let mut sent = None;
         if last_auto_fps.is_none() || should_decrease || should_increase {
+            decision = if should_decrease {
+                "decrease"
+            } else if should_increase {
+                "increase"
+            } else {
+                "init"
+            };
             // limited_fps to ensure decoding is faster than encoding
             let mut auto_fps = limited_fps;
             if should_decrease && limited_fps < max_queue_len {
                 auto_fps = limited_fps / 2;
+                decision = "halve";
             }
             if auto_fps < 1 {
                 auto_fps = 1;
@@ -1618,9 +1703,36 @@ impl<T: InvokeUiSession> Remote<T> {
                 let mut msg = Message::new();
                 msg.set_misc(misc);
                 self.sender.send(Data::Message(msg)).ok();
-                log::info!("Set fps to {}", auto_fps);
+                log::info!(
+                    "Set fps to {} (reason={} last_auto={:?} custom={} limited={} min_decode_fps={} max_queue_len={} direct={} |{})",
+                    auto_fps,
+                    decision,
+                    last_auto_fps,
+                    custom_fps,
+                    limited_fps,
+                    min_decode_fps,
+                    max_queue_len,
+                    direct,
+                    self.fps_control_displays(counts, &trend_of)
+                );
                 self.handler.lc.write().unwrap().last_auto_fps = Some(auto_fps);
+                sent = Some(auto_fps);
             }
+        }
+        if let Some(tick_ms) = log_tick_ms {
+            log::info!(
+                "FPSCTL tick_ms={} direct={} custom={} last_auto={} limited={} min_decode_fps={} max_queue_len={} decision={} sent={} |{}",
+                tick_ms,
+                direct,
+                custom_fps,
+                last_auto_fps.map_or("-".to_owned(), |f| f.to_string()),
+                limited_fps,
+                min_decode_fps,
+                max_queue_len,
+                decision,
+                sent.map_or("-".to_owned(), |f| f.to_string()),
+                self.fps_control_displays(counts, &trend_of)
+            );
         }
         // send refresh
         for (display, thread) in self.video_threads.iter_mut() {
@@ -1632,12 +1744,197 @@ impl<T: InvokeUiSession> Remote<T> {
                             && (ctl.refresh_times == 0 || ctl.last_refresh_instant.map(|t|t.elapsed().as_secs() > 10).unwrap_or(false)))
             {
                 // Refresh causes client set_display, left frames cause flickering.
+                let queue_len = video_queue.len();
                 drop(video_queue);
                 self.handler.refresh_video(*display as _);
-                log::info!("Refresh display {} to reduce delay", display);
+                log::info!(
+                    "Refresh display {} to reduce delay (queue_len={} tolerable={} refresh_times={})",
+                    display,
+                    queue_len,
+                    tolerable,
+                    ctl.refresh_times
+                );
                 ctl.refresh_times += 1;
                 ctl.last_refresh_instant = Some(Instant::now());
             }
+        }
+    }
+
+    /// Per-display inputs of `fps_control` for its log lines: the counters of the last tick,
+    /// the legacy `decode_fps` split into decode, present and the rest, the queue, the
+    /// controller state and trend, and the current `net+server(est)` when it is measured.
+    fn fps_control_displays(
+        &self,
+        counts: &HashMap<usize, client::VideoCountersTick>,
+        // What the trend check saw: (queue len, decode_fps, trend). Missing: read them now.
+        seen: &HashMap<usize, (usize, Option<usize>, Option<bool>)>,
+    ) -> String {
+        let mut displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
+        displays.sort_unstable();
+        let avg_ms = |us: u64, n: usize| {
+            if n == 0 {
+                "n/a".to_owned()
+            } else {
+                format!("{:.1}", us as f64 / n as f64 / 1000.0)
+            }
+        };
+        let mut out = String::new();
+        for display in displays {
+            let Some(thread) = self.video_threads.get(&display) else {
+                continue;
+            };
+            let c = counts.get(&display).copied().unwrap_or_default();
+            let (queue_len, decode_fps, trend) = match seen.get(&display) {
+                Some((len, fps, trend)) => (
+                    *len,
+                    *fps,
+                    match trend {
+                        Some(true) => "up",
+                        Some(false) => "down",
+                        None => "-",
+                    },
+                ),
+                None => (
+                    thread.video_queue.read().unwrap().len(),
+                    *thread.decode_fps.read().unwrap(),
+                    "?",
+                ),
+            };
+            out += &format!(
+                " d{} rx={} dec={} shown={} ui_lost={} skip={} discard={} fail={} queue_len={} queue_max={} decode_fps={} dec_ms={} present_ms={} other_ms={} idle={} inactive={} trend={} net+server={};",
+                display,
+                c.received,
+                c.decoded,
+                c.shown,
+                c.ui_lost,
+                c.decoded.saturating_sub(c.shown),
+                c.discarded,
+                c.failed,
+                queue_len,
+                c.queue_max,
+                decode_fps.map_or("-".to_owned(), |f| f.to_string()),
+                avg_ms(c.decode_us, c.decoded),
+                avg_ms(c.present_us, c.shown),
+                avg_ms(
+                    c.busy_us.saturating_sub(c.decode_us + c.present_us),
+                    c.decoded
+                ),
+                thread.fps_control.idle_counter,
+                thread.fps_control.inactive_counter,
+                trend,
+                client::latency::net_srv_now(client::latency::stream_key(&thread.video_queue))
+                    .unwrap_or_else(|| "?".to_owned()),
+            );
+        }
+        out
+    }
+
+    /// Gentle fps control (`enable-gentle-fps-control`, docs/LATENCY-METRICS.md): asks the host
+    /// for less only while the decoder thread is measurably overloaded, with hysteresis and a
+    /// floor, and refreshes only as a last resort. Same message to the host as the legacy one.
+    fn fps_control_gentle(
+        &mut self,
+        direct: bool,
+        counts: &HashMap<usize, client::VideoCountersTick>,
+        tick_ms: u128,
+        log: bool,
+    ) {
+        let custom_fps = self.handler.lc.read().unwrap().custom_fps.clone();
+        let custom_fps = custom_fps.lock().unwrap().clone();
+        let mut custom_fps = custom_fps.unwrap_or(30);
+        if custom_fps < 5 || custom_fps > 120 {
+            custom_fps = 30;
+        }
+        if self.gentle_fps.ticks == 0 {
+            // The host starts at the custom fps sent at login, whatever an earlier connection
+            // of this session asked for.
+            self.handler.lc.write().unwrap().last_auto_fps = None;
+        }
+        let mut ticks = self
+            .video_threads
+            .keys()
+            .map(|d| (*d, counts.get(d).copied().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        ticks.sort_unstable_by_key(|(d, _)| *d);
+        let tick = self
+            .gentle_fps
+            .tick(custom_fps, tick_ms.min(u64::MAX as u128) as u64, &ticks);
+        if let Some(fps) = tick.send {
+            let mut misc = Misc::new();
+            misc.set_option(OptionMessage {
+                custom_fps: fps as _,
+                ..Default::default()
+            });
+            let mut msg = Message::new();
+            msg.set_misc(misc);
+            self.sender.send(Data::Message(msg)).ok();
+            self.handler.lc.write().unwrap().last_auto_fps = Some(fps);
+            log::info!(
+                "Set fps to {} (gentle {} direct={} |{}|{})",
+                fps,
+                tick.summary(),
+                direct,
+                self.fps_control_displays(counts, &HashMap::new()),
+                self.gentle_fps.describe_displays()
+            );
+        }
+        if log {
+            log::info!(
+                "FPSCTL mode=gentle tick_ms={} direct={} {} |{}|{}",
+                tick_ms,
+                direct,
+                tick.summary(),
+                self.fps_control_displays(counts, &HashMap::new()),
+                self.gentle_fps.describe_displays()
+            );
+        }
+        // A display whose overflow refresh was deferred (`key_frame_pending`) gets it as soon as
+        // its limit allows.
+        let mut pending = self
+            .video_threads
+            .iter()
+            .filter(|(d, v)| v.fps_control.key_frame_pending && !tick.refresh.contains(*d))
+            .map(|(d, _)| *d)
+            .collect::<Vec<_>>();
+        pending.sort_unstable();
+        for display in pending {
+            let Some(thread) = self.video_threads.get_mut(&display) else {
+                continue;
+            };
+            if !thread.fps_control.key_frame_refresh_allowed() {
+                continue;
+            }
+            self.handler.refresh_video(display as _);
+            log::info!(
+                "Refresh display {} after queue overflow (deferred, refresh_times={})",
+                display,
+                thread.fps_control.refresh_times
+            );
+            thread.fps_control.on_refresh();
+        }
+        for display in tick.refresh {
+            let Some(thread) = self.video_threads.get_mut(&display) else {
+                continue;
+            };
+            let allowed = if thread.fps_control.key_frame_pending {
+                thread.fps_control.key_frame_refresh_allowed()
+            } else {
+                thread.fps_control.refresh_allowed()
+            };
+            if !allowed {
+                continue;
+            }
+            let queue_len = thread.video_queue.read().unwrap().len();
+            self.handler.refresh_video(display as _);
+            log::info!(
+                "Refresh display {} to reduce delay (gentle: queue_max above {} for {} ticks, queue_len={} refresh_times={})",
+                display,
+                gentle_refresh_queue(),
+                GENTLE_REFRESH_TICKS,
+                queue_len,
+                thread.fps_control.refresh_times
+            );
+            thread.fps_control.on_refresh();
         }
     }
 
@@ -1699,7 +1996,11 @@ impl<T: InvokeUiSession> Remote<T> {
                         return true;
                     };
                     client::latency::on_received(client::latency::stream_key(&thread.video_queue), &vf);
-                    if Self::contains_key_frame(&vf) {
+                    thread.counters.on_received();
+                    let key_frame = Self::contains_key_frame(&vf);
+                    thread.pacing.on_received(&vf, key_frame);
+                    if key_frame {
+                        thread.fps_control.key_frame_pending = false;
                         thread
                             .video_sender
                             .send(MediaData::VideoFrame(Box::new(vf)))
@@ -1708,7 +2009,34 @@ impl<T: InvokeUiSession> Remote<T> {
                         let video_queue = thread.video_queue.read().unwrap();
                         if video_queue.force_push(vf).is_some() {
                             drop(video_queue);
-                            self.handler.refresh_video(display as _);
+                            thread.counters.on_discarded();
+                            if !self.gentle_fps.enabled {
+                                self.handler.refresh_video(display as _);
+                            } else if thread.fps_control.key_frame_refresh_allowed() {
+                                // Gentle fps control: a refresh restarts the host's capturer
+                                // and encoder for every viewer, so overflow refreshes are
+                                // spaced (`KEY_FRAME_REFRESH_SPACING`), not capped: without a
+                                // key frame the stream cannot be decoded again.
+                                self.handler.refresh_video(display as _);
+                                log::info!(
+                                    "Refresh display {} after queue overflow (refresh_times={})",
+                                    display,
+                                    thread.fps_control.refresh_times
+                                );
+                                thread.fps_control.on_refresh();
+                            } else if !thread.fps_control.key_frame_pending {
+                                // The evicted frame is a reference of the frames after it:
+                                // freeze (drop the queue until a key frame) rather than decode
+                                // across the hole, and refresh once the limit allows
+                                // (`fps_control_gentle`, every status tick).
+                                *thread.discard_queue.write().unwrap() = true;
+                                thread.fps_control.key_frame_pending = true;
+                                log::info!(
+                                    "Queue overflow on display {}: refresh deferred by the limit, queue discarded until a key frame (refresh_times={})",
+                                    display,
+                                    thread.fps_control.refresh_times
+                                );
+                            }
                         } else {
                             thread.video_sender.send(MediaData::VideoQueue).ok();
                         }
@@ -2846,6 +3174,8 @@ impl<T: InvokeUiSession> Remote<T> {
         let decode_fps = Arc::new(RwLock::new(None));
         let frame_count = Arc::new(RwLock::new(0));
         let discard_queue = Arc::new(RwLock::new(false));
+        let counters: Arc<client::VideoCounters> = Default::default();
+        let pacing = Arc::new(client::PresentPacing::new());
         let video_thread = VideoThread {
             video_queue: video_queue.clone(),
             video_sender,
@@ -2853,6 +3183,8 @@ impl<T: InvokeUiSession> Remote<T> {
             frame_count: frame_count.clone(),
             fps_control: Default::default(),
             discard_queue: discard_queue.clone(),
+            counters: counters.clone(),
+            pacing: pacing.clone(),
         };
         let handler = self.handler.ui_handler.clone();
         crate::client::start_video_thread(
@@ -2863,6 +3195,8 @@ impl<T: InvokeUiSession> Remote<T> {
             decode_fps,
             self.chroma.clone(),
             discard_queue,
+            counters,
+            pacing,
             move |display: usize,
                   data: &mut scrap::ImageRgb,
                   _texture: *mut c_void,
@@ -3088,12 +3422,438 @@ impl RemoveJob {
     }
 }
 
+/// Shortest gap between two key-frame refreshes after queue overflows (gentle fps control). A
+/// refresh restarts the host encoder for every viewer, so not every overflow gets one; a longer
+/// gap would freeze the display for that long.
+const KEY_FRAME_REFRESH_SPACING: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Default)]
 struct FpsControl {
     refresh_times: usize,
     last_refresh_instant: Option<Instant>,
     idle_counter: usize,
     inactive_counter: usize,
+    // Gentle fps control: a queue overflow evicted a frame while `refresh_allowed` refused the
+    // refresh. The queue is discarded until a key frame arrives (cleared then), and the refresh
+    // goes out once `key_frame_refresh_allowed`.
+    key_frame_pending: bool,
+}
+
+impl FpsControl {
+    /// The legacy controller's refresh limit: at most 20 per display, 10 s apart.
+    fn refresh_allowed(&self) -> bool {
+        self.refresh_times < 20
+            && (self.refresh_times == 0
+                || self
+                    .last_refresh_instant
+                    .map_or(false, |t| t.elapsed().as_secs() > 10))
+    }
+
+    /// The limit for a refresh that a frame evicted by a queue overflow needs: spaced by
+    /// `KEY_FRAME_REFRESH_SPACING`, not capped at 20, as the stream cannot be decoded again
+    /// without a key frame. In between, the display freezes (queue discarded).
+    fn key_frame_refresh_allowed(&self) -> bool {
+        self.last_refresh_instant
+            .map_or(true, |t| t.elapsed() >= KEY_FRAME_REFRESH_SPACING)
+    }
+
+    fn on_refresh(&mut self) {
+        self.refresh_times += 1;
+        self.last_refresh_instant = Some(Instant::now());
+    }
+}
+
+/// Whether gentle fps control is on (`enable-gentle-fps-control`): by default on Windows ("N"
+/// turns it off), off elsewhere unless "Y". Read once per connection.
+fn gentle_fps_control_enabled() -> bool {
+    let option = LocalConfig::get_option(keys::OPTION_ENABLE_GENTLE_FPS_CONTROL);
+    if cfg!(windows) {
+        option != "N"
+    } else {
+        option == "Y"
+    }
+}
+
+// Gentle fps control constants (docs/LATENCY-METRICS.md, "Viewer: fps control").
+// The soft floor is min(custom fps, GENTLE_FLOOR); below it, down to min(custom fps,
+// GENTLE_HARD_FLOOR), only after GENTLE_BELOW_FLOOR_TICKS ticks of capacity under it.
+const GENTLE_FLOOR: usize = 24;
+const GENTLE_HARD_FLOOR: usize = 10;
+const GENTLE_BELOW_FLOOR_TICKS: usize = 10;
+// Decoder thread busy fraction (dequeue to after the UI callback, over the tick) above which it
+// is overloaded, and below which it is calm.
+const GENTLE_BUSY_OVERLOAD: f64 = 0.9;
+const GENTLE_BUSY_CALM: f64 = 0.75;
+// Overload: GENTLE_DECREASE_TICKS overloaded ticks in a row and GENTLE_DECREASE_GAP_MS since
+// the last change, then x GENTLE_DECREASE_FACTOR.
+const GENTLE_DECREASE_TICKS: usize = 2;
+const GENTLE_DECREASE_GAP_MS: u64 = 2000;
+const GENTLE_DECREASE_FACTOR: f64 = 0.85;
+// Backlog: fewer frames taken from the queue than received, and the median queue length
+// growing, for this many ticks in a row.
+const GENTLE_BACKLOG_TICKS: usize = 3;
+// Calm: GENTLE_INCREASE_TICKS calm ticks in a row and GENTLE_INCREASE_GAP_MS since the last
+// change, then + max(GENTLE_INCREASE_MIN, 10%), at most the custom fps. A calm display also has
+// capacity for GENTLE_CALM_HEADROOM x the current fps.
+const GENTLE_INCREASE_TICKS: usize = 5;
+const GENTLE_INCREASE_GAP_MS: u64 = 3000;
+const GENTLE_INCREASE_MIN: usize = 3;
+const GENTLE_CALM_HEADROOM: f64 = 1.2;
+// Lasting present overload: shown fps under GENTLE_PRESENT_LOW x min(current fps, received
+// fps) for GENTLE_PRESENT_LOW_TICKS ticks, then ask for GENTLE_PRESENT_HEADROOM x shown fps.
+const GENTLE_PRESENT_LOW: f64 = 0.7;
+const GENTLE_PRESENT_LOW_TICKS: usize = 10;
+const GENTLE_PRESENT_HEADROOM: f64 = 1.2;
+// Start-up: no request before this many ticks and steady (non-key, past warm-up) frames.
+const GENTLE_MIN_TICKS: usize = 3;
+const GENTLE_MIN_SAMPLES: usize = 30;
+// A display without decoded frames for this many ticks is ignored (as the legacy controller).
+const GENTLE_INACTIVE_TICKS: usize = 15;
+// Capacity: EWMA over ticks with at least GENTLE_CAP_MIN_FRAMES steady frames.
+const GENTLE_CAP_ALPHA: f64 = 0.3;
+const GENTLE_CAP_MIN_FRAMES: usize = 5;
+// Last-resort refresh: queue_max above gentle_refresh_queue() for this many ticks in a row.
+const GENTLE_REFRESH_TICKS: usize = 3;
+
+fn gentle_refresh_queue() -> usize {
+    std::cmp::max(30, client::VIDEO_QUEUE_SIZE / 4)
+}
+
+/// Per-display state of `GentleFpsControl`.
+#[derive(Debug, Default)]
+struct GentleDisplay {
+    ticks: usize,
+    samples: usize,
+    inactive_ticks: usize,
+    // Frames per busy second of steady frames, EWMA over ticks.
+    cap: Option<f64>,
+    busy: f64,
+    queue_p50: usize,
+    // Ticks in a row with a growing backlog, and the median queue length before them.
+    growth_ticks: usize,
+    growth_from: usize,
+    big_queue_ticks: usize,
+    ready: bool,
+    overloaded: bool,
+    present_low: bool,
+}
+
+/// Gentle fps control: the fps the viewer asks the host for (`custom_fps` option message, as
+/// the legacy controller) follows the decoder thread's measured load. A state machine fed once
+/// per status tick with each display's `VideoCountersTick`.
+#[derive(Debug)]
+struct GentleFpsControl {
+    enabled: bool,
+    displays: HashMap<usize, GentleDisplay>,
+    ticks: usize,
+    custom: Option<usize>,
+    // The fps last asked for; None while the host runs at the custom fps.
+    target: Option<usize>,
+    since_change_ms: u64,
+    overload_ticks: usize,
+    calm_ticks: usize,
+    below_floor_ticks: usize,
+    present_low_ticks: usize,
+    present_low_shown_sum: f64,
+}
+
+/// What one `GentleFpsControl::tick` saw and decided.
+#[derive(Debug, Default)]
+struct GentleTick {
+    custom: usize,
+    target: usize,
+    floor: usize,
+    cap: Option<f64>,
+    overload_ticks: usize,
+    calm_ticks: usize,
+    below_floor_ticks: usize,
+    present_low_ticks: usize,
+    since_change_ms: u64,
+    decision: &'static str,
+    send: Option<usize>,
+    refresh: Vec<usize>,
+}
+
+impl GentleTick {
+    fn summary(&self) -> String {
+        format!(
+            "custom={} target={} floor={} cap={} overload={}/{} calm={}/{} below_floor={}/{} present_low={}/{} since_change_ms={} decision={} sent={}",
+            self.custom,
+            self.target,
+            self.floor,
+            self.cap.map_or("-".to_owned(), |c| format!("{:.1}", c)),
+            self.overload_ticks,
+            GENTLE_DECREASE_TICKS,
+            self.calm_ticks,
+            GENTLE_INCREASE_TICKS,
+            self.below_floor_ticks,
+            GENTLE_BELOW_FLOOR_TICKS,
+            self.present_low_ticks,
+            GENTLE_PRESENT_LOW_TICKS,
+            self.since_change_ms,
+            self.decision,
+            self.send.map_or("-".to_owned(), |f| f.to_string()),
+        )
+    }
+}
+
+impl GentleFpsControl {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            displays: Default::default(),
+            ticks: 0,
+            custom: None,
+            target: None,
+            since_change_ms: 0,
+            overload_ticks: 0,
+            calm_ticks: 0,
+            below_floor_ticks: 0,
+            present_low_ticks: 0,
+            present_low_shown_sum: 0.0,
+        }
+    }
+
+    /// A `custom_fps` option message on its way to the host: the controller's own request, or
+    /// the user's custom fps (sent again even when unchanged), after which the host runs at the
+    /// latter. Returns true when it was the user's, while the controller had asked for less.
+    fn on_custom_fps_sent(&mut self, fps: usize) -> bool {
+        if !self.enabled || self.target.map_or(true, |target| target == fps) {
+            return false;
+        }
+        self.target = None;
+        self.since_change_ms = 0;
+        self.reset_streaks();
+        true
+    }
+
+    fn reset_streaks(&mut self) {
+        self.overload_ticks = 0;
+        self.calm_ticks = 0;
+        self.below_floor_ticks = 0;
+        self.present_low_ticks = 0;
+        self.present_low_shown_sum = 0.0;
+    }
+
+    /// One status tick of `tick_ms` with each display's counters. `custom` is the user's fps
+    /// (already defaulted to 30 like the legacy controller).
+    fn tick(
+        &mut self,
+        custom: usize,
+        tick_ms: u64,
+        counts: &[(usize, client::VideoCountersTick)],
+    ) -> GentleTick {
+        self.ticks += 1;
+        self.since_change_ms = self.since_change_ms.saturating_add(tick_ms);
+        if self.custom != Some(custom) {
+            if self.custom.is_some() {
+                // The user changed it, and the host was just told: it runs at `custom` now.
+                self.target = None;
+                self.since_change_ms = 0;
+                self.reset_streaks();
+            }
+            self.custom = Some(custom);
+        }
+        let target = self.target.unwrap_or(custom).min(custom);
+        let floor = GENTLE_FLOOR.min(custom);
+        let hard_floor = GENTLE_HARD_FLOOR.min(custom);
+        let secs = tick_ms.max(1) as f64 / 1000.0;
+        let target_f = target as f64;
+        let refresh_queue = gentle_refresh_queue();
+        self.displays
+            .retain(|d, _| counts.iter().any(|(display, _)| display == d));
+        let mut any_ready = false;
+        let mut overloaded = false;
+        // Calm: every display with enough frames to tell is calm, and there is one.
+        let mut calm_all = true;
+        let mut calm_some = false;
+        let mut cap_min: Option<f64> = None;
+        // The smallest shown fps over displays with a present overload.
+        let mut shown_min: Option<f64> = None;
+        let mut refresh = Vec::new();
+        for (display, c) in counts {
+            let st = self.displays.entry(*display).or_default();
+            st.ticks += 1;
+            st.samples = st.samples.saturating_add(c.steady_decoded);
+            if c.decoded == 0 {
+                st.inactive_ticks += 1;
+            } else {
+                st.inactive_ticks = 0;
+            }
+            if c.steady_decoded >= GENTLE_CAP_MIN_FRAMES && c.steady_busy_us > 0 {
+                let cap = c.steady_decoded as f64 * 1e6 / c.steady_busy_us as f64;
+                st.cap = Some(st.cap.map_or(cap, |e| e + GENTLE_CAP_ALPHA * (cap - e)));
+            }
+            st.busy = c.busy_us as f64 / (secs * 1e6);
+            // The queue grows when fewer frames leave it than arrive; its median (not its
+            // maximum, which Wi-Fi bursts make large) must grow too.
+            let taken = c.decoded + c.failed + c.discarded;
+            if taken < c.received && c.queue_p50 > 0 && c.queue_p50 >= st.queue_p50 {
+                if st.growth_ticks == 0 {
+                    st.growth_from = st.queue_p50;
+                }
+                st.growth_ticks += 1;
+            } else {
+                st.growth_ticks = 0;
+            }
+            st.queue_p50 = c.queue_p50;
+            let backlog =
+                st.growth_ticks >= GENTLE_BACKLOG_TICKS && c.queue_p50 > st.growth_from;
+            if c.queue_max > refresh_queue {
+                st.big_queue_ticks += 1;
+            } else {
+                st.big_queue_ticks = 0;
+            }
+            if st.big_queue_ticks >= GENTLE_REFRESH_TICKS && self.ticks >= GENTLE_MIN_TICKS {
+                st.big_queue_ticks = 0;
+                refresh.push(*display);
+            }
+            st.ready = st.ticks >= GENTLE_MIN_TICKS
+                && st.samples >= GENTLE_MIN_SAMPLES
+                && st.inactive_ticks < GENTLE_INACTIVE_TICKS;
+            if !st.ready {
+                st.overloaded = false;
+                st.present_low = false;
+                continue;
+            }
+            any_ready = true;
+            let rx = c.received as f64 / secs;
+            let dec = c.decoded as f64 / secs;
+            // Frames that reached the screen (soft-render drops and replacements excluded).
+            let shown = c.displayed() as f64 / secs;
+            st.overloaded = c.decoded >= 2 && (st.busy > GENTLE_BUSY_OVERLOAD || backlog);
+            // Frames arrive (not a static screen) but most of them are not shown.
+            st.present_low =
+                rx >= target_f * 0.5 && shown < GENTLE_PRESENT_LOW * target_f.min(rx);
+            overloaded |= st.overloaded;
+            if st.present_low {
+                shown_min = Some(shown_min.map_or(shown, |m: f64| m.min(shown)));
+            }
+            if let Some(cap) = st.cap {
+                cap_min = Some(cap_min.map_or(cap, |m: f64| m.min(cap)));
+            }
+            if dec >= target_f * 0.5 {
+                let calm = !st.overloaded
+                    && !st.present_low
+                    && st.busy < GENTLE_BUSY_CALM
+                    && c.queue_p50 <= 1
+                    && shown >= rx * 0.9
+                    && st
+                        .cap
+                        .map_or(false, |cap| cap >= target_f * GENTLE_CALM_HEADROOM);
+                calm_all &= calm;
+                calm_some |= calm;
+            }
+        }
+        let calm = calm_all && calm_some && !overloaded && shown_min.is_none();
+        let mut out = GentleTick {
+            custom,
+            target,
+            floor,
+            cap: cap_min,
+            decision: "keep",
+            refresh,
+            ..Default::default()
+        };
+        if self.ticks < GENTLE_MIN_TICKS || !any_ready {
+            self.reset_streaks();
+            out.decision = "warmup";
+            out.since_change_ms = self.since_change_ms;
+            return out;
+        }
+        self.overload_ticks = if overloaded { self.overload_ticks + 1 } else { 0 };
+        self.calm_ticks = if calm { self.calm_ticks + 1 } else { 0 };
+        self.below_floor_ticks = match cap_min {
+            Some(cap) if cap < floor as f64 => self.below_floor_ticks + 1,
+            _ => 0,
+        };
+        match shown_min {
+            Some(shown) => {
+                self.present_low_ticks += 1;
+                self.present_low_shown_sum += shown;
+            }
+            None => {
+                self.present_low_ticks = 0;
+                self.present_low_shown_sum = 0.0;
+            }
+        }
+        out.overload_ticks = self.overload_ticks;
+        out.calm_ticks = self.calm_ticks;
+        out.below_floor_ticks = self.below_floor_ticks;
+        out.present_low_ticks = self.present_low_ticks;
+        let mut new = None;
+        if self.overload_ticks >= GENTLE_DECREASE_TICKS
+            && self.since_change_ms >= GENTLE_DECREASE_GAP_MS
+        {
+            self.overload_ticks = 0;
+            let mut lowest = floor;
+            if self.below_floor_ticks >= GENTLE_BELOW_FLOOR_TICKS {
+                if let Some(cap) = cap_min {
+                    lowest = ((cap * 0.9).round() as usize).clamp(hard_floor, floor);
+                }
+            }
+            let fps = lowest.max((target_f * GENTLE_DECREASE_FACTOR).round() as usize);
+            if fps < target {
+                new = Some(fps);
+                out.decision = if fps < floor {
+                    "decrease-below-floor"
+                } else {
+                    "decrease"
+                };
+            } else {
+                out.decision = "at-floor";
+            }
+        } else if self.present_low_ticks >= GENTLE_PRESENT_LOW_TICKS
+            && self.since_change_ms >= GENTLE_DECREASE_GAP_MS
+        {
+            let shown = self.present_low_shown_sum / self.present_low_ticks as f64;
+            self.present_low_ticks = 0;
+            self.present_low_shown_sum = 0.0;
+            let fps = floor.max((shown * GENTLE_PRESENT_HEADROOM).round() as usize);
+            if fps < target {
+                new = Some(fps);
+                out.decision = "present";
+            } else {
+                out.decision = "present-at-floor";
+            }
+        } else if self.calm_ticks >= GENTLE_INCREASE_TICKS
+            && self.since_change_ms >= GENTLE_INCREASE_GAP_MS
+            && target < custom
+        {
+            self.calm_ticks = 0;
+            new = Some(custom.min(target + GENTLE_INCREASE_MIN.max(target / 10)));
+            out.decision = "increase";
+        }
+        if let Some(fps) = new {
+            self.target = Some(fps);
+            self.since_change_ms = 0;
+            out.send = Some(fps);
+        }
+        out.since_change_ms = self.since_change_ms;
+        out
+    }
+
+    /// The per-display state for the log lines.
+    fn describe_displays(&self) -> String {
+        let mut displays = self.displays.iter().collect::<Vec<_>>();
+        displays.sort_unstable_by_key(|(d, _)| **d);
+        let mut out = String::new();
+        for (display, st) in displays {
+            out += &format!(
+                " d{} ready={} busy={:.2} cap={} queue_p50={} grow={} big_queue={} overload={} present_low={};",
+                display,
+                st.ready as u8,
+                st.busy,
+                st.cap.map_or("-".to_owned(), |c| format!("{:.1}", c)),
+                st.queue_p50,
+                st.growth_ticks,
+                st.big_queue_ticks,
+                st.overloaded as u8,
+                st.present_low as u8,
+            );
+        }
+        out
+    }
 }
 
 struct VideoThread {
@@ -3103,6 +3863,8 @@ struct VideoThread {
     frame_count: Arc<RwLock<usize>>,
     discard_queue: Arc<RwLock<bool>>,
     fps_control: FpsControl,
+    counters: Arc<client::VideoCounters>,
+    pacing: Arc<client::PresentPacing>,
 }
 
 impl Drop for VideoThread {
@@ -3320,5 +4082,209 @@ mod kept_cursor_tests {
         let mut bomb = compressed(4, 4);
         bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
         assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
+    }
+}
+
+#[cfg(test)]
+mod gentle_fps_tests {
+    use super::*;
+
+    // A 1 s tick in which the host sent `rx` frames and the viewer decoded `dec` (all steady)
+    // in `busy_ms`, showed `shown`, with the given median and largest queue length.
+    fn tick(
+        rx: usize,
+        dec: usize,
+        shown: usize,
+        busy_ms: u64,
+        queue_p50: usize,
+        queue_max: usize,
+    ) -> client::VideoCountersTick {
+        client::VideoCountersTick {
+            received: rx,
+            decoded: dec,
+            shown,
+            busy_us: busy_ms * 1000,
+            steady_decoded: dec,
+            steady_busy_us: busy_ms * 1000,
+            queue_p50,
+            queue_max,
+            ..Default::default()
+        }
+    }
+
+    // Runs `n` ticks; `f(fps the host sends)` gives each tick's counters. Returns the requests.
+    fn run(
+        ctl: &mut GentleFpsControl,
+        custom: usize,
+        n: usize,
+        mut f: impl FnMut(usize) -> client::VideoCountersTick,
+    ) -> Vec<(usize, usize)> {
+        let mut sent = Vec::new();
+        for i in 0..n {
+            let fps = ctl.target.unwrap_or(custom);
+            let out = ctl.tick(custom, 1000, &[(0, f(fps))]);
+            if let Some(fps) = out.send {
+                sent.push((i, fps));
+            }
+        }
+        sent
+    }
+
+    // A viewer that decodes at most `cap` fps; the host sends `fps`.
+    fn limited(cap: usize, fps: usize) -> client::VideoCountersTick {
+        let dec = fps.min(cap);
+        let busy_ms = (dec as u64 * 1000 / cap as u64).min(1000);
+        tick(fps, dec, dec, busy_ms, 0, 1)
+    }
+
+    #[test]
+    fn gentle_fps_latency_waits_for_warmup_then_steps_down() {
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 4, |fps| tick(fps, fps, fps, 950, 0, 1));
+        // Ticks 0-1 warm up, 2-3 are the two overloaded ticks.
+        assert_eq!(sent, vec![(3, 51)]);
+    }
+
+    #[test]
+    fn gentle_fps_latency_floor_holds_while_capacity_is_above_it() {
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 60, |fps| limited(26, fps));
+        let fps = sent.iter().map(|(_, f)| *f).collect::<Vec<_>>();
+        assert_eq!(fps, vec![51, 43, 37, 31, 26, 24]);
+        // Each step waited at least 2 ticks and 2 s.
+        assert!(sent.windows(2).all(|w| w[1].0 - w[0].0 >= 2));
+    }
+
+    #[test]
+    fn gentle_fps_latency_below_floor_only_after_10s_of_low_capacity() {
+        let mut ctl = GentleFpsControl::new(true);
+        // Custom 24 is the floor: overloaded from tick 2 (ready), but the first request waits
+        // until capacity (15) has been below the floor for 10 ticks: 2..=11.
+        let sent = run(&mut ctl, 24, 40, |fps| limited(15, fps));
+        assert_eq!(sent.first(), Some(&(11, 20)), "{:?}", sent);
+        // Then down in x0.85 steps to 0.9 x capacity, not lower.
+        let fps = sent.iter().map(|(_, f)| *f).collect::<Vec<_>>();
+        assert_eq!(fps, vec![20, 17, 14]);
+        // From custom 60 it goes through the floor the same way, never under 0.9 x capacity.
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 80, |fps| limited(15, fps));
+        assert_eq!(sent.last().unwrap().1, 14, "{:?}", sent);
+        assert!(sent.iter().all(|(_, f)| *f >= 14));
+    }
+
+    #[test]
+    fn gentle_fps_latency_ignores_wifi_bursts() {
+        let mut ctl = GentleFpsControl::new(true);
+        // Bursts: a big queue maximum, the decoder briefly behind, but it keeps up overall.
+        let mut i = 0;
+        let sent = run(&mut ctl, 60, 60, |_| {
+            i += 1;
+            if i % 2 == 0 {
+                tick(66, 55, 50, 450, 1, 12)
+            } else {
+                tick(54, 65, 60, 500, 0, 3)
+            }
+        });
+        assert!(sent.is_empty(), "{:?}", sent);
+    }
+
+    #[test]
+    fn gentle_fps_latency_growing_backlog_is_overload() {
+        let mut ctl = GentleFpsControl::new(true);
+        let mut p50 = 0;
+        let sent = run(&mut ctl, 60, 8, |_| {
+            p50 += 4;
+            tick(60, 50, 50, 600, p50, p50 + 5)
+        });
+        assert_eq!(sent.first().map(|(_, f)| *f), Some(51));
+    }
+
+    #[test]
+    fn gentle_fps_latency_climbs_back_when_calm() {
+        let mut ctl = GentleFpsControl::new(true);
+        let mut loaded = 6;
+        let sent = run(&mut ctl, 60, 40, |fps| {
+            if loaded > 0 {
+                loaded -= 1;
+                tick(fps, fps, fps, 950, 0, 1)
+            } else {
+                tick(fps, fps, fps, 300, 0, 1)
+            }
+        });
+        let fps = sent.iter().map(|(_, f)| *f).collect::<Vec<_>>();
+        assert_eq!(fps.first(), Some(&51));
+        assert_eq!(fps.last(), Some(&60));
+        assert!(fps.iter().all(|f| *f <= 60));
+        // Up in steps of max(3, 10%), each after 5 calm ticks.
+        assert_eq!(&fps[fps.len() - 2..], &[56, 60]);
+        assert!(sent.windows(2).skip(1).all(|w| w[1].0 - w[0].0 >= 5));
+    }
+
+    #[test]
+    fn gentle_fps_latency_present_overload_needs_10s() {
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 30, |fps| tick(fps, fps, 25, 500, 0, 1));
+        // Ready at tick 2, ten present-low ticks: 2..=11.
+        assert_eq!(sent, vec![(11, 30)]);
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 30, |fps| tick(fps, fps, 10, 500, 0, 1));
+        assert_eq!(sent.first(), Some(&(11, 24)));
+    }
+
+    #[test]
+    fn gentle_fps_latency_refresh_is_last_resort() {
+        let mut ctl = GentleFpsControl::new(true);
+        let mut refreshes = Vec::new();
+        for i in 0..6 {
+            let qmax = if i < 4 { 100 } else { 10 };
+            let out = ctl.tick(60, 1000, &[(0, tick(60, 60, 60, 500, 0, qmax))]);
+            refreshes.push(out.refresh.len());
+        }
+        // Three ticks in a row above the threshold, then the count starts again.
+        assert_eq!(refreshes, vec![0, 0, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn gentle_fps_latency_custom_change_resets_target() {
+        let mut ctl = GentleFpsControl::new(true);
+        run(&mut ctl, 60, 4, |fps| tick(fps, fps, fps, 950, 0, 1));
+        assert_eq!(ctl.target, Some(51));
+        let out = ctl.tick(30, 1000, &[(0, tick(30, 30, 30, 300, 0, 1))]);
+        assert_eq!(ctl.target, None);
+        assert_eq!(out.target, 30);
+        assert_eq!(out.send, None);
+    }
+
+    #[test]
+    fn gentle_fps_latency_custom_resend_resets_target() {
+        let mut ctl = GentleFpsControl::new(true);
+        run(&mut ctl, 60, 4, |fps| tick(fps, fps, fps, 950, 0, 1));
+        assert_eq!(ctl.target, Some(51));
+        // The controller's own request passes through io_loop too.
+        assert!(!ctl.on_custom_fps_sent(51));
+        assert_eq!(ctl.target, Some(51));
+        // The user applies the unchanged custom fps again: the host is back at 60.
+        assert!(ctl.on_custom_fps_sent(60));
+        assert_eq!(ctl.target, None);
+        assert_eq!(ctl.since_change_ms, 0);
+    }
+
+    #[test]
+    fn gentle_fps_latency_deferred_overflow_refresh_ignores_the_cap() {
+        let mut ctl = FpsControl::default();
+        assert!(ctl.key_frame_refresh_allowed());
+        ctl.refresh_times = 20;
+        ctl.last_refresh_instant = Some(Instant::now() - Duration::from_secs(11));
+        assert!(!ctl.refresh_allowed());
+        assert!(ctl.key_frame_refresh_allowed());
+        ctl.on_refresh();
+        assert!(!ctl.key_frame_refresh_allowed());
+    }
+
+    #[test]
+    fn gentle_fps_latency_static_screen_sends_nothing() {
+        let mut ctl = GentleFpsControl::new(true);
+        let sent = run(&mut ctl, 60, 40, |_| tick(2, 2, 2, 30, 0, 1));
+        assert!(sent.is_empty(), "{:?}", sent);
     }
 }

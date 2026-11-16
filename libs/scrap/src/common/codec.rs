@@ -627,6 +627,26 @@ impl Decoder {
         self.valid
     }
 
+    /// The decoder in use, for logs: "vram/<driver>" (GPU texture output), "hwram/<FFmpeg
+    /// decoder>/<device>", "vpx", "aom", "other" (MediaCodec) or "none".
+    pub fn describe(&self) -> String {
+        #[cfg(feature = "vram")]
+        if let Some(d) = self.h264_vram.as_ref().or(self.h265_vram.as_ref()) {
+            return format!("vram/{}", d.driver());
+        }
+        #[cfg(feature = "hwcodec")]
+        if let Some(d) = self.h264_ram.as_ref().or(self.h265_ram.as_ref()) {
+            return format!("hwram/{}/{:?}", d.info.name, d.info.hwdevice);
+        }
+        if self.vp8.is_some() || self.vp9.is_some() {
+            return "vpx".to_owned();
+        }
+        if self.av1.is_some() {
+            return "aom".to_owned();
+        }
+        if self.valid { "other" } else { "none" }.to_owned()
+    }
+
     // rgb [in/out] fmt and stride must be set in ImageRgb
     pub fn handle_video_frame(
         &mut self,

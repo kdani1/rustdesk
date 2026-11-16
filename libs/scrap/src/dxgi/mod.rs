@@ -69,6 +69,9 @@ pub struct Capturer {
     rotate: Rotate,
     frame_state: FrameState,
     hdr: Option<hdr::HdrToSdr>,
+    // QPC now minus `LastPresentTime` when the last frame with a new image was acquired; `None`
+    // after a call that returned no DXGI image (GDI fallback, timeout, error).
+    last_present_age: Option<std::time::Duration>,
 }
 
 impl Capturer {
@@ -188,6 +191,7 @@ impl Capturer {
             rotate,
             frame_state: FrameState::Idle,
             hdr: None,
+            last_present_age: None,
         })
     }
 
@@ -427,6 +431,12 @@ impl Capturer {
         self.is_gdi()
     }
 
+    /// How old the image of the last successful `frame()` was when it was acquired: QPC time at
+    /// acquire minus its `LastPresentTime`. `None` when that call returned no DXGI image.
+    pub fn last_present_age(&self) -> Option<std::time::Duration> {
+        self.last_present_age
+    }
+
     pub fn cancel_gdi(&mut self) {
         self.gdi_buffer = Vec::new();
         self.gdi_capturer.take();
@@ -452,6 +462,7 @@ impl Capturer {
         if *info.LastPresentTime.QuadPart() == 0 {
             return Err(std::io::ErrorKind::WouldBlock.into());
         }
+        self.last_present_age = present_age(*info.LastPresentTime.QuadPart());
 
         #[allow(invalid_value)]
         let mut rect = mem::MaybeUninit::uninit().assume_init();
@@ -511,6 +522,7 @@ impl Capturer {
     }
 
     pub fn frame<'a>(&'a mut self, timeout: UINT) -> io::Result<Frame<'a>> {
+        self.last_present_age = None;
         if self.output_texture {
             Ok(Frame::Texture(self.get_texture(timeout)?))
         } else {
@@ -604,6 +616,7 @@ impl Capturer {
             if info.AccumulatedFrames == 0 || *info.LastPresentTime.QuadPart() == 0 {
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
+            self.last_present_age = present_age(*info.LastPresentTime.QuadPart());
 
             let mut texture: *mut ID3D11Texture2D = ptr::null_mut();
             (*frame.0).QueryInterface(
@@ -1028,6 +1041,32 @@ fn wrap_hresult(x: HRESULT) -> io::Result<()> {
         }
     })
     .into())
+}
+
+// QueryPerformanceCounter time since `last_present`, a DXGI `LastPresentTime` (QPC ticks).
+fn present_age(last_present: i64) -> Option<std::time::Duration> {
+    // kernel32, linked by std; declared here because scrap's winapi lacks the `profileapi` feature.
+    extern "system" {
+        fn QueryPerformanceCounter(count: *mut i64) -> i32;
+        fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+    }
+    static FREQUENCY: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let frequency = *FREQUENCY.get_or_init(|| {
+        let mut f = 0i64;
+        if unsafe { QueryPerformanceFrequency(&mut f) } == 0 {
+            0
+        } else {
+            f
+        }
+    });
+    let mut now = 0i64;
+    if frequency <= 0 || unsafe { QueryPerformanceCounter(&mut now) } == 0 {
+        return None;
+    }
+    let ticks = now.saturating_sub(last_present).max(0) as u128;
+    Some(std::time::Duration::from_nanos(
+        (ticks * 1_000_000_000 / frequency as u128).min(u64::MAX as u128) as u64,
+    ))
 }
 
 struct Rotate {

@@ -95,6 +95,8 @@ pub use super::lang::*;
 
 #[cfg(not(target_os = "linux"))]
 mod audio_playback;
+#[cfg(not(target_os = "linux"))]
+mod audio_target;
 #[cfg(target_os = "windows")]
 mod audio_playback_recovery;
 #[cfg(all(test, not(target_os = "linux")))]
@@ -212,6 +214,78 @@ impl Drop for OffererGuard {
         if let Some(stream) = self.0.take() {
             stream.close_detached();
         }
+    }
+}
+
+/// Outcome of one connection race, logged as a `RACE` line (docs/LATENCY-METRICS.md): each
+/// candidate's result and when it finished, and the winner. Candidates still running when the
+/// race ended are dropped by it and show as `pending`. Connect time only, so always on.
+#[derive(Clone)]
+struct RaceLog {
+    site: &'static str,
+    start: std::time::Instant,
+    // (candidate, Some((ok, ms)) once it finished)
+    results: Arc<Mutex<Vec<(&'static str, Option<(bool, u128)>)>>>,
+}
+
+impl RaceLog {
+    fn new(site: &'static str) -> Self {
+        Self {
+            site,
+            start: std::time::Instant::now(),
+            results: Default::default(),
+        }
+    }
+
+    /// Wraps a candidate so its outcome is recorded; the race itself sees no difference.
+    fn track<'a, T: Send + 'a>(
+        &self,
+        name: &'static str,
+        fut: BoxFuture<'a, ResultType<T>>,
+    ) -> BoxFuture<'a, ResultType<T>> {
+        let index = {
+            let mut results = self.results.lock().unwrap();
+            results.push((name, None));
+            results.len() - 1
+        };
+        let log = self.clone();
+        async move {
+            let res = fut.await;
+            let ms = log.start.elapsed().as_millis();
+            if let Some(entry) = log.results.lock().unwrap().get_mut(index) {
+                entry.1 = Some((res.is_ok(), ms));
+            }
+            res
+        }
+        .boxed()
+    }
+
+    /// Records a candidate that ran after the race (the relay fallback).
+    fn add(&self, name: &'static str, ok: bool) {
+        let ms = self.start.elapsed().as_millis();
+        self.results.lock().unwrap().push((name, Some((ok, ms))));
+    }
+
+    fn finish(&self, winner: &str) {
+        let candidates = self
+            .results
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, result)| match result {
+                Some((true, ms)) => format!("{name}=ok@{ms}"),
+                Some((false, ms)) => format!("{name}=err@{ms}"),
+                None => format!("{name}=pending"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::info!(
+            "RACE site={} {} winner={} ms={}",
+            self.site,
+            candidates,
+            if winner.is_empty() { "none" } else { winner },
+            self.start.elapsed().as_millis()
+        );
     }
 }
 
@@ -575,17 +649,24 @@ impl Client {
             contained,
         )
         .boxed();
+        let race_log = RaceLog::new("start");
+        let preferred_fut = race_log.track("preferred", preferred_fut);
+        let fallback_fut = race_log.track("tcp_punch_round", fallback_fut);
         if has_webrtc_offerer {
-            return race_transports_prefer_webrtc(
+            let res = race_transports_prefer_webrtc(
                 preferred_fut,
                 vec![fallback_fut],
                 Self::relay_fallback_delay_ms(),
                 |result| result.0 .1,
             )
             .await;
+            race_log.finish(res.as_ref().map_or("", |r| r.0 .4));
+            return res;
         }
         let connect_futures = vec![preferred_fut, fallback_fut];
-        match select_ok(connect_futures).await {
+        let res = select_ok(connect_futures).await;
+        race_log.finish(res.as_ref().map_or("", |r| r.0 .0 .4));
+        match res {
             Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
             Err(e) => Err(e),
         }
@@ -1050,18 +1131,20 @@ impl Client {
                         );
                         start = Instant::now();
                         let mut connect_futures = Vec::new();
+                        let race_log = RaceLog::new("relay_response");
                         if let Some(s) = ipv6.0 {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             if addr.port() > 0 {
                                 if s.connect(addr).await.is_ok() {
-                                    connect_futures.push(
+                                    connect_futures.push(race_log.track(
+                                        "v6",
                                         async move {
                                             let (conn, kcp, typ) =
                                                 udp_nat_connect(s, "IPv6", CONNECT_TIMEOUT).await?;
                                             Ok((conn, kcp, typ, true))
                                         }
                                         .boxed(),
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -1126,7 +1209,8 @@ impl Client {
                             conn_type,
                             my_addr.is_ipv4(),
                         );
-                        connect_futures.push(
+                        connect_futures.push(race_log.track(
+                            "relay",
                             async move {
                                 let conn = fut.await?;
                                 Ok((
@@ -1137,7 +1221,7 @@ impl Client {
                                 ))
                             }
                             .boxed(),
-                        );
+                        ));
                         // Keep the adopted offerer in a guard that stays armed across the race AND
                         // secure_connection, so cancellation of this future by the outer race (or a
                         // secure-handshake failure) closes the pc instead of leaking it. It is
@@ -1157,6 +1241,7 @@ impl Client {
                                 Ok((Stream::WebRTC(raced), None, "WebRTC", !relayed))
                             }
                             .boxed();
+                            let webrtc_fut = race_log.track("webrtc", webrtc_fut);
                             if interface.is_policy_relay() {
                                 // Relay-only WebRTC can use only TURN, so it has no P2P advantage
                                 // over the RustDesk relay. Take the first successful relay instead
@@ -1181,6 +1266,7 @@ impl Client {
                             // Run all connection attempts concurrently, take the first success.
                             select_ok(connect_futures).await.map(|r| r.0)
                         };
+                        race_log.finish(race_result.as_ref().map_or("", |r| r.2));
                         if let Some(stop) = webrtc_bridge_stop {
                             let _ = stop.send(());
                         }
@@ -1458,35 +1544,39 @@ impl Client {
         // Each attempt carries whether its path is direct (4th field). TCP/UDP/IPv6 punch are
         // always direct; WebRTC is direct only when ICE nominated a non-TURN pair.
         let mut direct_futures = Vec::new();
+        let race_log = RaceLog::new("connect");
         if allow_tcp_punch {
             let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
-            direct_futures.push(
+            direct_futures.push(race_log.track(
+                "tcp",
                 async move {
                     let conn = fut.await?;
                     Ok((conn, None, "TCP", true))
                 }
                 .boxed(),
-            );
+            ));
         }
         if let Some(udp_socket_nat) = udp_socket_nat {
-            direct_futures.push(
+            direct_futures.push(race_log.track(
+                "udp",
                 async move {
                     let (conn, kcp, typ) =
                         udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).await?;
                     Ok((conn, kcp, typ, true))
                 }
                 .boxed(),
-            );
+            ));
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
-            direct_futures.push(
+            direct_futures.push(race_log.track(
+                "v6",
                 async move {
                     let (conn, kcp, typ) =
                         udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).await?;
                     Ok((conn, kcp, typ, true))
                 }
                 .boxed(),
-            );
+            ));
         }
         // Race a clone of the offerer; the guard retains its own clone so a losing/cancelled race
         // still closes the pc (select_ok drops the future's clone without closing).
@@ -1501,14 +1591,17 @@ impl Client {
                 // tighter timeout, so a working direct connection still wins immediately, and the
                 // relay fallback only waits the extra time when direct attempts all failed.
                 let webrtc_timeout = connect_timeout.max(Self::relay_fallback_delay_ms());
-                async move {
-                    raced.wait_connected(webrtc_timeout).await?;
-                    // Resolve the pair here: a TURN win is relayed, not direct, and must be held
-                    // behind still-racing direct attempts rather than committed as P2P.
-                    let relayed = raced.is_relayed().await.unwrap_or(true);
-                    Ok((Stream::WebRTC(raced), None, "WebRTC", !relayed))
-                }
-                .boxed()
+                race_log.track(
+                    "webrtc",
+                    async move {
+                        raced.wait_connected(webrtc_timeout).await?;
+                        // Resolve the pair here: a TURN win is relayed, not direct, and must be
+                        // held behind still-racing direct attempts rather than committed as P2P.
+                        let relayed = raced.is_relayed().await.unwrap_or(true);
+                        Ok((Stream::WebRTC(raced), None, "WebRTC", !relayed))
+                    }
+                    .boxed(),
+                )
             });
         // Prefer P2P: a direct result wins outright, a relayed WebRTC (TURN) is held for the
         // window so a direct punch can still land. Falls back to plain select_ok when only one
@@ -1555,7 +1648,9 @@ impl Client {
                     &switch_code,
                 )
                 .await;
+                race_log.add("relay", conn.is_ok());
                 if let Err(e) = conn {
+                    race_log.finish("");
                     // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                     interface.update_direct(Some(false));
                     bail!("Failed to connect via relay server: {}", e);
@@ -1563,9 +1658,11 @@ impl Client {
                 typ = "Relay";
                 direct = false;
             } else {
+                race_log.finish("");
                 bail!("Failed to make direct connection to remote desktop");
             }
         }
+        race_log.finish(if conn.is_ok() { typ } else { "" });
         let mut conn = conn?;
         log::info!(
             "{:?} used to establish {typ} connection with {} punch",
@@ -2148,6 +2245,12 @@ pub struct AudioHandler {
     playback_status: Arc<audio_playback::AudioPlaybackStatus>,
     #[cfg(target_os = "windows")]
     playback_recovery: audio_playback_recovery::PlaybackRecovery,
+    // The buffer level at the last appended frame, for `take_level_sample`.
+    #[cfg(not(target_os = "linux"))]
+    level_sample: Option<latency::AudioLevelSample>,
+    // When the previous audio frame arrived, to tell a pause of the host's audio.
+    #[cfg(not(target_os = "linux"))]
+    last_frame_at: Option<std::time::Instant>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2204,7 +2307,46 @@ struct AudioBuffer(
     usize,
     [usize; 30],
     Arc<std::sync::atomic::AtomicUsize>,
+    AudioBufferTarget,
 );
+
+/// The trim policy of one `AudioBuffer`: the adaptive target (`audio-target-ms`), or None for
+/// the legacy `try_shrink` rule.
+#[cfg(not(target_os = "linux"))]
+struct AudioBufferTarget {
+    target: Option<audio_target::AudioTarget>,
+    channels: usize,
+}
+
+#[cfg(not(target_os = "linux"))]
+thread_local! {
+    // Set on the viewer's received-audio thread (`start_audio_thread`): only there does an
+    // `AudioBuffer` follow `audio-target-ms`. Elsewhere (the host's virtual-microphone playback,
+    // `start_microphone_audio_thread`) it keeps the legacy rule.
+    static ADAPTIVE_AUDIO_TARGET: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Default for AudioBufferTarget {
+    /// Reads the option: once per audio format (a new format starts a new `AudioHandler`).
+    fn default() -> Self {
+        if !ADAPTIVE_AUDIO_TARGET.with(|adaptive| adaptive.get()) {
+            return Self {
+                target: None,
+                channels: 2,
+            };
+        }
+        let option = LocalConfig::get_option(keys::OPTION_AUDIO_TARGET_MS);
+        // Adaptive by default only on Windows; elsewhere a number turns it on.
+        let target = audio_target::AudioTarget::from_option(&option, cfg!(windows));
+        log::info!(
+            "LATENCY client audio_policy={} floor_ms={}",
+            if target.is_some() { "adaptive" } else { "legacy" },
+            target.as_ref().map_or(0, |t| t.floor().as_millis())
+        );
+        Self { target, channels: 2 }
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl Default for AudioBuffer {
@@ -2216,6 +2358,7 @@ impl Default for AudioBuffer {
             48000 * 2,
             [0; 30],
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Default::default(),
         )
     }
 }
@@ -2230,9 +2373,11 @@ impl AudioBuffer {
             self.1 = sample_rate * channels;
             log::info!("Audio buffer resized from {old_capacity} to {capacity}");
         }
+        self.4.channels = channels.max(1);
     }
 
-    fn try_shrink(&mut self, having: usize) {
+    /// Returns how many samples it dropped.
+    fn try_shrink(&mut self, having: usize) -> usize {
         extern crate chrono;
         use chrono::prelude::*;
 
@@ -2248,9 +2393,9 @@ impl AudioBuffer {
         unsafe {
             if tms == 0 {
                 tms = dt;
-                return;
+                return 0;
             } else if dt < tms + 12000 {
-                return;
+                return 0;
             }
             tms = dt;
         }
@@ -2279,7 +2424,7 @@ impl AudioBuffer {
         const N: usize = 4;
         self.2[max] = 0;
         if max < 6 {
-            return;
+            return 0;
         } else if max > zero * N {
             max = zero * N;
         }
@@ -2293,7 +2438,9 @@ impl AudioBuffer {
             let generation = self.signal_discontinuity();
             drop(lock);
             log::info!("skip {skip}, based {max} {zero}, generation={generation}");
+            return skip;
         }
+        0
     }
 
     /// The caller must hold the PCM buffer lock while signaling the discard.
@@ -2324,12 +2471,65 @@ impl AudioBuffer {
         occupied
     }
 
+    /// Trims buffered audio down to the adaptive target (`audio_target`): drops `excess` of
+    /// the oldest audio, in whole channel frames, and lets playback crossfade. Returns how many
+    /// samples it dropped.
+    fn trim_to_target(&self, excess: Duration, target: Duration) -> usize {
+        let channels = self.4.channels.max(1);
+        let samples = (excess.as_micros() * self.1 as u128 / 1_000_000) as usize;
+        let mut lock = self.0.lock().unwrap();
+        let skip = samples.min(lock.occupied_len()) / channels * channels;
+        if skip == 0 {
+            return 0;
+        }
+        lock.skip(skip);
+        let generation = self.signal_discontinuity();
+        drop(lock);
+        log::info!(
+            "audio trim {}ms to target {}ms, generation={generation}",
+            excess.as_millis(),
+            target.as_millis()
+        );
+        skip
+    }
+
     /// append pcm to audio buffer, trying to drop data
     /// when data is too much (per 12 seconds) based
     /// statistics.
-    pub fn append_pcm(&mut self, buffer: &[f32]) {
+    ///
+    /// With the adaptive target (`audio-target-ms`) the trim follows `audio_target` instead;
+    /// `underruns` are the output underruns since the previous call, which raise its target.
+    ///
+    /// Returns the buffer level found before the push (at most capacity minus the new data)
+    /// and the samples the trim dropped, for the `LATENCY client audio` line.
+    pub fn append_pcm(&mut self, buffer: &[f32], underruns: usize) -> latency::AudioLevelSample {
         let having = self.append_pcm2(buffer);
-        self.try_shrink(having);
+        let samples_per_sec = self.1.max(1) as u64;
+        let to_duration = |samples: usize| {
+            Duration::from_micros(samples as u64 * 1_000_000 / samples_per_sec)
+        };
+        let level = to_duration(having.saturating_sub(buffer.len()));
+        let (trimmed, target) = match self.4.target.as_mut() {
+            Some(target) => {
+                let excess = target.on_packet(
+                    std::time::Instant::now(),
+                    level,
+                    to_duration(buffer.len()),
+                    underruns,
+                );
+                let state = target.state();
+                let trimmed =
+                    excess.map_or(0, |excess| self.trim_to_target(excess, state.target));
+                (trimmed, Some(state))
+            }
+            None => (self.try_shrink(having), None),
+        };
+        latency::AudioLevelSample {
+            level,
+            trimmed: to_duration(trimmed),
+            underruns: 0,
+            target,
+        }
     }
 }
 
@@ -2354,6 +2554,7 @@ mod audio_buffer_discontinuity_tests {
             BUFFER_CAPACITY,
             [0; BUFFER_LEVELS],
             Arc::new(AtomicUsize::new(0)),
+            Default::default(),
         );
 
         assert_eq!(audio_buffer.append_pcm2(&FIRST_INPUT), FIRST_INPUT.len());
@@ -2574,7 +2775,23 @@ impl AudioHandler {
                         return;
                     }
                 };
-                self.audio_buffer.append_pcm(&buffer);
+                let target_underruns = self
+                    .playback_status
+                    .target_underruns
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                // Taken on every frame, measured or not. Those before a pause of the host's audio
+                // (it stops sending after silence) only ended that audio: not gaps in it.
+                let underruns = self
+                    .playback_status
+                    .underruns
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                let after_pause = self.last_frame_at.replace(now).map_or(true, |last| {
+                    now.saturating_duration_since(last) >= audio_target::PAUSE
+                });
+                let mut sample = self.audio_buffer.append_pcm(&buffer, target_underruns);
+                sample.underruns = if after_pause { 0 } else { underruns };
+                self.level_sample = Some(sample);
             }
             #[cfg(target_os = "linux")]
             {
@@ -2583,6 +2800,18 @@ impl AudioHandler {
                 self.simple.as_mut().map(|x| x.write(data_u8));
             }
         });
+    }
+
+    /// The buffer level of the frame `handle_frame` just played, with the playback underruns
+    /// since the previous frame (not those before a pause). None while latency measurement is
+    /// off or nothing was appended.
+    #[cfg(not(target_os = "linux"))]
+    pub fn take_level_sample(&mut self) -> Option<latency::AudioLevelSample> {
+        let sample = self.level_sample.take();
+        if !latency::is_any_enabled() {
+            return None;
+        }
+        sample
     }
 
     /// Build audio output stream for current device.
@@ -2700,8 +2929,10 @@ impl VideoHandler {
             } else {
                 ImageFormat::ARGB
             };
+        let decoder = Decoder::new(format, luid);
+        Self::log_decoder(&decoder, _display);
         VideoHandler {
-            decoder: Decoder::new(format, luid),
+            decoder,
             rgb: ImageRgb::new(rgba_format, crate::get_dst_align_rgba()),
             texture: Default::default(),
             recorder: Default::default(),
@@ -2777,8 +3008,23 @@ impl VideoHandler {
         let luid = Self::get_adapter_luid();
         let format = format.unwrap_or(self.decoder.format());
         self.decoder = Decoder::new(format, luid);
+        Self::log_decoder(&self.decoder, self._display);
         self.fail_counter = 0;
         self.first_frame = true;
+    }
+
+    /// Which decoder and render path a display uses (docs/LATENCY-METRICS.md). Once per
+    /// decoder creation, not tied to the latency log.
+    fn log_decoder(decoder: &Decoder, display: usize) {
+        let path = decoder.describe();
+        log::info!(
+            "LATENCY client decoder display={} codec={:?} path={} hw={} use_texture_render={}",
+            display,
+            decoder.format(),
+            path,
+            path.starts_with("vram"),
+            use_texture_render(),
+        );
     }
 
     /// Start or stop screen record.
@@ -4004,6 +4250,286 @@ pub enum MediaData {
 
 pub type MediaSender = mpsc::Sender<MediaData>;
 
+/// Frame counters of one display's video thread. Always on (a few relaxed atomic adds per
+/// frame) and independent of `latency`; io_loop takes them once per status tick for the
+/// `FPSCTL` line and the fps fields of the latency report (docs/LATENCY-METRICS.md).
+#[derive(Default)]
+pub struct VideoCounters {
+    received: std::sync::atomic::AtomicUsize,
+    discarded: std::sync::atomic::AtomicUsize,
+    decoded: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+    shown: std::sync::atomic::AtomicUsize,
+    ui_lost: std::sync::atomic::AtomicUsize,
+    decode_us: std::sync::atomic::AtomicU64,
+    present_us: std::sync::atomic::AtomicU64,
+    busy_us: std::sync::atomic::AtomicU64,
+    queue_max: std::sync::atomic::AtomicUsize,
+    steady_decoded: std::sync::atomic::AtomicUsize,
+    steady_busy_us: std::sync::atomic::AtomicU64,
+    // Queue length right after each decode, by `QUEUE_BUCKETS`, for its median.
+    queue_hist: [std::sync::atomic::AtomicU32; QUEUE_BUCKETS.len()],
+}
+
+// Lower bounds of the queue-length buckets behind `VideoCountersTick::queue_p50`.
+const QUEUE_BUCKETS: [usize; 14] = [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96];
+// Decoded frames after a decoder start, reset or codec change that do not count towards
+// `steady_*`: the first frames are slow (decoder init), as `fps_calculate` assumes too.
+const STEADY_WARMUP_FRAMES: usize = 3;
+
+/// What `VideoCounters` counted since the previous `take`.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct VideoCountersTick {
+    /// Frames parsed in io_loop.
+    pub received: usize,
+    /// Received frames dropped undecoded: `discard_queue`, or evicted by a full queue.
+    pub discarded: usize,
+    /// `handle_frame` returned a picture.
+    pub decoded: usize,
+    /// `handle_frame` returned no picture or an error.
+    pub failed: usize,
+    /// Decoded frames handed to the UI callback.
+    pub shown: usize,
+    /// Of the `shown` frames, those the soft renderer dropped or that a later one replaced
+    /// before Flutter fetched them (`ui_dropped` + `ui_replaced`): they never reached the screen.
+    pub ui_lost: usize,
+    /// `handle_frame` time of the decoded frames.
+    pub decode_us: u64,
+    /// UI callback time of the shown frames.
+    pub present_us: u64,
+    /// What `fps_calculate` (the legacy controller's `decode_fps`) sums: dequeue until after
+    /// the callback and the latency hook (frames skipped by present pacing: no callback),
+    /// decoded frames only.
+    pub busy_us: u64,
+    /// Largest `video_queue.len()` right after a decode.
+    pub queue_max: usize,
+    /// Decoded frames that are not key frames and not among the first
+    /// `STEADY_WARMUP_FRAMES` after a decoder start, reset or codec change.
+    pub steady_decoded: usize,
+    /// `busy_us` of the `steady_decoded` frames.
+    pub steady_busy_us: u64,
+    /// Median `video_queue.len()` right after a decode, over the tick's decoded frames, as the
+    /// lower bound of its bucket (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96).
+    pub queue_p50: usize,
+}
+
+impl VideoCountersTick {
+    /// Frames that reached the screen: `shown` minus `ui_lost`.
+    pub fn displayed(&self) -> usize {
+        self.shown.saturating_sub(self.ui_lost)
+    }
+}
+
+impl VideoCounters {
+    pub fn on_received(&self) {
+        self.received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn on_discarded(&self) {
+        self.discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The video thread, once per decoded frame, after `busy` (see `VideoCountersTick`).
+    fn on_decoded_busy(&self, busy: std::time::Duration, steady: bool, queue_len: usize) {
+        let busy = duration_us(busy);
+        self.busy_us.fetch_add(busy, Ordering::Relaxed);
+        if steady {
+            self.steady_decoded.fetch_add(1, Ordering::Relaxed);
+            self.steady_busy_us.fetch_add(busy, Ordering::Relaxed);
+        }
+        let bucket = QUEUE_BUCKETS
+            .iter()
+            .rposition(|lower| queue_len >= *lower)
+            .unwrap_or(0);
+        self.queue_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn take(&self) -> VideoCountersTick {
+        let hist = self
+            .queue_hist
+            .iter()
+            .map(|n| n.swap(0, Ordering::Relaxed) as usize)
+            .collect::<Vec<_>>();
+        let total: usize = hist.iter().sum();
+        let mut queue_p50 = 0;
+        let mut seen = 0;
+        for (n, lower) in hist.iter().zip(QUEUE_BUCKETS.iter()) {
+            seen += n;
+            if total > 0 && seen * 2 >= total {
+                queue_p50 = *lower;
+                break;
+            }
+        }
+        VideoCountersTick {
+            steady_decoded: self.steady_decoded.swap(0, Ordering::Relaxed),
+            steady_busy_us: self.steady_busy_us.swap(0, Ordering::Relaxed),
+            queue_p50,
+            received: self.received.swap(0, Ordering::Relaxed),
+            discarded: self.discarded.swap(0, Ordering::Relaxed),
+            decoded: self.decoded.swap(0, Ordering::Relaxed),
+            failed: self.failed.swap(0, Ordering::Relaxed),
+            shown: self.shown.swap(0, Ordering::Relaxed),
+            ui_lost: self.ui_lost.swap(0, Ordering::Relaxed),
+            decode_us: self.decode_us.swap(0, Ordering::Relaxed),
+            present_us: self.present_us.swap(0, Ordering::Relaxed),
+            busy_us: self.busy_us.swap(0, Ordering::Relaxed),
+            queue_max: self.queue_max.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+fn duration_us(d: std::time::Duration) -> u64 {
+    d.as_micros().min(u64::MAX as u128) as u64
+}
+
+/// Present pacing ("always show the newest frame", option `enable-viewer-present-pacing`): what
+/// io_loop tells one display's video thread about frames it has not taken yet. Every frame is
+/// still decoded; `PresentPacer` only decides which decoded frames reach the UI callback.
+pub struct PresentPacing {
+    enabled: bool,
+    // Key frames sent through the channel and not taken yet. They bypass `video_queue`, so its
+    // length alone does not see them.
+    key_frames_pending: std::sync::atomic::AtomicUsize,
+    // pts of the newest frame received, `i64::MIN` while none carried one.
+    newest_pts: std::sync::atomic::AtomicI64,
+}
+
+impl PresentPacing {
+    /// Reads the option; called once per video thread.
+    pub fn new() -> Self {
+        let option = LocalConfig::get_option(keys::OPTION_ENABLE_VIEWER_PRESENT_PACING);
+        Self {
+            // Default on only on Windows; other platforms keep the old behaviour unless "Y".
+            enabled: if cfg!(windows) {
+                option != "N"
+            } else {
+                option == "Y"
+            },
+            key_frames_pending: Default::default(),
+            newest_pts: std::sync::atomic::AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// io_loop, before the frame is sent to the video thread.
+    pub fn on_received(&self, vf: &VideoFrame, key_frame: bool) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(pts) = latency::frame_pts(vf) {
+            self.newest_pts.store(pts, Ordering::Relaxed);
+        }
+        if key_frame {
+            self.key_frames_pending.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn on_key_frame_taken(&self) {
+        // Only the video thread decrements, so checking first cannot race into a wrap.
+        if self.enabled && self.key_frames_pending.load(Ordering::Relaxed) > 0 {
+            self.key_frames_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// A decoded frame waiting behind newer ones is shown anyway once the backlog has lasted this
+// long, measured from when it began (not from the last present, which after a network stall
+// would show the oldest frame of the burst). Bounds the shown-frame gap while the viewer stays
+// behind.
+const PACING_MAX_BACKLOG: std::time::Duration = std::time::Duration::from_millis(50);
+
+thread_local! {
+    // Set on a video thread whose display uses present pacing; the soft renderer, which runs
+    // on that thread, then lets a newer frame replace one Flutter has not fetched yet.
+    static PRESENT_PACING_THREAD: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Whether the current thread is a video thread with present pacing on.
+#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
+pub fn is_present_pacing_thread() -> bool {
+    PRESENT_PACING_THREAD.with(|p| p.get())
+}
+
+/// The video thread's present decision. A decoded frame is shown unless a newer frame is
+/// already waiting and either the backlog has lasted 1.5 frame intervals or the newest waiting
+/// frame is at least 1.5 frame intervals newer than this one (Moonlight-style window: two frames
+/// arriving together, as Wi-Fi aggregation delivers them, are both shown). Key frames and the
+/// first frame after a start, reset or codec change are always shown.
+struct PresentPacer {
+    shared: Arc<PresentPacing>,
+    present_next: bool,
+    backlog_since: Option<std::time::Instant>,
+    last_pts: Option<i64>,
+    // EWMA of the pts step between decoded frames, in ms.
+    interval_ms: f64,
+}
+
+impl PresentPacer {
+    fn new(shared: Arc<PresentPacing>) -> Self {
+        Self {
+            shared,
+            present_next: true,
+            backlog_since: None,
+            last_pts: None,
+            interval_ms: 1000.0 / 60.0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.shared.enabled
+    }
+
+    /// Shows the next decoded frame unconditionally.
+    fn reset(&mut self) {
+        self.present_next = true;
+        self.backlog_since = None;
+    }
+
+    fn should_present(
+        &mut self,
+        key_frame: bool,
+        pts: Option<i64>,
+        queue_len: usize,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.shared.enabled {
+            return true;
+        }
+        if let (Some(pts), Some(last)) = (pts, self.last_pts) {
+            let step = pts - last;
+            // Larger steps are a static screen or a stall, not the frame rate.
+            if (1..=100).contains(&step) {
+                self.interval_ms += (step as f64 - self.interval_ms) / 8.0;
+            }
+        }
+        self.last_pts = pts;
+        if key_frame || std::mem::take(&mut self.present_next) {
+            self.backlog_since = None;
+            return true;
+        }
+        let newer_waiting =
+            queue_len > 0 || self.shared.key_frames_pending.load(Ordering::Relaxed) > 0;
+        if !newer_waiting {
+            self.backlog_since = None;
+            return true;
+        }
+        let since = *self.backlog_since.get_or_insert(now);
+        let backlog = now.saturating_duration_since(since);
+        if backlog >= PACING_MAX_BACKLOG {
+            // Still behind: show this frame so motion stays visible, and start a new window.
+            self.backlog_since = Some(now);
+            return true;
+        }
+        let window_ms = self.interval_ms.clamp(4.0, 50.0) * 1.5;
+        let lasting = backlog.as_secs_f64() * 1000.0 >= window_ms;
+        let newest = self.shared.newest_pts.load(Ordering::Relaxed);
+        // A pts going backwards (host capture restart) says nothing about staleness.
+        let behind = pts.map_or(false, |pts| {
+            newest != i64::MIN && newest >= pts && (newest - pts) as f64 >= window_ms
+        });
+        !(lasting || behind)
+    }
+}
+
 /// Start video thread.
 ///
 /// # Arguments
@@ -4017,6 +4543,8 @@ pub fn start_video_thread<F, T>(
     fps: Arc<RwLock<Option<usize>>>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     discard_queue: Arc<RwLock<bool>>,
+    counters: Arc<VideoCounters>,
+    pacing: Arc<PresentPacing>,
     video_callback: F,
 ) where
     F: 'static + FnMut(usize, &mut scrap::ImageRgb, *mut c_void, bool) + Send,
@@ -4029,6 +4557,17 @@ pub fn start_video_thread<F, T>(
 
     std::thread::spawn(move || {
         latency::set_thread_stream(latency_key);
+        let mut pacer = PresentPacer::new(pacing);
+        PRESENT_PACING_THREAD.with(|p| p.set(pacer.enabled()));
+        log::info!(
+            "LATENCY client pacing display={} present_pacing={}",
+            display,
+            if pacer.enabled() { "on" } else { "off" }
+        );
+        // ABOVE_NORMAL for this display's decoder thread (enable-viewer-priority-boost); the
+        // thread is dedicated, the guard only lives as long as it.
+        #[cfg(windows)]
+        let _priority_boost = crate::platform::windows::viewer_thread_boost("decoder", Some(display));
         #[cfg(windows)]
         sync_cpu_usage();
         get_hwcodec_config();
@@ -4036,18 +4575,24 @@ pub fn start_video_thread<F, T>(
         let mut count = 0;
         let mut duration = std::time::Duration::ZERO;
         let mut skip_beginning = 0;
+        // Decoded frames since the decoder started, reset or changed codec, up to
+        // STEADY_WARMUP_FRAMES (for `VideoCounters::steady_*`).
+        let mut warmup = 0;
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
                     MediaData::VideoFrame(_) | MediaData::VideoQueue => {
+                        let key_frame = matches!(data, MediaData::VideoFrame(_));
                         let vf = match data {
                             MediaData::VideoFrame(vf) => {
+                                pacer.shared.on_key_frame_taken();
                                 *discard_queue.write().unwrap() = false;
                                 *vf
                             }
                             MediaData::VideoQueue => {
                                 if let Some(vf) = video_queue.read().unwrap().pop() {
                                     if discard_queue.read().unwrap().clone() {
+                                        counters.on_discarded();
                                         continue;
                                     }
                                     vf
@@ -4073,33 +4618,78 @@ pub fn start_video_thread<F, T>(
                                 handler.record_screen(true, id, display, is_view_camera);
                             }
                             video_handler = Some(handler);
+                            pacer.reset();
+                            warmup = 0;
                         }
                         if let Some(handler) = video_handler.as_mut() {
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
                             let format_changed = handler.decoder.format() != format;
+                            if format_changed {
+                                pacer.reset();
+                                warmup = 0;
+                            }
                             let decode_start = std::time::Instant::now();
                             match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
                                     let decode_end = std::time::Instant::now();
-                                    video_callback(
-                                        display,
-                                        &mut handler.rgb,
-                                        handler.texture.texture,
-                                        pixelbuffer,
-                                    );
-                                    latency::on_frame_done(
-                                        latency_key,
-                                        latency::DecodedFrame {
-                                            pts: latency_pts,
-                                            dequeued: start,
-                                            decode_start,
+                                    // Present pacing: a stale frame is decoded (later frames
+                                    // reference it) but not handed to the UI.
+                                    let present = !pacer.enabled()
+                                        || pacer.should_present(
+                                            key_frame,
+                                            latency_pts,
+                                            video_queue.read().unwrap().len(),
                                             decode_end,
-                                            format,
-                                            gpu_texture: !pixelbuffer,
-                                        },
-                                        video_queue.read().unwrap().len(),
+                                        );
+                                    if present {
+                                        video_callback(
+                                            display,
+                                            &mut handler.rgb,
+                                            handler.texture.texture,
+                                            pixelbuffer,
+                                        );
+                                    }
+                                    let present_end = std::time::Instant::now();
+                                    let queue_len = video_queue.read().unwrap().len();
+                                    counters.decoded.fetch_add(1, Ordering::Relaxed);
+                                    counters.decode_us.fetch_add(
+                                        duration_us(decode_end - decode_start),
+                                        Ordering::Relaxed,
                                     );
+                                    if present {
+                                        counters.shown.fetch_add(1, Ordering::Relaxed);
+                                        if latency::ui_frame_lost() {
+                                            counters.ui_lost.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        counters.present_us.fetch_add(
+                                            duration_us(present_end - decode_end),
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    counters.queue_max.fetch_max(queue_len, Ordering::Relaxed);
+                                    let decoded_frame = latency::DecodedFrame {
+                                        pts: latency_pts,
+                                        dequeued: start,
+                                        decode_start,
+                                        decode_end,
+                                        format,
+                                        gpu_texture: !pixelbuffer,
+                                        paced: pacer.enabled(),
+                                    };
+                                    if present {
+                                        latency::on_frame_done(
+                                            latency_key,
+                                            decoded_frame,
+                                            queue_len,
+                                        );
+                                    } else {
+                                        latency::on_frame_skipped(
+                                            latency_key,
+                                            decoded_frame,
+                                            queue_len,
+                                        );
+                                    }
 
                                     // chroma
                                     if tmp_chroma.is_some() && last_chroma != tmp_chroma {
@@ -4108,16 +4698,29 @@ pub fn start_video_thread<F, T>(
                                     }
 
                                     // fps calculation
+                                    let busy = start.elapsed();
+                                    counters.on_decoded_busy(
+                                        busy,
+                                        !key_frame && warmup >= STEADY_WARMUP_FRAMES,
+                                        queue_len,
+                                    );
+                                    if warmup < STEADY_WARMUP_FRAMES {
+                                        warmup += 1;
+                                    }
                                     fps_calculate(
                                         &mut skip_beginning,
                                         &fps,
                                         format_changed,
-                                        start.elapsed(),
+                                        busy,
                                         &mut count,
                                         &mut duration,
                                     );
                                 }
+                                Ok(false) => {
+                                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                                }
                                 Err(e) => {
+                                    counters.failed.fetch_add(1, Ordering::Relaxed);
                                     // This is a simple workaround.
                                     //
                                     // I only see the following error:
@@ -4132,7 +4735,6 @@ pub fn start_video_thread<F, T>(
                                     log::error!("handle video frame error, {}", e);
                                     session.refresh_video(display as _);
                                 }
-                                _ => {}
                             }
                         }
 
@@ -4161,6 +4763,8 @@ pub fn start_video_thread<F, T>(
                         if let Some(handler) = video_handler.as_mut() {
                             handler.reset(None);
                         }
+                        pacer.reset();
+                        warmup = 0;
                     }
                     MediaData::RecordScreen(start) => {
                         let id = session.lc.read().unwrap().id.clone();
@@ -4184,7 +4788,11 @@ pub fn start_video_thread<F, T>(
 pub fn start_audio_thread() -> MediaSender {
     let (audio_sender, audio_receiver) = mpsc::channel::<MediaData>();
     std::thread::spawn(move || {
+        #[cfg(not(target_os = "linux"))]
+        ADAPTIVE_AUDIO_TARGET.with(|adaptive| adaptive.set(true));
         let mut audio_handler = AudioHandler::default();
+        #[cfg(not(target_os = "linux"))]
+        let mut audio_level = latency::AudioLevel::default();
         loop {
             #[cfg(target_os = "windows")]
             let received = audio_handler.receive_audio(&audio_receiver);
@@ -4194,6 +4802,8 @@ pub fn start_audio_thread() -> MediaSender {
                 match data {
                     MediaData::AudioFrame(af) => {
                         audio_handler.handle_frame(*af);
+                        #[cfg(not(target_os = "linux"))]
+                        audio_level.on_frame(audio_handler.take_level_sample());
                     }
                     MediaData::AudioFormat(f) => {
                         log::debug!("recved audio format, sample rate={}", f.sample_rate);

@@ -139,6 +139,13 @@ pub trait TraitCapturer {
     #[cfg(windows)]
     fn set_gdi(&mut self) -> bool;
 
+    /// How old the image of the last successful `frame()` was when the capturer got it (DXGI:
+    /// now minus its `LastPresentTime`). `None` for capturers that cannot tell.
+    #[cfg(windows)]
+    fn last_present_age(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice;
 

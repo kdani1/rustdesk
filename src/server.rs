@@ -91,6 +91,62 @@ pub struct ConnectionMeta {
     pub controlled_context: Option<ControlledContext>,
 }
 
+/// How an incoming session reached this host, for the `TRANSPORT host` line and the `via` of
+/// `LATENCY conn` (docs/LATENCY-METRICS.md). Logging only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportKind {
+    /// The controller connected to our listener after `FetchLocalAddr` (same network).
+    Intranet,
+    /// A TCP hole punch: the controller's connect met our listener, or our punch.
+    TcpPunch,
+    /// Direct IP access to the listening port.
+    Direct,
+    /// KCP over a punched UDP socket, IPv4.
+    KcpUdp,
+    /// KCP over a punched UDP socket, IPv6.
+    KcpIpv6,
+    WebRtc,
+    /// Through the relay server (hbbr).
+    Relay,
+}
+
+impl TransportKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Intranet => "Intranet",
+            Self::TcpPunch => "TCP-punch",
+            Self::Direct => "Direct",
+            Self::KcpUdp => "KCP-UDP",
+            Self::KcpIpv6 => "KCP-IPv6",
+            Self::WebRtc => "WebRTC",
+            Self::Relay => "Relay",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportInfo {
+    pub kind: TransportKind,
+    /// Extra context for the log: which side completed a TCP punch, the relay server.
+    pub detail: String,
+}
+
+impl TransportInfo {
+    pub fn new(kind: TransportKind) -> Self {
+        Self {
+            kind,
+            detail: String::new(),
+        }
+    }
+
+    pub fn with_detail(kind: TransportKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -198,7 +254,15 @@ async fn accept_connection_(
         stream.set_nodelay(true).ok();
         let stream_addr = stream.local_addr()?;
         if let Some(stream) = crate::common::host_session_stream(stream, stream_addr, addr).await {
-            create_tcp_connection(server, stream, addr, secure, meta).await?;
+            create_tcp_connection(
+                server,
+                stream,
+                addr,
+                secure,
+                meta,
+                TransportInfo::new(TransportKind::Intranet),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -210,6 +274,7 @@ pub async fn create_tcp_connection(
     addr: SocketAddr,
     secure: bool,
     meta: ConnectionMeta,
+    transport: TransportInfo,
 ) -> ResultType<()> {
     let mut stream = stream;
     // The address the connection layer keys on, whitelist and admission alike.
@@ -220,6 +285,18 @@ pub async fn create_tcp_connection(
     let Some(unauthorized) = admit_unauthorized(id, addr.ip()) else {
         bail!("too many unauthenticated connections from {}", addr.ip());
     };
+    log::info!(
+        "TRANSPORT host conn={} type={} peer={} secure={} detail={}",
+        id,
+        transport.kind.label(),
+        addr,
+        secure,
+        if transport.detail.is_empty() {
+            "-"
+        } else {
+            &transport.detail
+        }
+    );
     // Before the handshake, so its read is bounded too; lifted again at authorization.
     stream.set_max_packet_length(MAX_UNAUTHORIZED_MESSAGE);
     tokio::select! {
@@ -248,6 +325,7 @@ pub async fn create_tcp_connection(
         Arc::downgrade(&server),
         meta,
         unauthorized,
+        transport.kind,
     )
     .await;
     Ok(())
@@ -398,6 +476,7 @@ async fn create_relay_connection_(
     ipv4: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
+    let transport = TransportInfo::with_detail(TransportKind::Relay, relay_server.clone());
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
         CONNECT_TIMEOUT,
@@ -411,7 +490,7 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
-    create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
+    create_tcp_connection(server, stream, peer_addr, secure, meta, transport).await?;
     Ok(())
 }
 
