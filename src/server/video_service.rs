@@ -796,9 +796,11 @@ fn run(vs: VideoService) -> ResultType<()> {
     // M13: refreshes served by a forced key frame (enable-refresh-keyframe, read per refresh).
     #[cfg(windows)]
     let mut key_refresh = super::key_refresh::KeyRefresh::default();
-    // M14: re-encodes of the kept last image on a static screen.
+    // M14: re-encodes of the kept last image on a static screen, only on an encoder that runs
+    // with the small VBV (nvenc with `nvenc-vbv-frames` > 0): the two only go on together, and
+    // `enable-static-refine=N` turns both off (`nvenc_vbv_frames` is then 0).
     #[cfg(windows)]
-    let mut static_refine = super::key_refresh::StaticRefine::new(static_refine_enabled());
+    let mut static_refine = super::key_refresh::StaticRefine::new(encoder.small_vbv());
     #[cfg(windows)]
     if static_refine.enabled() {
         log::info!("static refine on");
@@ -948,15 +950,27 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
 
         frame_controller.reset();
+        // `wait` is sampled for captured frames only, not for kept-image and refine encodes.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut wait_sample = true;
 
         let time = now - start;
         let ms = (time.as_secs() * 1000 + time.subsec_millis() as u64) as i64;
-        let grab_begin = Instant::now();
-        let res = match c.frame(if dxgi_wait_margin {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut frame_timeout = if dxgi_wait_margin {
             dxgi_frame_timeout(spf)
         } else {
             spf
-        }) {
+        };
+        // A requested or deferred refresh key frame is due before the capturer's timeout.
+        #[cfg(windows)]
+        if let Some(due) = key_refresh.next_due(spf) {
+            frame_timeout = frame_timeout
+                .min(due.saturating_duration_since(Instant::now()))
+                .max(Duration::from_millis(1));
+        }
+        let grab_begin = Instant::now();
+        let res = match c.frame(frame_timeout) {
             Ok(frame) => {
                 let grab_done = Instant::now();
                 repeat_encode_counter = 0;
@@ -1025,7 +1039,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     #[cfg(windows)]
                     if let Some(encoded) = _encoded {
                         static_refine.on_frame(encoded);
-                        match key_refresh.on_encoded(encoded, Instant::now()) {
+                        match key_refresh.on_encoded(encoded, Instant::now(), false) {
                             Ok(true) if !send_conn_ids.is_empty() => {
                                 latency_stats.on_refresh_key_sent(false)
                             }
@@ -1129,7 +1143,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 bail_switch!("refresh_kept_failed");
                             }
                         };
-                        match key_refresh.on_encoded(encoded, now) {
+                        match key_refresh.on_encoded(encoded, now, true) {
                             Ok(_) => {
                                 static_refine.on_kept_key();
                                 if !send_conn_ids.is_empty() {
@@ -1142,6 +1156,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                             }
                         }
                         frame_controller.set_send(now, send_conn_ids);
+                        wait_sample = false;
                         send_counter += 1;
                     } else if !key_refresh.pending() && static_refine.on_idle(now) {
                         check_new_subscriber(&sp)?;
@@ -1158,8 +1173,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                         ) {
                             Ok((send_conn_ids, encoded)) => {
                                 latency_stats.on_refine();
-                                let _ = key_refresh.on_encoded(encoded, now);
+                                let _ = key_refresh.on_encoded(encoded, now, true);
                                 frame_controller.set_send(now, send_conn_ids);
+                                wait_sample = false;
                                 send_counter += 1;
                             }
                             Err(e) => {
@@ -1251,14 +1267,25 @@ fn run(vs: VideoService) -> ResultType<()> {
             }
         }
         latency_stats.on_wait(
-            !frame_controller.send_conn_ids.is_empty(),
+            wait_sample && !frame_controller.send_conn_ids.is_empty(),
             wait_begin.elapsed(),
         );
         DISPLAY_CONN_IDS.lock().unwrap().remove(&display_idx);
 
+        // A refresh key frame that is due before the end of this period cuts the sleep short.
+        #[cfg(windows)]
+        let refresh_due = key_refresh.next_due(spf);
+        #[cfg(not(windows))]
+        let refresh_due: Option<Instant> = None;
         if deadline_pacing {
             next_tick += spf;
             let now = Instant::now();
+            if let Some(due) = refresh_due {
+                if due < next_tick {
+                    // The schedule continues from the refresh deadline.
+                    next_tick = due.max(now);
+                }
+            }
             if now < next_tick {
                 latency_stats.on_sleep(next_tick - now);
                 std::thread::sleep(next_tick - now);
@@ -1277,8 +1304,14 @@ fn run(vs: VideoService) -> ResultType<()> {
             // may need to enable frame(timeout)
             log::trace!("{:?} {:?}", time::Instant::now(), elapsed);
             if elapsed < spf {
-                latency_stats.on_sleep(spf - elapsed);
-                std::thread::sleep(spf - elapsed);
+                let mut rest = spf - elapsed;
+                if let Some(due) = refresh_due {
+                    rest = rest.min(due.saturating_duration_since(Instant::now()));
+                }
+                if !rest.is_zero() {
+                    latency_stats.on_sleep(rest);
+                    std::thread::sleep(rest);
+                }
             }
         }
         latency_stats.tick(spf, deadline_pacing);
@@ -1673,13 +1706,6 @@ fn encode_kept_frame(
 #[cfg(windows)]
 fn refresh_keyframe_enabled() -> bool {
     Config::get_option(base::config::keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y"
-}
-
-// On exactly with a VBV smaller than FFmpeg's default: the two only go on together (roadmap
-// M14), and `enable-static-refine=N` turns both off (`nvenc_vbv_frames` is then 0).
-#[cfg(windows)]
-fn static_refine_enabled() -> bool {
-    scrap::codec::nvenc_vbv_frames() > 0
 }
 
 #[cfg(windows)]

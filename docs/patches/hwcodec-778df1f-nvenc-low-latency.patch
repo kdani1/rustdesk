@@ -990,25 +990,30 @@ index 68753c1..89e4b40 100644
  }
  
 diff --git a/src/vram/nv.rs b/src/vram/nv.rs
-index a78b9df..cb1b59b 100644
+index a78b9df..1751984 100644
 --- a/src/vram/nv.rs
 +++ b/src/vram/nv.rs
-@@ -6,7 +6,9 @@ include!(concat!(env!("OUT_DIR"), "/nv_ffi.rs"));
+@@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/nv_ffi.rs"));
  
  use crate::{
      common::DataFormat::*,
 -    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
 +    vram::inner::{
-+        encode_last_unsupported, DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext,
++        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
++        InnerDecodeContext, InnerEncodeContext,
 +    },
  };
  
  pub fn encode_calls() -> EncodeCalls {
-@@ -17,6 +19,8 @@ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,12 @@ pub fn encode_calls() -> EncodeCalls {
          test: nv_test_encode,
          set_bitrate: nv_set_bitrate,
          set_framerate: nv_set_framerate,
-+        request_keyframe: nv_request_keyframe,
++        // No forced keyframe until this driver has `encode_last` as well: RustDesk serves a
++        // refresh on a static screen from the kept image, so with only one of the two a refresh
++        // would wait for that deadline and then restart anyway. `nv_request_keyframe` stays for
++        // when `encode_last` is added.
++        request_keyframe: request_keyframe_unsupported,
 +        encode_last: encode_last_unsupported,
      }
  }

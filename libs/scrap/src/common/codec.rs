@@ -93,6 +93,12 @@ pub trait EncoderApi {
     fn encode_last(&mut self, _ms: i64) -> ResultType<VideoFrame> {
         bail!("encode_last not supported")
     }
+
+    /// This encoder was opened with a VBV smaller than FFmpeg's default (FFmpeg nvenc with
+    /// `nvenc-vbv-frames` > 0, roadmap M14). Static refine only runs on such an encoder.
+    fn small_vbv(&self) -> bool {
+        false
+    }
 }
 
 pub struct Encoder {

@@ -50,6 +50,8 @@ pub struct VRamEncoder {
     bitrate: u32,
     last_frame_len: usize,
     same_bad_len_counter: usize,
+    // Opened as FFmpeg nvenc with `nvenc-vbv-frames` > 0 (`small_vbv`).
+    small_vbv: bool,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -77,7 +79,12 @@ impl EncoderApi for VRamEncoder {
                         gop,
                     },
                 };
-                hwcodec::ffmpeg::set_nvenc_vbv_frames(crate::codec::nvenc_vbv_frames());
+                let vbv_frames = crate::codec::nvenc_vbv_frames();
+                hwcodec::ffmpeg::set_nvenc_vbv_frames(vbv_frames);
+                // hwcodec applies the VBV to the FFmpeg driver's nvenc only (`set_vbv`).
+                let small_vbv = vbv_frames > 0
+                    && config.feature.driver == Driver::FFMPEG
+                    && config.feature.vendor == Driver::NV;
                 match Encoder::new(ctx.clone()) {
                     Ok(encoder) => Ok(VRamEncoder {
                         encoder,
@@ -86,6 +93,7 @@ impl EncoderApi for VRamEncoder {
                         bitrate,
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
+                        small_vbv,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -158,6 +166,10 @@ impl EncoderApi for VRamEncoder {
 
     fn request_keyframe(&mut self) -> bool {
         self.encoder.request_keyframe().is_ok()
+    }
+
+    fn small_vbv(&self) -> bool {
+        self.small_vbv
     }
 
     fn encode_last(&mut self, ms: i64) -> ResultType<VideoFrame> {

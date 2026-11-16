@@ -76,7 +76,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkey` | Windows host, `enable-refresh-keyframe=Y`: refreshes served by a forced key frame on the running encoder (no restart), counted when the key frame reached at least one connection. Their gaps are in `gap` and in `LATENCY switch` lines with `reason=refresh_keyframe restarts=0`. |
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
-| `refine` | static refine (on with `nvenc-vbv-frames` > 0): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`. |
+| `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
 `rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
@@ -95,11 +95,14 @@ three are off by default in this build.
   login) then asks the running encoder for a key frame instead of restarting capturer and encoder
   (`SWITCH`). Stock viewers recover on any key-flagged frame, so nothing changes on the wire.
   Encoders: FFmpeg `hevc_nvenc`/`h264_nvenc` (VRAM and RAM): `pict_type I` with `forced-idr=1`;
-  direct NVENC SDK: `NV_ENC_PIC_FLAG_FORCEIDR | OUTPUT_SPSPPS`; VP8/VP9/AV1: `FORCE_KF`. AMF, QSV,
-  MFX keep the restart (`reason=refresh_unsupported`). Still a restart: a real display change
+  VP8/VP9/AV1: `FORCE_KF`. AMF, QSV, MFX and the direct NVENC SDK VRAM driver (which has no
+  `encode_last` for a static screen) keep the restart (`reason=refresh_unsupported`). Still a restart: a real display change
   (`display_changed`), a pending screenshot (`refresh_screenshot`), and the escalations:
   - `refresh_escalated`: a refresh after 3 refreshes were served by key frames within 3 s (log
     line `refresh escalated to SWITCH`; should stay about 0),
+  - `refresh_kept_again`: a refresh 200 ms to 3 s after the previous one was served from the
+    kept image, with no new captured image since (same log line). The kept image cannot show a
+    stalled capturer, so a second Refresh in the session menu restarts it as before,
   - `refresh_no_key`: the encode after the request had no key frame,
   - `refresh_kept_failed`: static screen, and the kept image could not be encoded (the driver
     keeps none; before the run encoded its first frame the request waits for that frame, a key
@@ -109,7 +112,10 @@ three are off by default in this build.
   Refreshes while a key frame is pending merge into it; one that comes less than 200 ms after a
   key frame went out waits for the 200 ms (`rmerge`), once the encoder took a key frame request in
   this run (before that the refresh asks at once, so an encoder without forced key frames restarts
-  without the wait). Forced key frame and kept-image encode
+  without the wait). While a key frame is requested or deferred, the capturer's wait and the
+  loop's sleep end at its deadline (kept image, end of the 200 ms), so at a low frame rate the
+  kept-image key frame still comes about 100 ms after the request, not after a whole frame
+  period. Forced key frame and kept-image encode
   failures never count as encode failures and never turn the hardware encoder off.
 - **`nvenc-vbv-frames`** (number, empty or `0` = FFmpeg's default VBV; read when an encoder is
   created). nvenc `rc_buffer_size` = N × bitrate / encoder frame rate, at open and after every
@@ -117,12 +123,13 @@ three are off by default in this build.
   IDR). The encoder frame rate is the one NVENC was opened with: 30 on the VRAM and RAM paths
   today, while the loop runs at up to 60, so N = 1 is one NVENC frame budget, about two real
   frames at 60 fps (until the encoder is opened at the real frame rate). `ldkfs` is left at
-  NVENC's default (1 with `tune=ull`). Turns static refine on: the two only go on together
-  (roadmap M14).
+  NVENC's default (1 with `tune=ull`). Turns static refine on for FFmpeg nvenc encoders: the two
+  only go on together (roadmap M14); another encoder (VP9/AV1, AMF, QSV, the NVENC SDK driver)
+  gets neither.
 - **`enable-static-refine`** (`N` turns static refine and the VBV off together, so
   `nvenc-vbv-frames` is then ignored; any other value changes nothing, refine is on exactly when
-  `nvenc-vbv-frames` > 0; read when the capture loop starts, the VBV part when an encoder is
-  created): see `refine` above.
+  the running encoder got the VBV of `nvenc-vbv-frames` > 0; read when an encoder is created):
+  see `refine` above.
 
 Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL]`, `[FFMPEG_VRAM_ENC]` or `[FFMPEG_RAM_ENC]`):
 
