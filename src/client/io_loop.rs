@@ -109,6 +109,9 @@ pub struct Remote<T: InvokeUiSession> {
     cursor_dedupe: CursorDedupe,
     // Fork-only UDP video lane, shadow probe (docs/UDP-VIDEO.md).
     udp_video: crate::udp_video::viewer::ViewerLane,
+    // Fork-only per-frame video feedback (M23): set from the host's PeerInfo of each round when
+    // it advertised Features.video_feedback.
+    video_feedback: Option<crate::video_feedback::viewer::Collector>,
 }
 
 #[derive(Default)]
@@ -166,6 +169,7 @@ impl<T: InvokeUiSession> Remote<T> {
             sent_close_reason: false,
             cursor_dedupe: Default::default(),
             udp_video: Default::default(),
+            video_feedback: None,
         }
     }
 
@@ -308,6 +312,8 @@ impl<T: InvokeUiSession> Remote<T> {
                     && !peer.is_webrtc())
                 .then(|| peer.local_addr());
                 let mut udp_rx = self.udp_video.begin_round(&self.handler.get_id(), udp_local);
+                // Per-frame feedback is decided again by this round's PeerInfo.
+                self.video_feedback = None;
 
                 let _keep_it = client::hc_connection(feedback, rendezvous_server, token).await;
                 let mut last_recv_time = Instant::now();
@@ -340,6 +346,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                         // An ACTIVE marker or a SwitchDisplay may have released
                                         // held UDP frames.
                                         self.feed_udp_video(&mut peer).await;
+                                        self.flush_video_feedback(&mut peer).await;
                                     }
                                 }
                             } else {
@@ -365,6 +372,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 allow_err!(peer.send(&msg).await);
                             }
                             self.feed_udp_video(&mut peer).await;
+                            self.flush_video_feedback(&mut peer).await;
                         }
                         _msg = rx_clip_client.recv() => {
                             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -435,6 +443,16 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                             if let Some(msg) = self.udp_video.tick() {
                                 allow_err!(peer.send(&msg).await);
+                            }
+                            // The decode of the last frames of a burst, on a screen that went
+                            // static, is reported here at the latest.
+                            self.flush_video_feedback(&mut peer).await;
+                            if let Some(fb) = self.video_feedback.as_mut() {
+                                if client::latency::is_log_enabled() {
+                                    if let Some(line) = fb.take_window(std::time::Instant::now(), Duration::from_secs(5)) {
+                                        log::info!("VFB viewer {line}");
+                                    }
+                                }
                             }
                             let elapsed = fps_instant.elapsed().as_millis();
                             if elapsed < 1000 {
@@ -2005,7 +2023,8 @@ impl<T: InvokeUiSession> Remote<T> {
 
     /// A video frame from the session stream or, in live mode, from the UDP video lane: the
     /// same decoder queue, pacer, fps control and latency stats either way.
-    async fn handle_video_frame(&mut self, vf: VideoFrame, peer: &mut Stream) {
+    async fn handle_video_frame(&mut self, vf: VideoFrame, peer: &mut Stream, udp: bool) {
+        let arrived = std::time::Instant::now();
         if !self.first_frame {
             self.first_frame = true;
             self.handler.close_success();
@@ -2024,6 +2043,10 @@ impl<T: InvokeUiSession> Remote<T> {
         };
         client::latency::on_received(client::latency::stream_key(&thread.video_queue), &vf);
         thread.counters.on_received();
+        if let Some(fb) = self.video_feedback.as_mut() {
+            let queue_len = thread.video_queue.read().unwrap().len();
+            fb.on_arrival(&vf, arrived, queue_len, udp);
+        }
         let key_frame = Self::contains_key_frame(&vf);
         thread.pacing.on_received(&vf, key_frame);
         if key_frame {
@@ -2078,7 +2101,48 @@ impl<T: InvokeUiSession> Remote<T> {
             self.data_count.fetch_add(bytes, Ordering::Relaxed);
         }
         while let Some(vf) = self.udp_video.next_ready() {
-            self.handle_video_frame(vf, peer).await;
+            self.handle_video_frame(vf, peer, true).await;
+        }
+    }
+
+    /// Sends the per-frame feedback batch (M23) when one is due and has something in it.
+    async fn flush_video_feedback(&mut self, peer: &mut Stream) {
+        let Some(fb) = self.video_feedback.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if !fb.due(now) {
+            return;
+        }
+        let (counts, lost) = self.udp_video.take_feedback();
+        fb.on_udp(&counts, &lost);
+        let done = self
+            .video_threads
+            .iter()
+            .map(|(display, t)| (*display as i32, t.counters.feedback.take()))
+            .filter(|(_, d)| !d.is_empty())
+            .collect();
+        if let Some(msg) = fb.build(now, done) {
+            allow_err!(peer.send(&msg).await);
+        }
+    }
+
+    /// After the host's PeerInfo: per-frame feedback for this round, if the host asks for it
+    /// (Features.video_feedback) and this viewer sends it.
+    fn setup_video_feedback(&mut self, pi: &PeerInfo) {
+        let host_version = pi.features.as_ref().map_or(0, |f| f.video_feedback);
+        let on = self.handler.is_default()
+            && crate::video_feedback::viewer::enabled(host_version);
+        if host_version > 0 {
+            log::info!(
+                "VFB viewer host_version={} sending={}",
+                host_version,
+                on
+            );
+        }
+        self.video_feedback = on.then(|| crate::video_feedback::viewer::Collector::new(std::time::Instant::now()));
+        for t in self.video_threads.values() {
+            t.counters.feedback.set_on(on);
         }
     }
 
@@ -2089,7 +2153,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     // After a live UDP video lane, a display whose UDP frames did not all
                     // arrive restarts on TCP from a key frame.
                     if self.udp_video.on_tcp_frame(&vf) {
-                        self.handle_video_frame(vf, peer).await;
+                        self.handle_video_frame(vf, peer, false).await;
                     }
                 }
                 Some(message::Union::Hash(hash)) => {
@@ -2115,6 +2179,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         let peer_version = pi.version.clone();
                         let peer_platform = pi.platform.clone();
                         self.set_peer_info(&pi);
+                        self.setup_video_feedback(&pi);
                         if self.handler.is_view_camera() {
                             if !self.check_view_camera_support(&peer_version, &peer_platform) {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
@@ -3233,6 +3298,7 @@ impl<T: InvokeUiSession> Remote<T> {
         let frame_count = Arc::new(RwLock::new(0));
         let discard_queue = Arc::new(RwLock::new(false));
         let counters: Arc<client::VideoCounters> = Default::default();
+        counters.feedback.set_on(self.video_feedback.is_some());
         let pacing = Arc::new(client::PresentPacing::new());
         let video_thread = VideoThread {
             video_queue: video_queue.clone(),

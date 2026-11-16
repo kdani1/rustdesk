@@ -48,6 +48,7 @@ use base::{
         UdpVideoFeedback, UdpVideoOffer, VideoFrame,
     },
 };
+use crate::video_feedback::viewer::{LostRange, UdpCounts};
 use hbb_common::{
     config::LocalConfig, log, protobuf::Message as _, rendezvous_proto::ConnType, tokio::sync::mpsc,
 };
@@ -79,6 +80,8 @@ const HOLD_MAX: usize = 32;
 /// Live: a display broken this long after a loss (no key frame), or frames waiting this long
 /// for ACTIVE, and the viewer asks the host to stop the lane.
 pub const WATCHDOG: Duration = Duration::from_secs(1);
+/// Loss ranges kept for the per-frame feedback between two batches (a batch carries 16).
+const FEEDBACK_LOST_MAX: usize = 32;
 /// Live: while a display waits for a key frame, the request is repeated this long after the
 /// last one (the key frame or its request may be lost too). Losses in between ask nothing: the
 /// key frame already asked for repairs them. About 2.5x the usual request-to-IDR time on a LAN.
@@ -162,6 +165,9 @@ pub enum ViewerEvent {
     /// Live: every `ACK_EVERY` (50 ms) while the lane is up; the io_loop repeats key frame
     /// requests on it.
     Tick,
+    /// Live: the receiver's loss counters since the previous one, right before a `Tick` when
+    /// any changed; the per-frame feedback (M23) reports them.
+    Counts(UdpCounts),
     /// Live: the thread gave up on the lane (silence, socket errors) and stopped.
     Failed(String),
     Window(Box<RecvWindow>),
@@ -351,6 +357,10 @@ fn recv_loop(
     let mut errors_in_row = 0u32;
     let mut last_heard = started;
     let mut acks: Vec<AckState> = Vec::new();
+    // Feedback (M23): the receiver's counters at the last `Counts`, and what a window reset
+    // took since then.
+    let mut fb_prev = UdpCounts::default();
+    let mut fb_carry = UdpCounts::default();
     let send = |lane_tx: &mut LaneSender, inner: &Inner| {
         if let Ok(d) = lane_tx.seal(inner) {
             let _ = socket.send(&d);
@@ -560,13 +570,25 @@ fn recv_loop(
                 send(&mut lane_tx, &Inner::Ack(ack));
                 win.acks += 1;
             }
-            if periodic && tx.send(ViewerEvent::Tick).is_err() {
-                return;
+            if periodic {
+                let cur = udp_counts(lane_rx.reassembler().stats());
+                let mut delta = cur.minus(&fb_prev);
+                delta.add(&fb_carry);
+                fb_prev = cur;
+                fb_carry = UdpCounts::default();
+                if !delta.is_zero() && tx.send(ViewerEvent::Counts(delta)).is_err() {
+                    return;
+                }
+                if tx.send(ViewerEvent::Tick).is_err() {
+                    return;
+                }
             }
         }
         let now = Instant::now();
         if now.duration_since(win_start) >= WINDOW {
             let (loss, drops) = lane_rx.take_stats();
+            fb_carry.add(&udp_counts(&loss).minus(&fb_prev));
+            fb_prev = UdpCounts::default();
             win.loss = loss;
             win.drops = drops;
             win.span = now.duration_since(win_start);
@@ -578,6 +600,18 @@ fn recv_loop(
                 return;
             }
         }
+    }
+}
+
+/// The counters the per-frame feedback reports, from the receiver's window statistics.
+fn udp_counts(s: &LossStats) -> UdpCounts {
+    UdpCounts {
+        datagrams_expected: s.datagrams_expected,
+        datagrams_received: s.datagrams_received,
+        frames_completed: s.frames_completed,
+        frames_lost: s.frames_lost,
+        fec_recovered: s.fec_recovered,
+        fec_unrecoverable: s.fec_unrecoverable,
     }
 }
 
@@ -716,6 +750,10 @@ pub struct ViewerLane {
     ready: VecDeque<VideoFrame>,
     udp_bytes: usize,
     stats: LiveStats,
+    /// For the per-frame feedback (M23): receiver counters and loss ranges since
+    /// `take_feedback`, the ranges bounded by `FEEDBACK_LOST_MAX`.
+    fb_counts: UdpCounts,
+    fb_lost: Vec<LostRange>,
 }
 
 impl ViewerLane {
@@ -732,6 +770,8 @@ impl ViewerLane {
         self.tcp_await_key.clear();
         self.ready.clear();
         self.stats = LiveStats::default();
+        self.fb_counts = UdpCounts::default();
+        self.fb_lost.clear();
         self.matcher = ShadowMatcher::default();
         self.peer = peer.to_owned();
         self.round = Some(Round { local, tx });
@@ -1056,6 +1096,14 @@ impl ViewerLane {
             } => {
                 let now = Instant::now();
                 let l = self.live.as_mut()?;
+                if self.fb_lost.len() < FEEDBACK_LOST_MAX {
+                    self.fb_lost.push(LostRange {
+                        display,
+                        from,
+                        to,
+                        repaired,
+                    });
+                }
                 if repaired {
                     // The key frame behind it is the display's next event.
                     self.stats.lost_fixed += 1;
@@ -1071,6 +1119,10 @@ impl ViewerLane {
                 self.next_request(lane_id, now)
             }
             ViewerEvent::Tick => self.next_request(lane_id, Instant::now()),
+            ViewerEvent::Counts(c) => {
+                self.fb_counts.add(&c);
+                None
+            }
             ViewerEvent::Failed(why) => self.request_stop(&why),
             ViewerEvent::Window(w) => {
                 self.log_window(lane_id, *w);
@@ -1148,6 +1200,15 @@ impl ViewerLane {
     #[inline]
     pub fn next_ready(&mut self) -> Option<VideoFrame> {
         self.ready.pop_front()
+    }
+
+    /// The per-frame feedback's share (M23): receiver counters and loss ranges since the last
+    /// call.
+    pub fn take_feedback(&mut self) -> (UdpCounts, Vec<LostRange>) {
+        (
+            std::mem::take(&mut self.fb_counts),
+            std::mem::take(&mut self.fb_lost),
+        )
     }
 
     /// Bytes of live frames received since the last call (the session's kB/s).
@@ -1634,6 +1695,23 @@ mod latency_tests {
         assert!(lane.on_event(ViewerEvent::Tick).is_some());
         assert!(lane.on_event(ViewerEvent::Tick).is_none());
         assert_eq!(lane.stats.kf_req, 2);
+        // The per-frame feedback (M23) gets every range, repaired or not, and the counters.
+        let counts = UdpCounts {
+            datagrams_expected: 10,
+            datagrams_received: 9,
+            ..Default::default()
+        };
+        assert!(lane.on_event(ViewerEvent::Counts(counts)).is_none());
+        let (c, ranges) = lane.take_feedback();
+        assert_eq!(c, counts);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|r| (r.from, r.to, r.repaired))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, true), (3, 4, false), (6, 6, false)]
+        );
+        assert!(lane.take_feedback().1.is_empty());
         // The key frame ends the wait; a new loss then asks at once.
         lane.on_live_frame(live_frame(0, 7, 0, true));
         assert_eq!(ready_ids(&mut lane), vec![7]);

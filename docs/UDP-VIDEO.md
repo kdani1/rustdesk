@@ -7,8 +7,12 @@ sends a copy of every Nth video frame over it and the viewer only measures it. I
 control, input, audio, cursor and clipboard stay on the session stream (TCP), and any trouble
 puts the video back on TCP in the same session. Since M21 every frame carries Reed-Solomon
 parity (20% by default, `udp-video-fec-percent`) when the viewer speaks lane v4, so scattered
-losses are repaired on arrival instead of costing a key frame. Off by default on the host. Roadmap:
-`PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), M24 (internet).
+losses are repaired on arrival instead of costing a key frame. Since M23 a fork viewer can send
+per-frame feedback (arrival, decode and present times, UDP losses) over the session stream on any
+transport; the host measures the one-way queueing delay from it and, when told to, uses it for
+QoS, an adaptive FEC level and the lane's fallback (see "Per-frame feedback (M23)"). Off by
+default on the host. Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21
+(FEC), M23 (feedback), M24 (internet).
 
 ## What exists
 
@@ -24,6 +28,8 @@ losses are repaired on arrival instead of costing a key frame. Off by default on
 | `src/udp_video/host.rs` | Offer gate, `UdpVideoHost` (socket, receive and sender threads, send window, QoS signal), `VideoTap` (routing, ACTIVE/STOP markers) |
 | `src/udp_video/viewer.rs` | Offer check, `UdpVideoClient` (socket, receive thread, ACKs), `ViewerLane` (io_loop state: hold, epochs, key frame requests, watchdog) |
 | `src/udp_video/shadow.rs` | Pairing of UDP and TCP copies by pts, window statistics |
+| `src/video_feedback/viewer.rs` | Per-frame feedback, viewer: `Collector` (batches), `DoneLog` (the video thread's hook), `UdpCounts` (M23) |
+| `src/video_feedback/host.rs` | Per-frame feedback, host: `SendLog`, `Estimator` (q_owd, GCC trendline, jitter, loss), `FeedbackInput` / `FeedbackSink` (the seam to the fast ABR), `LegacyQos`, `FecAdapt`, `ConnFeedback` (M23) |
 
 Hooks: `libs/base/protos/message.proto` (negotiation), `src/client.rs` `create_login_msg`
 (advertise), `src/client/io_loop.rs` (offer, control, the lane's `select!` branch, the TCP
@@ -182,7 +188,10 @@ frame.
 
 Tag plan of the fork: Misc 1001 `pointer_captured`; the lane uses LoginRequest 1001 and Misc
 1002 (`UdpVideoOffer`, field 10 `fec_percent` since M21), 1003 (`UdpVideoControl`) and 1004
-(`UdpVideoFeedback`, M20); the next free Misc tag is 1005.
+(`UdpVideoFeedback`, M20); the per-frame feedback (M23) uses Features 1001 (`video_feedback`)
+and Misc 1005 (`VideoFeedback`). Next free: Misc 1006, Features 1002, LoginRequest 1002. The fast
+ABR design's own plan (Features 1001 / Misc 1002 for the feedback) is superseded by this one:
+Misc 1002 was taken by the lane.
 
 1. **Viewer -> host:** `LoginRequest.udp_video_version` (1001), set by a Windows viewer for
    remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 by the
@@ -501,8 +510,132 @@ key frame, no request and no wait.
 
 ### Left out of M21
 
-- **Adaptive FEC** (`clamp(10, 50, 2 x loss% + 5)` from feedback): needs the per-frame loss
-  feedback of M23; the percentage is fixed per lane.
+- **Adaptive FEC** (`clamp(10, 50, 2 x loss% + 5)` from feedback): done in M23
+  (`udp-video-fec-adaptive`), see "Per-frame feedback (M23)".
 - **Recovered-frame count on the host**: the ACK layout is fixed (an M20 host rejects a longer
   ACK), so `fec_rec` is in the viewer's window line only; the host sees fewer `vlost`.
 - **More than 4 blocks per frame**: very large frames get less parity instead (see layout).
+
+## Per-frame feedback (M23)
+
+The viewer tells the host what happened to every video frame, over the session stream (the
+reliable channel), on any transport: direct TCP, KCP, relay, WebRTC, and the UDP lane. This is
+the feedback channel of the roadmap's [ABR] step 8 and [UDP] step 6: it shows queueing on the
+relay-to-viewer leg and inside the viewer, which neither TestDelay nor the host's TCP meter
+sees, and it carries the lane's losses to the host's QoS and FEC.
+
+### Negotiation and compatibility
+
+- **Host -> viewer:** `PeerInfo.features.video_feedback` (Features 1001) = 1, set by a Windows
+  host with `enable-video-feedback=Y` for remote-control logins (not file transfer, terminal,
+  camera or port forward). Stock and older fork viewers ignore the field.
+- **Viewer -> host:** `Misc.video_feedback` (1005, `VideoFeedback`), sent only by a Windows
+  viewer with `enable-video-feedback` not `N`, only after such a PeerInfo, decided again at every
+  login. A stock host never advertises, so it never receives one; an older fork host neither.
+- Nothing else changes on the wire. The existing `UdpVideoFeedback` (1004) key frame request
+  stays the immediate per-loss NACK (sent at once on the loss, repeated every 250 ms); the batch
+  only reports the same ranges for statistics.
+
+### What the viewer sends
+
+`VideoFeedback { seq, sent_us, frames[], done[], lost[], udp, dropped }`, times in microseconds
+on the viewer's feedback clock (started at the login; only differences mean anything):
+
+- `frames`: one `VideoFeedbackFrame { display, pts, arrival_us, bytes, queue_len, udp }` per
+  frame that entered the decoder path (`handle_video_frame`, TCP and UDP alike; TCP right after
+  the parse). `pts` is the largest pts of the frame's encoded frames, the key both ends match by.
+- `done`: one `VideoFeedbackDone { display, pts, decode_us, present_us }` per decoded frame, both
+  relative to its arrival; `present_us` 0 = present pacing did not hand it to the UI. The video
+  thread writes each display's `DoneLog` (one relaxed load per frame while off); a frame seen
+  arriving before feedback started is left out.
+- `lost`: the lane's loss ranges `{ display, from, to, repaired }` (lane frame ids).
+- `udp`: the lane receiver's counters since the previous batch (datagrams expected / received,
+  frames completed / lost, FEC recovered / unrecoverable), taken by the receive thread every
+  50 ms (`ViewerEvent::Counts`) as deltas of its window statistics.
+- Rate limit: a batch at most every 50 ms, only when something is in it, flushed after a message
+  or a lane event was handled and on the 1 s status tick; at most 64 frames, 64 done entries and
+  16 ranges per batch, the rest counted in `dropped`. At 60 fps about 20 batches of about 60 B
+  per second.
+
+### What the host does with it
+
+`SendLog` (shared with the split writer) records `(display, pts, time, bytes, udp)` of every
+video item as it leaves the video channel: right before the TCP write, or before the lane's
+queue and pacer. `Estimator` (one per connection) takes each batch (at most 40 per second; more
+are dropped and counted) and produces a `FeedbackInput`:
+
+| Field | Meaning |
+|---|---|
+| `q_owd_ms` / `q_owd_max_ms` | per-frame one-way delay (viewer arrival - host send, clock offset included) minus its lowest value over the last 10 s (1 s buckets); the batch's smallest and largest. The smallest is the queue: a large frame's own transmission time does not count (the fast ABR's `min(Q) over 100 ms` idea) |
+| `trend`, `threshold`, `usage` | GCC (draft-ietf-rmcat-gcc-02, the defaults of WebRTC's `TrendlineEstimator` and `OveruseDetector`): delay gradient per frame, accumulated, smoothed 0.9, slope over 20 frames x min(n, 60) x 4; adaptive threshold from 12.5 (k_up 0.0087, k_down 0.039, 6..600); overuse after more than 10 ms and two samples above it with a rising trend |
+| `jitter_ms` | RFC 3550 style, gain 1/16 |
+| `recv_kbps` | the batch's frame bytes over their arrival span (from the previous batch's last arrival) |
+| `viewer_ms`, `decode_ms`, `queue_len` | the viewer's own delay (largest of the batch) and decoder queue |
+| `udp`, `loss`, `frame_loss` | UDP lane: datagram loss and frame loss after FEC over the last 1 s |
+| `fec_recovered`, `lost_frames` | UDP lane, this batch |
+
+Clocks: the viewer's clock is never compared with the host's directly. Drift between the two
+(tens of ppm) moves the 10 s minimum by well under a millisecond.
+
+Uses in this build, each behind its own host option (all off by default):
+
+- **QoS** (`video-feedback-qos=Y`, `LegacyQos`): the delay sample video_qos gets from each
+  TestDelay (or the live lane's sample, see "QoS signal") becomes `max(sample, q_owd)`, `q_owd`
+  being the largest batch value since the previous sample, plus `LOSS_PENALTY_MS` (150) when the
+  lane's datagram loss over 1 s went above 10% (the threshold of GCC's loss controller). Frame
+  losses after FEC already add the penalty through the lane's own sample.
+- **Adaptive FEC** (`udp-video-fec-adaptive=Y`, `FecAdapt`): for a live lane that has parity
+  (viewer lane v4, `udp-video-fec-percent` not 0) the percentage follows
+  `clamp(10, 50, 2 x loss% + 5)` of the datagram loss over 1 s: raised at once, lowered after
+  2 s below. The sender thread reads it per frame (`Shared::fec_now`); the viewer needs nothing,
+  every datagram carries its block's parity count. A new lane starts from the configured value.
+- **Fallback** (`video-feedback-qos=Y`): a live lane that loses more than 10% of its frames
+  after FEC over 3 s (at least 30 frames) goes back to TCP (`udp_video_stop`, with the same retry
+  backoff as the other reasons). The existing rules (4 key frames in 5 s, silence, socket
+  errors) stay.
+
+### Seam to the fast ABR (M15/M16, the `rate` stream)
+
+The fast estimator (`src/server/video_qos/fast.rs` on `feature/b3-rate`) takes TCP meter samples
+through `FastEstimator::on_tcp(TcpInput)`. The feedback is its second input, defined here so
+the merge only has to connect them:
+
+```rust
+// src/video_feedback/host.rs
+pub struct FeedbackInput { pub at: Instant, pub frames: u32, pub q_owd_ms: Option<f64>,
+    pub q_owd_max_ms: Option<f64>, pub trend: f64, pub threshold: f64, pub usage: Usage,
+    pub jitter_ms: f64, pub recv_kbps: Option<f64>, pub viewer_ms: Option<f64>,
+    pub decode_ms: Option<f64>, pub queue_len: u32, pub udp: bool, pub loss: Option<f64>,
+    pub frame_loss: Option<f64>, pub fec_recovered: u64, pub lost_frames: u64 }
+pub trait FeedbackSink { fn on_feedback(&mut self, input: &FeedbackInput); }
+// ConnFeedback::sinks: Vec<Box<dyn FeedbackSink + Send>>, called for every batch.
+```
+
+At the merge:
+
+1. `impl FeedbackSink` for a small adapter holding the connection's `Arc<ConnFastAbr>`; its
+   `on_feedback` forwards to a new `FastEstimator::on_feedback(&FeedbackInput)` under the
+   estimator's lock (the Connection task calls it, as it calls `on_dequeue` and `on_sent`).
+2. In `Connection`, right after `video_feedback` is created at PeerInfo, push that adapter into
+   `ConnFeedback::sinks`.
+3. In the estimator: `Q = max(existing terms, q_owd_ms)`; `usage == Overuse` counts as the
+   delay-based overuse signal on transports without a meter (relay, KCP, WebRTC); `recv_kbps` is
+   a delivered-rate sample (`R_acked`) where the meter has none; `loss > 0.10` cuts by
+   `(1 - 0.5 x loss)` and `loss < 0.02` allows the increase (GCC's loss controller); a large
+   `viewer_ms` with a small `q_owd` is the RECEIVER_LIMITED case (the viewer, not the network:
+   no bitrate cut).
+4. With `enable-fast-abr` live, `LegacyQos` steps aside (`ConnFeedback::qos_delay` only while the
+   fast loop is off), so video_qos is not fed the same delay twice.
+
+### Left out of M23
+
+- **Feedback-driven RFI**: the per-loss request stays the key frame request of M20 (RFI is M22,
+  hwcodec-dependent).
+- **Per-frame NACK with retransmission**: a lost UDP frame is repaired by FEC or a key frame,
+  never resent (a resend arrives too late for a 60 fps stream on the LAN).
+- **The fast ABR itself on this stream**: only the seam; `LegacyQos` is what this build uses.
+- **Feedback over the UDP lane**: the batches ride the session stream, so they still arrive
+  when the lane fails, which is what the fallback needs.
+- **Pacing or bitrate decisions from `trend` in this build**: `usage` is logged and handed to
+  the sinks; `LegacyQos` uses only `q_owd` and loss. The roadmap gate (a throttled
+  hbbr-to-viewer leg) decides how much more the signal is worth.

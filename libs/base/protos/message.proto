@@ -107,6 +107,11 @@ message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
   bool port_forward_mux = 3;
+  // Fork-only (docs/UDP-VIDEO.md, "Per-frame feedback (M23)"): the version of per-frame video
+  // feedback (Misc.video_feedback) this host takes, 0 or absent = none. Set only by a fork host
+  // with enable-video-feedback=Y for remote control. Stock viewers ignore it; stock hosts never
+  // set it, so a fork viewer never sends feedback to them.
+  uint32 video_feedback = 1001;
 }
 
 message CodecAbility {
@@ -888,10 +893,14 @@ message Misc {
     bool pointer_captured = 1001;
     // Fork-only UDP video lane (docs/UDP-VIDEO.md). Sent only to a peer that advertised
     // LoginRequest.udp_video_version; a stock peer parses an unknown tag as no union and ignores
-    // it. Fork tag plan: 1001 pointer_captured, 1002-1004 the UDP lane, next free 1005.
+    // it. Fork tag plan: 1001 pointer_captured, 1002-1004 the UDP lane, 1005 per-frame video
+    // feedback (M23), next free 1006. Features: 1001 video_feedback, next free 1002.
     UdpVideoOffer udp_video_offer = 1002;
     UdpVideoControl udp_video_control = 1003;
     UdpVideoFeedback udp_video_feedback = 1004;
+    // Fork-only, viewer -> host (M23): sent only to a host that advertised
+    // Features.video_feedback; a stock host never advertises, so it never gets one.
+    VideoFeedback video_feedback = 1005;
   }
 }
 
@@ -965,6 +974,66 @@ message UdpVideoLastFrame {
 
 // Fork-only, viewer -> host over the session stream, live mode: frames of a display were lost
 // on the lane; the viewer shows nothing of that display until a key frame.
+// Fork-only, viewer -> host over the session stream (M23, docs/UDP-VIDEO.md "Per-frame
+// feedback"): what happened to the video frames since the previous batch. At most one batch
+// per 50 ms, only while there is something to report. Times are microseconds on the viewer's
+// feedback clock (it starts when the viewer reads the host's PeerInfo); only differences mean
+// anything, the host never compares them with its own clock directly.
+message VideoFeedback {
+  // Batch counter from 0 for the session, wrapping.
+  uint32 seq = 1;
+  // Viewer clock when the batch was built.
+  uint64 sent_us = 2;
+  // Frames that arrived (parsed from the session stream, or released by the UDP lane), in
+  // arrival order.
+  repeated VideoFeedbackFrame frames = 3;
+  // Frames the decoder finished since the previous batch (reported once each).
+  repeated VideoFeedbackDone done = 4;
+  // UDP lane: frame ranges declared lost.
+  repeated VideoFeedbackLost lost = 5;
+  // UDP lane: the receiver's counters since the previous batch; absent without a live lane.
+  VideoFeedbackUdp udp = 6;
+  // Entries left out because a batch carries at most 64 frames, 64 done and 16 lost.
+  uint32 dropped = 7;
+}
+message VideoFeedbackFrame {
+  int32 display = 1;
+  // The frame's pts (the largest of its encoded frames), the key the host matches.
+  int64 pts = 2;
+  uint64 arrival_us = 3;
+  // Encoded bytes of the frame.
+  uint32 bytes = 4;
+  // The display's decoder queue length when it arrived.
+  uint32 queue_len = 5;
+  // Came over the UDP video lane.
+  bool udp = 6;
+}
+message VideoFeedbackDone {
+  int32 display = 1;
+  int64 pts = 2;
+  // From arrival to the end of the decode.
+  uint32 decode_us = 3;
+  // From arrival to the end of the hand-over to the UI; 0 = not shown (present pacing).
+  uint32 present_us = 4;
+}
+message VideoFeedbackLost {
+  int32 display = 1;
+  // Lane frame ids, inclusive, wrapping.
+  uint32 from = 2;
+  uint32 to = 3;
+  // A key frame right behind the loss repaired it; no request went out.
+  bool repaired = 4;
+}
+message VideoFeedbackUdp {
+  // Sequence span and datagrams that opened (the lane's whole receive side).
+  uint64 datagrams_expected = 1;
+  uint64 datagrams_received = 2;
+  uint64 frames_completed = 3;
+  uint64 frames_lost = 4;
+  // Frames delivered only thanks to FEC, and frames FEC could not save.
+  uint64 fec_recovered = 5;
+  uint64 fec_unrecoverable = 6;
+}
 message UdpVideoFeedback {
   uint64 lane_id = 1;
   int32 display = 2;

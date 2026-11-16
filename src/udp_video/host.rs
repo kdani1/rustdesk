@@ -53,7 +53,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -383,7 +383,13 @@ struct Shared {
     /// Set by the sender when the socket keeps failing: the lane must end.
     fatal: Mutex<Option<String>>,
     live: Mutex<Live>,
+    /// FEC percentage set by the adaptive FEC of the per-frame feedback (M23); `FEC_UNSET`:
+    /// the lane's `Params::fec_percent`.
+    fec_now: AtomicU32,
 }
+
+/// `Shared::fec_now` before any adaptive change.
+const FEC_UNSET: u32 = u32::MAX;
 
 impl Shared {
     fn new(clock: LaneClock) -> Self {
@@ -403,6 +409,15 @@ impl Shared {
             last_rx_ms: AtomicU64::new(0),
             fatal: Mutex::new(None),
             live: Mutex::new(Live::default()),
+            fec_now: AtomicU32::new(FEC_UNSET),
+        }
+    }
+
+    /// The FEC percentage for the next frame.
+    fn fec_percent(&self, configured: u32) -> u32 {
+        match self.fec_now.load(Ordering::Relaxed) {
+            FEC_UNSET => configured,
+            p => p,
         }
     }
 
@@ -1076,6 +1091,23 @@ impl UdpVideoHost {
         )
     }
 
+    /// The FEC percentage the lane started with (0: no parity, e.g. a viewer below lane v4).
+    pub fn fec_configured(&self) -> u32 {
+        self.params.fec_percent
+    }
+
+    /// Adaptive FEC (M23): the parity percentage from the next frame on. Refused (false) for a
+    /// lane without parity: its viewer may not take parity datagrams at all.
+    pub fn set_fec_percent(&self, percent: u32) -> bool {
+        if self.params.fec_percent == 0 {
+            return false;
+        }
+        self.shared
+            .fec_now
+            .store(percent.min(fec::MAX_PERCENT), Ordering::Relaxed);
+        true
+    }
+
     /// Ends the lane (the threads stop when it is dropped). Idempotent.
     pub fn shutdown(&mut self, why: &str) -> StopInfo {
         if self.state == State::Stopped {
@@ -1392,7 +1424,7 @@ fn send_loop(
                         &job,
                         frame_id,
                         clock,
-                        params.fec_percent,
+                        shared.fec_percent(params.fec_percent),
                         |d| socket.send(d),
                     );
                     if let (true, Some(hooks)) = (sent.is_some(), &hooks) {
@@ -1417,7 +1449,7 @@ fn send_loop(
                     &mut w,
                     job,
                     clock,
-                    params.fec_percent,
+                    shared.fec_percent(params.fec_percent),
                     |d| socket.send(d),
                 ),
             },
@@ -1742,12 +1774,18 @@ fn log_window(
         String::new()
     };
     let fec = if w.fec_frames + w.fec_off > 0 {
+        // The adaptive percentage (M23), once it changed the lane's.
+        let adapted = match shared.fec_now.load(Ordering::Relaxed) {
+            FEC_UNSET => String::new(),
+            p => format!(" fec_pct={p}"),
+        };
         format!(
-            " fec_frames={} fec_dgrams={} fec_off={} fec_ms={}",
+            " fec_frames={} fec_dgrams={} fec_off={} fec_ms={}{}",
             w.fec_frames,
             w.fec_dgrams,
             w.fec_off,
-            w.fec_enc.ms3()
+            w.fec_enc.ms3(),
+            adapted
         )
     } else {
         String::new()
@@ -2265,5 +2303,13 @@ pub(crate) mod latency_tests {
             tap.route(&video(0, pts, false), Instant::now());
         }
         assert_eq!(shared.qdrop.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn latency_feedback_fec_percent_adapts() {
+        let shared = Shared::new(LaneClock::new());
+        assert_eq!(shared.fec_percent(20), 20);
+        shared.fec_now.store(35, Ordering::Relaxed);
+        assert_eq!(shared.fec_percent(20), 35);
     }
 }

@@ -337,6 +337,26 @@ pub const OPTION_UDP_VIDEO_TIMEOUT_MS: &str = "udp-video-timeout-ms";
 // (above 100): 20. Applies to live and shadow lanes, only for a viewer of lane v4 (older fork
 // viewers get lanes without parity). Read at each offer. See docs/UDP-VIDEO.md, "FEC".
 pub const OPTION_UDP_VIDEO_FEC_PERCENT: &str = "udp-video-fec-percent";
+// Per-frame video feedback (roadmap M23, docs/UDP-VIDEO.md "Per-frame feedback"). The same key
+// on both sides:
+// - Windows host, server option (Config), off by default: "Y" advertises
+//   Features.video_feedback to remote-control viewers, records each video frame's send time
+//   and size, and takes the viewer's feedback batches: one-way queueing delay (`q_owd`), GCC
+//   trendline, jitter, the viewer's own delay, UDP loss. Measurement only unless
+//   video-feedback-qos is "Y". Read at each login.
+// - Windows viewer, local option (LocalConfig), on by default: "N" sends no feedback even to a
+//   host that asks for it. Read at each login.
+pub const OPTION_ENABLE_VIDEO_FEEDBACK: &str = "enable-video-feedback";
+// Windows host, server option, off by default (M23): "Y" lets the viewer's feedback steer the
+// host: the queueing delay and UDP datagram loss it reports go into video_qos's delay sample,
+// and a live UDP lane whose frames keep getting lost after FEC goes back to TCP. Needs
+// enable-video-feedback=Y. Read every second.
+pub const OPTION_VIDEO_FEEDBACK_QOS: &str = "video-feedback-qos";
+// Windows host, server option, off by default (M23): "Y" adapts the FEC parity of a live UDP
+// lane to the datagram loss the viewer's feedback reports: clamp(10, 50, 2 x loss% + 5),
+// raised at once, lowered after 2 s. Needs enable-video-feedback=Y and a lane with parity
+// (viewer lane v4, udp-video-fec-percent not "0"). Read every second.
+pub const OPTION_UDP_VIDEO_FEC_ADAPTIVE: &str = "udp-video-fec-adaptive";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -412,6 +432,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
     OPTION_ENABLE_UDP_VIDEO,
+    OPTION_ENABLE_VIDEO_FEEDBACK,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
     OPTION_PRE_ELEVATE_SERVICE,

@@ -489,6 +489,66 @@ live) end with:
 loss; `lost`, `frag_miss` and `kf_req` are what was left after FEC. Roadmap gate: with the same
 loss pattern as an M20 run, fewer `lost` and more `fec_rec`.
 
+### Per-frame feedback (M23)
+
+Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows
+(`enable-video-feedback` not `N`): the viewer reports every video frame's arrival, size, decode
+and present time and, on a live UDP lane, its losses, at most every 50 ms over the session
+stream; the host turns that into a one-way queueing delay, a GCC trend, jitter and loss rates
+(docs/UDP-VIDEO.md, "Per-frame feedback (M23)"). Works on every transport (TCP, KCP, relay,
+WebRTC, UDP lane). Measurement only unless `video-feedback-qos=Y`.
+
+```
+VFB host conn=5 advertised version=1 qos=false fec_adaptive=false
+VFB viewer host_version=1 sending=true
+VFB host conn=5 secs=5.0 batches=100 rl=0 frames=300 unmatched=0 udp_frames=0 done=299 dropped=0 q_owd=0.4/2.1/9.8 trend_max=3.2 thr=6.0 usage=Normal over=0 under=0 jitter=0.6 viewer=6.1/8.0/14.2 decode=3.2/4.9/9.1 queue_max=1 dgram_loss=- frames_lost=0 lost_ranges=0 fec_rec=0 fec_unrec=0 last=[age_ms=12 frames=3 q_owd=0.2/1.1 trend=0.4 thr=6.0 usage=Normal jitter=0.6 kbps=9850 viewer=7.2 decode=3.9 queue=0 udp=false loss=- frame_loss=- fec_rec=0 lost=0] qos=false
+VFB viewer secs=5.0 batches=100 frames=300 done=299 lost=0 dropped=0 bytes=6100
+UDPVIDEO host conn=5 fec 25% (datagram loss 10.2% over 1 s, adaptive)
+```
+
+The `advertised` and `host_version` lines come at each login (always on); the window lines every
+5 s with `enable-latency-log=Y` (each side's own option), only while batches come; the `fec` line
+on each adaptive change (`udp-video-fec-adaptive=Y`, always on).
+
+`VFB host`, per connection:
+
+| Field | Meaning |
+|---|---|
+| `secs` | window length |
+| `batches` / `rl` | batches taken / dropped by the host's rate limit (more than 40 per second) |
+| `frames` | arrivals reported; `unmatched`: of them, not found in the host's send log (a frame sent more than 512 frames ago, or before the log started) |
+| `udp_frames` | matched frames that went over the UDP lane |
+| `done` | decode/present entries; `dropped`: entries the viewer left out of full batches (64 frames, 64 done, 16 loss ranges) |
+| `q_owd` | p50/p95/max of the per-frame queueing one-way delay in ms: (viewer arrival - host send) minus its lowest value over the last 10 s. The host stamps a frame when it takes it off the connection's video channel (TCP: right before the write, so a blocked write counts; UDP: before the lane queue and pacer), the viewer when the frame enters its decoder path (TCP: after the parse; UDP: as the lane releases it). Covers host write, network, relay legs and the viewer's io_loop; a large frame's own transmission time counts too, which is why QoS uses each batch's smallest value |
+| `trend_max` | largest GCC modified trend (delay-gradient slope x min(frames, 60) x 4) in the window |
+| `thr` / `usage` | the overuse detector's adaptive threshold and state at the end of the window |
+| `over` / `under` | transitions into overuse / underuse in the window |
+| `jitter` | inter-arrival jitter in ms (RFC 3550 style, gain 1/16) |
+| `viewer` | p50/p95/max of arrival-to-UI-handover in ms of the frames shown (the viewer's own delay: queue, decode, conversion, callback) |
+| `decode` | p50/p95/max of arrival-to-decode-end in ms, shown or not |
+| `queue_max` | largest decoder queue length at an arrival |
+| `dgram_loss` | UDP lane datagram loss in percent over the window (`-`: no lane counters) |
+| `frames_lost` | UDP frames the viewer declared lost (after FEC); `lost_ranges`: loss ranges reported, repaired ones included |
+| `fec_rec` / `fec_unrec` | UDP frames FEC saved / could not save |
+| `last=[...]` | the last batch's `FeedbackInput`: `age_ms` since it, matched `frames`, `q_owd` batch min/max, `trend`, `thr`, `usage`, `jitter`, `kbps` (bytes of its frames over their arrival span), `viewer` / `decode` (largest), `queue`, `udp`, `loss` / `frame_loss` (UDP, percent over 1 s), `fec_rec`, `lost` |
+| `fec_pct` | the adaptive FEC percentage, once it took over (`udp-video-fec-adaptive=Y`) |
+| `qos` | `video-feedback-qos` is on: the feedback steers QoS and the lane fallback |
+
+`VFB viewer`: `batches` sent, `frames` / `done` / `lost` entries in them, `dropped` entries left
+out, `bytes` of the batches (protobuf size, before encryption).
+
+With `video-feedback-qos=Y` the `qos_sig` of the `LATENCY server` line is unchanged; the delay
+sample video_qos gets becomes `max(sample, q_owd)` (largest batch minimum since the last
+TestDelay) plus 150 ms if the UDP datagram loss over 1 s went above 10%. A live lane that loses
+more than 10% of its frames after FEC over 3 s (at least 30 frames) goes back to TCP with the
+`UDPVIDEO host ... stop` reason `feedback: N of M frames lost after FEC ...`.
+
+The UDP lane's host window line gets `fec_pct=P` once the adaptive FEC changed the lane's
+percentage.
+
+Roadmap gate (M23): with the hbbr-to-viewer leg throttled, `q_owd` (and `usage=Overuse`) shows
+the congestion while the host's TCP meter `rtt` (`LATENCY tcp`) does not.
+
 ### Viewer (Rust)
 
 ```

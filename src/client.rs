@@ -4546,6 +4546,9 @@ pub struct VideoCounters {
     steady_busy_us: std::sync::atomic::AtomicU64,
     // Queue length right after each decode, by `QUEUE_BUCKETS`, for its median.
     queue_hist: [std::sync::atomic::AtomicU32; QUEUE_BUCKETS.len()],
+    /// Decode and present ends per frame for the per-frame feedback (M23); one relaxed load
+    /// per frame while the host did not ask for feedback.
+    pub feedback: crate::video_feedback::viewer::DoneLog,
 }
 
 // Lower bounds of the queue-length buckets behind `VideoCountersTick::queue_p50`.
@@ -5087,6 +5090,11 @@ pub fn start_video_thread<F, T>(
                                         );
                                     }
                                     counters.queue_max.fetch_max(queue_len, Ordering::Relaxed);
+                                    counters.feedback.on_frame(
+                                        latency_pts,
+                                        decode_end,
+                                        present.then_some(present_end),
+                                    );
                                     let decoded_frame = latency::DecodedFrame {
                                         pts: latency_pts,
                                         dequeued: start,

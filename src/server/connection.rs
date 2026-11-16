@@ -476,6 +476,10 @@ pub struct Connection {
     // Live mode: after a fallback to TCP, the next offer and how many were made.
     udp_retry_at: Option<Instant>,
     udp_retries: usize,
+    // Fork-only per-frame video feedback (M23, docs/UDP-VIDEO.md): the send time of each video
+    // frame (also written by the split writer) and the estimator, once advertised.
+    video_feedback_log: Arc<crate::video_feedback::host::SendLog>,
+    video_feedback: Option<crate::video_feedback::host::ConnFeedback>,
 }
 
 /// The connection's part of a split session's video writes, run by the writer task.
@@ -484,6 +488,7 @@ struct SplitHooks {
     video_ack_required: bool,
     sends: Arc<super::latency_stats::SplitSends>,
     udp_tap: Arc<crate::udp_video::host::VideoTap>,
+    video_feedback_log: Arc<crate::video_feedback::host::SendLog>,
 }
 
 impl crate::session_io::WriterHooks for SplitHooks {
@@ -495,6 +500,8 @@ impl crate::session_io::WriterHooks for SplitHooks {
         // The UDP lane decides before the TCP write (one atomic load while no lane): a shadow
         // copy starts here, a live lane takes video frames off TCP.
         let route = self.udp_tap.route(msg, queued_at.into_std());
+        self.video_feedback_log
+            .record(msg, std::time::Instant::now(), !route.tcp);
         // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames. A
         // frame that went to a live lane is reported by the lane's sender (send window).
         if !self.video_ack_required && route.tcp {
@@ -780,6 +787,8 @@ impl Connection {
             udp_video: None,
             udp_retry_at: None,
             udp_retries: 0,
+            video_feedback_log: Default::default(),
+            video_feedback: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -907,6 +916,7 @@ impl Connection {
                                 video_ack_required: conn.video_ack_required,
                                 sends: sends.clone(),
                                 udp_tap: conn.udp_tap.clone(),
+                                video_feedback_log: conn.video_feedback_log.clone(),
                             });
                             match conn.stream.split(video, hooks) {
                                 Ok(handle) => {
@@ -1308,6 +1318,7 @@ impl Connection {
                     // a shadow copy starts here, a live lane takes video frames off TCP and
                     // reports them fetched itself (send window).
                     let route = conn.udp_tap.route(&value, instant.into_std());
+                    conn.video_feedback_log.record(&value, std::time::Instant::now(), !route.tcp);
                     if !conn.video_ack_required && route.tcp {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
@@ -1422,6 +1433,7 @@ impl Connection {
                     }
                     conn_stats.tick(conn.authorized);
                     conn.udp_video_check().await;
+                    conn.video_feedback_second().await;
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
                     }
@@ -2371,10 +2383,31 @@ impl Connection {
         }
         pi.username = username;
         pi.sas_enabled = sas_enabled;
+        // Per-frame video feedback (M23): remote control only, with enable-video-feedback=Y.
+        let video_feedback = if self.file_transfer.is_none() && !self.terminal && !self.view_camera
+        {
+            crate::video_feedback::host::advertised_version()
+        } else {
+            0
+        };
+        if video_feedback > 0 {
+            self.video_feedback_log.enable();
+            self.video_feedback = Some(crate::video_feedback::host::ConnFeedback::new(
+                std::time::Instant::now(),
+            ));
+            log::info!(
+                "VFB host conn={} advertised version={} qos={} fec_adaptive={}",
+                self.inner.id,
+                video_feedback,
+                crate::video_feedback::host::qos_option(),
+                crate::video_feedback::host::fec_adaptive_option()
+            );
+        }
         pi.features = Some(Features {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
+            video_feedback,
             ..Default::default()
         })
         .into();
@@ -3399,6 +3432,11 @@ impl Connection {
                         .as_ref()
                         .and_then(|l| l.qos_delay(new_delay))
                         .unwrap_or(new_delay);
+                    // video-feedback-qos=Y: the viewer's queueing delay and UDP loss (M23).
+                    let qos_delay = match self.video_feedback.as_mut() {
+                        Some(fb) => fb.qos_delay(qos_delay),
+                        None => qos_delay,
+                    };
                     video_service::VIDEO_QOS
                         .lock()
                         .unwrap()
@@ -4189,6 +4227,9 @@ impl Connection {
                     }
                     Some(misc::Union::UdpVideoFeedback(f)) => {
                         self.on_udp_video_feedback(&f).await;
+                    }
+                    Some(misc::Union::VideoFeedback(f)) => {
+                        self.on_video_feedback(&f);
                     }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
@@ -6040,6 +6081,9 @@ impl Connection {
         });
         match udp::UdpVideoHost::start(id, self.udp_tap.clone(), local, viewer, params, hooks) {
             Ok((lane, offer)) => {
+                if let Some(fb) = self.video_feedback.as_mut() {
+                    fb.lane_started();
+                }
                 if mode == Mode::Live {
                     let forced = Config::get_option(keys::OPTION_ENABLE_REFRESH_KEYFRAME) == "Y";
                     log::info!(
@@ -6094,6 +6138,54 @@ impl Connection {
             Ok(Some(display)) => self.refresh_video_display(Some(display)),
             Ok(None) => {}
             Err(why) => self.udp_video_stop(&why, true).await,
+        }
+    }
+
+    /// A per-frame feedback batch of the viewer (M23): the estimate, and with
+    /// udp-video-fec-adaptive=Y the FEC level of a live lane.
+    fn on_video_feedback(&mut self, f: &VideoFeedback) {
+        let Some(fb) = self.video_feedback.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let Some(input) = fb.on_batch(f, &self.video_feedback_log, now) else {
+            return;
+        };
+        let Some(lane) = self.udp_video.as_ref().filter(|l| l.is_live_active()) else {
+            return;
+        };
+        if let Some(percent) = fb.fec_for(&input, lane.fec_configured(), now) {
+            if lane.set_fec_percent(percent) {
+                log::info!(
+                    "UDPVIDEO host conn={} fec {}% (datagram loss {:.1}% over 1 s, adaptive)",
+                    self.inner.id,
+                    percent,
+                    input.loss.unwrap_or(0.0) * 100.0
+                );
+            }
+        }
+    }
+
+    /// Every second, with per-frame feedback (M23): the options, the `VFB host` line
+    /// (enable-latency-log=Y), and with video-feedback-qos=Y the live lane's fallback rule.
+    async fn video_feedback_second(&mut self) {
+        let Some(fb) = self.video_feedback.as_mut() else {
+            return;
+        };
+        fb.refresh_options();
+        let now = std::time::Instant::now();
+        if Config::get_option(keys::OPTION_ENABLE_LATENCY_LOG) == "Y" {
+            if let Some(line) = fb.take_window(now, Duration::from_secs(5)) {
+                log::info!("VFB host conn={} {}", self.inner.id, line);
+            }
+        }
+        let live = self.udp_video.as_ref().map_or(false, |l| l.is_live_active());
+        if !live {
+            return;
+        }
+        if let Some(why) = fb.lane_verdict(now) {
+            fb.lane_started();
+            self.udp_video_stop(&why, true).await;
         }
     }
 
