@@ -106,7 +106,7 @@ index 2004166..f1477e7 100644
    return bResult == TRUE;
  }
 diff --git a/cpp/common/util.cpp b/cpp/common/util.cpp
-index 45810b4..7bc0602 100644
+index 45810b4..ab969d8 100644
 --- a/cpp/common/util.cpp
 +++ b/cpp/common/util.cpp
 @@ -3,8 +3,11 @@ extern "C" {
@@ -142,7 +142,7 @@ index 45810b4..7bc0602 100644
    }
    if (name.find("amf") != std::string::npos) {
      if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
-@@ -304,6 +321,77 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
+@@ -304,6 +321,86 @@ bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs) {
    return true;
  }
  
@@ -188,7 +188,7 @@ index 45810b4..7bc0602 100644
 +  c->rc_buffer_size = (int)bits;
 +}
 +
-+int virtual_fps_kbs(int kbs, int nominal_fps, int actual_fps) {
++int virtual_fps_kbs(int kbs, int open_kbs, int nominal_fps, int actual_fps) {
 +  if (kbs <= 0 || nominal_fps <= 0 || actual_fps <= 0) {
 +    return kbs;
 +  }
@@ -199,6 +199,15 @@ index 45810b4..7bc0602 100644
 +    scale = 4.0;
 +  }
 +  double v = (double)kbs * scale;
++  if (open_kbs > 0) {
++    double cap = 4.0 * (double)open_kbs;
++    if (cap < (double)kbs) {
++      cap = (double)kbs;
++    }
++    if (v > cap) {
++      v = cap;
++    }
++  }
 +  if (v > (double)(std::numeric_limits<int>::max() / 1000)) {
 +    v = (double)(std::numeric_limits<int>::max() / 1000);
 +  }
@@ -220,7 +229,7 @@ index 45810b4..7bc0602 100644
  void vram_encode_test_callback(const uint8_t *data, int32_t len, int32_t key, const void *obj, int64_t pts) {
    (void)data;
    (void)len;
-@@ -328,6 +416,20 @@ bool has_flag_could_not_find_ref_with_poc() {
+@@ -328,6 +425,20 @@ bool has_flag_could_not_find_ref_with_poc() {
  
  } // namespace util_decode
  
@@ -243,10 +252,10 @@ index 45810b4..7bc0602 100644
  }
 \ No newline at end of file
 diff --git a/cpp/common/util.h b/cpp/common/util.h
-index 711fd2a..29c34cf 100644
+index 711fd2a..4a32e16 100644
 --- a/cpp/common/util.h
 +++ b/cpp/common/util.h
-@@ -20,6 +20,30 @@ bool force_hw(void *priv_data, const std::string &name);
+@@ -20,6 +20,33 @@ bool force_hw(void *priv_data, const std::string &name);
  bool set_others(void *priv_data, const std::string &name);
  
  bool change_bit_rate(AVCodecContext *c, const std::string &name, int kbs);
@@ -267,9 +276,12 @@ index 711fd2a..29c34cf 100644
 +void set_vbv(AVCodecContext *c, const std::string &name, int kbs, int fps, int frames);
 +// Virtual framerate (nvenc only): the bitrate to set on an encoder opened at `nominal_fps` that
 +// runs at `actual_fps`, so NVENC's per-frame budget (bit_rate / nominal_fps) is kbs / actual_fps:
-+// kbs * clamp(nominal_fps / actual_fps, 0.5, 4). The clamp keeps a reconfigure within 4x of the
-+// bitrate the encoder was opened with. kbs unchanged when either fps is <= 0.
-+int virtual_fps_kbs(int kbs, int nominal_fps, int actual_fps);
++// kbs * clamp(nominal_fps / actual_fps, 0.5, 4). kbs is the current QoS bitrate, which moves with
++// set_bitrate after open, so the clamp alone bounds the scale, not the result; the result is also
++// capped at max(kbs, 4 * open_kbs) (open_kbs: the bitrate the encoder was opened with, <= 0 for
++// no cap), so the virtual framerate never asks for more than 4x the opened bitrate (HEVC level
++// limits) unless QoS alone already does. kbs unchanged when either fps is <= 0.
++int virtual_fps_kbs(int kbs, int open_kbs, int nominal_fps, int actual_fps);
 +// nvenc only: one line with the rate-control values FFmpeg settled on at open (rc_buffer_size reads
 +// back FFmpeg's default VBV when none was set).
 +void log_open_rate(AVCodecContext *c, const std::string &name, int fps, int vbv_frames,
@@ -278,10 +290,19 @@ index 711fd2a..29c34cf 100644
  
  } // namespace util
 diff --git a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-index 0a8d1b1..9477823 100644
+index 0a8d1b1..1a354f7 100644
 --- a/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
 +++ b/cpp/ffmpeg_ram/ffmpeg_ram_encode.cpp
-@@ -122,6 +122,19 @@ public:
+@@ -109,6 +109,8 @@ public:
+   int rc_ = 0;
+   int quality_ = 0;
+   int kbs_ = 0;
++  // The bitrate the encoder was opened with: virtual_fps_kbs caps at 4x of it.
++  int open_kbs_ = 0;
+   int q_ = 0;
+   int fps_ = 30;
+   int gop_ = 0xFFFF;
+@@ -122,6 +124,19 @@ public:
    AVBufferRef *hw_device_ctx_ = NULL;
    AVFrame *hw_frame_ = NULL;
  
@@ -301,7 +322,15 @@ index 0a8d1b1..9477823 100644
    FFmpegRamEncoder(const char *name, const char *mc_name, int width, int height,
                     int pixfmt, int align, int fps, int gop, int rc, int quality,
                     int kbs, int q, int thread_count, int gpu,
-@@ -240,6 +253,11 @@ public:
+@@ -137,6 +152,7 @@ public:
+     rc_ = rc;
+     quality_ = quality;
+     kbs_ = kbs;
++    open_kbs_ = kbs;
+     q_ = q;
+     thread_count_ = thread_count;
+     gpu_ = gpu;
+@@ -240,6 +256,11 @@ public:
      util_encode::set_gpu(c_->priv_data, name_, gpu_);
      util_encode::force_hw(c_->priv_data, name_);
      util_encode::set_others(c_->priv_data, name_);
@@ -313,7 +342,7 @@ index 0a8d1b1..9477823 100644
      if (name_.find("mediacodec") != std::string::npos) {
        if (mc_name_.length() > 0) {
          LOG_INFO(std::string("mediacodec codec_name: ") + mc_name_);
-@@ -255,6 +273,7 @@ public:
+@@ -255,6 +276,7 @@ public:
                  ", name: " + name_);
        return false;
      }
@@ -321,7 +350,7 @@ index 0a8d1b1..9477823 100644
  
      if (ffmpeg_ram_get_linesize_offset_length(pixfmt_, width_, height_, align_,
                                                NULL, offset_, length) != 0)
-@@ -304,7 +323,43 @@ public:
+@@ -304,7 +326,43 @@ public:
    }
  
    int set_bitrate(int kbs) {
@@ -329,7 +358,7 @@ index 0a8d1b1..9477823 100644
 +    if (kbs > 0)
 +      kbs_ = kbs;
 +    // kbs_ unchanged until set_framerate was called.
-+    int rate = util_encode::virtual_fps_kbs(kbs_, fps_, actual_fps_);
++    int rate = util_encode::virtual_fps_kbs(kbs_, open_kbs_, fps_, actual_fps_);
 +    if (!util_encode::change_bit_rate(c_, name_, rate))
 +      return -1;
 +    // N frames of nvenc's own per-frame budget (bitrate set / opened frame rate).
@@ -366,7 +395,7 @@ index 0a8d1b1..9477823 100644
    }
  
  private:
-@@ -339,11 +394,19 @@ private:
+@@ -339,11 +397,19 @@ private:
    int do_encode(AVFrame *frame, const void *obj, int64_t ms) {
      int ret;
      bool encoded = false;
@@ -387,7 +416,7 @@ index 0a8d1b1..9477823 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < DECODE_TIMEOUT_MS) {
-@@ -358,12 +421,28 @@ private:
+@@ -358,12 +424,28 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -417,7 +446,7 @@ index 0a8d1b1..9477823 100644
    }
  
    int fill_frame(AVFrame *frame, uint8_t *data, int data_length,
-@@ -463,4 +542,22 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
+@@ -463,4 +545,22 @@ extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
      LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
    }
    return -1;
@@ -546,11 +575,15 @@ index f8a0f92..6dfb0cf 100644
                                         int32_t maxDescNum, int32_t *outDescNum,
                                         DataFormat dataFormat,
 diff --git a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-index 2b21b73..4c95197 100644
+index 2b21b73..6e49d30 100644
 --- a/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
 +++ b/cpp/ffmpeg_vram/ffmpeg_vram_encode.cpp
-@@ -76,6 +76,20 @@ public:
+@@ -74,8 +74,24 @@ public:
+   int32_t width_ = 0;
+   int32_t height_ = 0;
    int32_t kbs_;
++  // The bitrate the encoder was opened with: virtual_fps_kbs caps at 4x of it.
++  int32_t open_kbs_ = 0;
    int32_t framerate_;
    int32_t gop_;
 +  // nvenc took forced-idr=1: request_keyframe is supported.
@@ -570,7 +603,15 @@ index 2b21b73..4c95197 100644
  
    const int align_ = 0;
    const bool full_range_ = false;
-@@ -136,6 +150,11 @@ public:
+@@ -89,6 +105,7 @@ public:
+     width_ = width;
+     height_ = height;
+     kbs_ = kbs;
++    open_kbs_ = kbs;
+     framerate_ = framerate;
+     gop_ = gop;
+   }
+@@ -136,6 +153,11 @@ public:
      // util_encode::set_quality(c_->priv_data, encoder_->name_, Quality_Default);
      util_encode::set_rate_control(c_, encoder_->name_, RC_CBR, -1);
      util_encode::set_others(c_->priv_data, encoder_->name_);
@@ -582,7 +623,7 @@ index 2b21b73..4c95197 100644
  
      hw_device_ctx_ = av_hwdevice_ctx_alloc(encoder_->device_type_);
      if (!hw_device_ctx_) {
-@@ -184,6 +203,7 @@ public:
+@@ -184,6 +206,7 @@ public:
                  ", name: " + encoder_->name_);
        return false;
      }
@@ -590,7 +631,7 @@ index 2b21b73..4c95197 100644
  
      if (!(frame_ = av_frame_alloc())) {
        LOG_ERROR(std::string("Could not allocate video frame"));
-@@ -227,10 +247,28 @@ public:
+@@ -227,10 +250,28 @@ public:
  
      if (!convert(texture))
        return -1;
@@ -619,7 +660,7 @@ index 2b21b73..4c95197 100644
    void destroy() {
      if (pkt_)
        av_packet_free(&pkt_);
-@@ -252,13 +290,39 @@ public:
+@@ -252,13 +293,39 @@ public:
    }
  
    int set_bitrate(int kbs) {
@@ -627,7 +668,7 @@ index 2b21b73..4c95197 100644
 +    if (kbs > 0)
 +      kbs_ = kbs;
 +    // kbs_ unchanged until set_framerate was called.
-+    int rate = util_encode::virtual_fps_kbs(kbs_, framerate_, actual_fps_);
++    int rate = util_encode::virtual_fps_kbs(kbs_, open_kbs_, framerate_, actual_fps_);
 +    if (!util_encode::change_bit_rate(c_, encoder_->name_, rate))
 +      return -1;
 +    // The VBV follows the bitrate actually set over the opened frame rate: N frames of nvenc's
@@ -663,7 +704,7 @@ index 2b21b73..4c95197 100644
    }
  
  private:
-@@ -314,11 +378,19 @@ private:
+@@ -314,11 +381,19 @@ private:
    int do_encode(EncodeCallback callback, const void *obj, int64_t ms) {
      int ret;
      bool encoded = false;
@@ -684,7 +725,7 @@ index 2b21b73..4c95197 100644
  
      auto start = util::now();
      while (ret >= 0 && util::elapsed_ms(start) < ENCODE_TIMEOUT_MS) {
-@@ -333,13 +405,33 @@ private:
+@@ -333,13 +408,33 @@ private:
          goto _exit;
        }
        encoded = true;
@@ -719,7 +760,7 @@ index 2b21b73..4c95197 100644
    }
  
    bool convert(void *texture) {
-@@ -486,13 +578,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
+@@ -486,13 +581,32 @@ int ffmpeg_vram_set_bitrate(FFmpegVRamEncoder *encoder, int kbs) {
  
  int ffmpeg_vram_set_framerate(FFmpegVRamEncoder *encoder, int32_t framerate) {
    try {

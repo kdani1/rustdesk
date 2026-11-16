@@ -77,8 +77,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
-
-| `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused it). |
+| `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused a rate and was reset to `nvenc-nominal-fps`). When the encoder refuses a rate and also the reset to nominal (in practice only the NVENC SDK driver, whose Reconfigure can fail), it keeps the last applied value, the rate the encoder is stuck at, until the capture restarts; a warning `virtual fps: ... stays at N fps until restart` marks this. Either way later cap changes are not applied until the capture restarts. |
 | `vfchg` | how often `vfps` changed in the window (each one is an IDR-free nvenc reconfigure with the next frame) |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
@@ -148,9 +147,12 @@ Windows host, server options, off by default in this build.
   bitrate × clamp(nominal / `vfps`, 0.5, 4): the per-frame budget is QoS bitrate / `vfps` and
   the real bitrate follows the QoS bitrate. FFmpeg's nvenc reconfigure applies it with the next
   frame, free of an IDR with patch 0009 (so an fps change needs no restart; `vfchg` counts them).
-  The NVENC SDK driver reconfigures its real frame rate instead. The 4× clamp keeps a reconfigure
-  within 4× of the opened bitrate (HEVC level limits); below nominal / 4 fps the stream stays
-  under the QoS bitrate. AMF, QSV, VP8/VP9/AV1 are unchanged. The price: at 60 fps a frame gets
+  The NVENC SDK driver reconfigures its real frame rate instead. The 4× clamp bounds the scale
+  relative to the current QoS bitrate, which itself moves with every QoS ratio change after open;
+  so the result is also capped at the larger of 4× the opened bitrate and the QoS bitrate (HEVC
+  level limits: the virtual framerate never asks for more than 4× the opened bitrate unless QoS
+  alone already does). Below nominal / 4 fps, or when that cap applies, the stream stays under
+  the QoS bitrate. AMF, QSV, VP8/VP9/AV1 are unchanged. The price: at 60 fps a frame gets
   half the bits it gets today at the same quality setting, so text after typing or scrolling is
   softer (check `maxf` and the picture).
 - **`nvenc-fps-from-send-rate`** (`Y`; read when the capture loop starts; only with

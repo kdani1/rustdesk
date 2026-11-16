@@ -1894,8 +1894,19 @@ fn check_qos(
                     log::info!("virtual fps: {name} encoder runs at {fps} fps (cap {fps_cap})");
                 }
             } else {
-                log::warn!("virtual fps: {name} encoder refused {fps} fps, off until restart");
-                latency_stats.on_virtual_fps(0);
+                // Back to neutral before giving up: at the nominal rate FFmpeg nvenc's scale is 1
+                // and the NVENC SDK driver runs at the rate it was opened with, i.e. "off".
+                let applied = vf.applied();
+                let nominal = scrap::codec::nvenc_nominal_fps();
+                if applied == 0 || applied == nominal || (nominal > 0 && encoder.set_fps(nominal)) {
+                    log::warn!("virtual fps: {name} encoder refused {fps} fps, off until restart");
+                    latency_stats.on_virtual_fps(0);
+                } else {
+                    // `vfps` keeps reporting the rate the encoder is stuck at.
+                    log::warn!(
+                        "virtual fps: {name} encoder refused {fps} fps and the reset to {nominal}, stays at {applied} fps until restart"
+                    );
+                }
                 *virtual_fps = None;
             }
         }
