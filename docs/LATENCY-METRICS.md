@@ -118,7 +118,7 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 ### Viewer (Rust)
 
 ```
-LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a noout=0 shown_gap=… discard=0 dec_fail=0 via=TCP
+LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 shown_gap=… discard=0 dec_fail=0 via=TCP
 ```
 
 | Field | Meaning |
@@ -142,7 +142,8 @@ LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=
 | `dec_fps` | frames `handle_frame` decoded to a picture per second |
 | `shown_fps` | decoded frames that reached the screen per second: handed to the UI callback, minus soft-render drops (`ui_dropped`) and frames a later one replaced before Flutter fetched them (`ui_replaced`). The overlay's `shown` is the same. |
 | `skip` | decoded frames not handed to the UI callback (`decoded` − handed), count in the window: the frames present pacing skipped. Always 0 with pacing off. Soft-render drops and replacements are not in it (they are left out of `shown_fps` instead). |
-| `decode_skip` | `decode` of the skipped frames (p50/p95/max ms), `n/a` when none was skipped. With `enable-viewer-decode-no-output` (default) these are decoded without output (see "Decode without output" below): `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
+| `decode_skip` | `decode` of the skipped frames that were decoded without output (`DecodeOutput::DecodedNoOutput`, see "Decode without output" below), p50/p95/max ms, `n/a` when there was none. `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
+| `decode_skip_conv` | `decode` of the skipped frames that were converted anyway, p50/p95/max ms, `n/a` when there was none: a frame that turned stale only during its decode, every skipped frame with `enable-viewer-decode-no-output` off, and every skipped frame of a decoder that always outputs (AMF/MFX GPU decoders). Kept apart so `decode_skip` stays a pure no-output time. |
 | `noout` | of the decoded frames, those decoded without output (`DecodeOutput::DecodedNoOutput`), count in the window. Equal to `skip` when every skipped frame was decided before its decode; lower when a frame turned stale only during its decode (the callback is skipped then, the conversion was already done) or the decoder always outputs (AMF/MFX GPU decoders) |
 | `shown_gap` | time between two consecutive frames that reached the screen (`to_ui` done → next `to_ui` done; frames counted in `ui_dropped`, and frames a later one replaced (`ui_replaced`), are left out: the gap runs from the frame shown before the replaced one to the replacing one), p50/p95/max ms. A gap is added once the next frame did not replace its frame, so the newest one lands in the next window. Gaps over 1 s (static screen) are left out. Its p95 shows stutter: with pacing on it must not grow in calm use. |
 | `discard` | received frames dropped undecoded, count in the window: `discard_queue` after a refresh request, or evicted by a full 120-deep queue |
@@ -368,17 +369,21 @@ meanwhile, only the UI callback is skipped (as without this option). With the
 option off, the decision is taken after the decode, as before. The recording
 (`record_screen`) writes the encoded frames and is not affected.
 
-Measured by `noout`, `decode_skip` vs `decode` (p50) and `dec_fail` on the LATENCY
+Measured by `noout`, `decode_skip` vs `decode` (p50; converted skips are in
+`decode_skip_conv`, not in `decode_skip`) and `dec_fail` on the LATENCY
 line, `noout` on the `FPSCTL` line, and the viewer's CPU and GPU 3D/Copy load with
 pacing on and off. `decode`'s meaning is unchanged (shown frames, with conversion).
 The gentle fps control's busy fraction is wall time, so it still sees the real
 decoder load; its per-frame capacity (`cap`) rises by what skipped frames save.
 
 The hwcodec `NativeDevice::Query` wait (used after the NV12→BGRA shader on every
-shown GPU frame, and by the no-output path above) no longer busy-polls 100 times
-before sleeping: for up to 2 ms each poll gives the processor to any other ready
-thread (`SwitchToThread`, which unlike `Sleep(0)` also yields to lower-priority
-threads such as the UI's raster thread), then it sleeps 1 ms per poll. No option
+shown GPU frame, and by the no-output path above) keeps its old shape, a short
+poll phase and then 1 ms sleeps, but the poll phase is now bounded by time
+(0.2 ms, was 100 polls, about 0.1-0.3 ms) and each failed poll calls `Sleep(0)`
+instead of polling again at once. `Sleep(0)` returns at once unless a thread of
+equal or higher priority is ready, so the decoder never hands its time slice to a
+lower-priority thread (`SwitchToThread` could, for a whole quantum). It still
+polls for up to 0.2 ms per wait; it does not wait on a GPU event. No option
 (C++ in hwcodec); it changes no output.
 
 ### Viewer: priority boost
@@ -416,8 +421,9 @@ is not touched (unlike the host's `mmcss_capture`, which also applies
 `enable-host-priority-boost`). Software and RAM decoding are not registered: a
 CPU-heavy decode at MMCSS priority could starve the Flutter UI and raster threads
 that present. The registration follows the decoder (codec switch, reset) and is
-reverted when the thread ends. It relies on the `Query` fix above (no busy wait at
-raised priority). Logged by the `LATENCY client mmcss` line. A/B it with the option
+reverted when the thread ends. With the `Query` change above the poll before the
+first sleep is capped at 0.2 ms, about what it was before, so the raised priority
+adds no longer spin. Logged by the `LATENCY client mmcss` line. A/B it with the option
 on and off: decode p95, `queue`, `shown_gap` p95 and the Flutter `paint` p50.
 
 ### Viewer: input and audio

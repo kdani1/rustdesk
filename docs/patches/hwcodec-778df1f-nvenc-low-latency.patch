@@ -1,37 +1,40 @@
 diff --git a/cpp/common/platform/win/win.cpp b/cpp/common/platform/win/win.cpp
-index 2004166..99c2557 100644
+index 2004166..f1477e7 100644
 --- a/cpp/common/platform/win/win.cpp
 +++ b/cpp/common/platform/win/win.cpp
-@@ -379,9 +379,18 @@ void NativeDevice::BeginQuery() { context_->Begin(query_.Get()); }
+@@ -379,9 +379,19 @@ void NativeDevice::BeginQuery() { context_->Begin(query_.Get()); }
  
  void NativeDevice::EndQuery() { context_->End(query_.Get()); }
  
-+// Waits for the event query without burning the core: for up to 2 ms each failed poll gives the
-+// processor to any other ready thread (SwitchToThread, not Sleep(0): the decoder thread may run
-+// at a raised or MMCSS priority, and Sleep(0) only yields to threads of equal or higher
-+// priority, which would starve the UI's raster thread), then it sleeps 1 ms per poll. It gives
-+// up after about the same number of sleeps as before (900).
++// Waits for the event query: polls for at most 0.2 ms (the old loop polled 100 times, about
++// 0.1-0.3 ms), each failed poll followed by Sleep(0), then sleeps 1 ms per poll. Sleep(0)
++// returns at once unless a thread of equal or higher priority is ready, so the decoder never
++// gives its time slice to a lower-priority thread (SwitchToThread can, for a whole quantum).
++// It gives up after about the same number of sleeps as before (900).
  bool NativeDevice::Query() {
    BOOL bResult = FALSE;
 -  int attempts = 0;
 +  LARGE_INTEGER freq, start, now;
 +  QueryPerformanceFrequency(&freq);
 +  QueryPerformanceCounter(&start);
-+  const LONGLONG yield_ticks = freq.QuadPart / 500; // 2 ms
++  const LONGLONG poll_ticks = freq.QuadPart / 5000; // 0.2 ms
++  bool polling = true;
 +  int sleeps = 0;
    while (!bResult) {
      HRESULT hr = context_->GetData(query_.Get(), &bResult, sizeof(BOOL), 0);
      if (SUCCEEDED(hr)) {
-@@ -389,11 +398,15 @@ bool NativeDevice::Query() {
+@@ -389,11 +399,17 @@ bool NativeDevice::Query() {
          break;
        }
      }
 -    attempts++;
 -    if (attempts > 100)
-+    QueryPerformanceCounter(&now);
-+    if (now.QuadPart - start.QuadPart < yield_ticks) {
-+      if (!SwitchToThread())
-+        YieldProcessor();
++    if (polling) {
++      QueryPerformanceCounter(&now);
++      polling = now.QuadPart - start.QuadPart < poll_ticks;
++    }
++    if (polling) {
++      Sleep(0);
 +    } else {
 +      if (++sleeps > 900)
 +        break;

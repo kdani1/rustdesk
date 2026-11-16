@@ -4883,6 +4883,7 @@ pub fn start_video_thread<F, T>(
                                         format,
                                         gpu_texture: !pixelbuffer,
                                         paced: pacer.enabled(),
+                                        no_output: output == DecodeOutput::DecodedNoOutput,
                                     };
                                     if present {
                                         latency::on_frame_done(
