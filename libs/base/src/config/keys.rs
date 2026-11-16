@@ -337,6 +337,18 @@ pub const OPTION_UDP_VIDEO_TIMEOUT_MS: &str = "udp-video-timeout-ms";
 // (above 100): 20. Applies to live and shadow lanes, only for a viewer of lane v4 (older fork
 // viewers get lanes without parity). Read at each offer. See docs/UDP-VIDEO.md, "FEC".
 pub const OPTION_UDP_VIDEO_FEC_PERCENT: &str = "udp-video-fec-percent";
+// UDP video lane over the internet (roadmap M24, docs/UDP-VIDEO.md "Internet lane"). The same
+// key on both sides:
+// - Windows host, server option (Config), off by default: "Y" also offers the lane (in the mode
+//   enable-udp-video asks for) when the session is not on the LAN but on a direct internet path
+//   (TCP punch, direct IP access, KCP over a punched UDP socket; never relay or WebRTC) and no
+//   proxy is set. The lane punches its own UDP socket to the viewer (public ports learned from
+//   the rendezvous server), sends datagrams of at most 1024 (IPv4) / 1184 (IPv6) bytes and
+//   marks no DSCP. Any failure leaves the video on the session stream. Read at each offer.
+// - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising internet
+//   lanes (lane v5 instead of v6), so a reconnect keeps a WAN session's video on TCP/KCP. LAN
+//   lanes are unaffected (enable-udp-video governs them).
+pub const OPTION_ENABLE_UDP_VIDEO_WAN: &str = "enable-udp-video-wan";
 // Per-frame video feedback (roadmap M23, docs/UDP-VIDEO.md "Per-frame feedback"). The same key
 // on both sides:
 // - Windows host, server option (Config), off by default: "Y" advertises
@@ -445,6 +457,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
     OPTION_ENABLE_UDP_VIDEO,
+    OPTION_ENABLE_UDP_VIDEO_WAN,
     OPTION_ENABLE_VIDEO_FEEDBACK,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,

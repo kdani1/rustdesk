@@ -62,6 +62,116 @@ pub fn lane_ip(ip: IpAddr) -> Result<IpAddr, &'static str> {
     Ok(ip)
 }
 
+/// The viewer's address for an internet lane (M24), normalized, or why not: a unicast address
+/// that is not on the LAN (that path has its own gate), not loopback, unspecified, link-local
+/// or multicast. CGNAT and other shared ranges count as internet (a tunnel or a carrier NAT:
+/// the WAN datagram size is the safe one there).
+pub fn wan_ip(ip: IpAddr) -> Result<IpAddr, &'static str> {
+    let ip = hbb_common::try_into_v4(SocketAddr::new(ip, 0)).ip();
+    if ip.is_unspecified() {
+        return Err("unspecified address");
+    }
+    if ip.is_loopback() {
+        return Err("loopback address");
+    }
+    if ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
+        return Err("multicast address");
+    }
+    if is_link_local_v6(ip) {
+        return Err("link-local IPv6");
+    }
+    if is_lan(ip) {
+        return Err("a LAN address");
+    }
+    Ok(ip)
+}
+
+/// The wildcard address of `ip`'s family: an internet lane socket is bound to it (the session's
+/// own local address can be a KCP stream's unspecified one, and the route to the viewer is the
+/// system's choice).
+pub fn any_of_family(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+/// The rendezvous server's UDP address in `ip`'s family (blocking DNS; called on a lane thread),
+/// for the NAT mapping query. None for an empty server or IPv6 (no NAT to learn there: the lane
+/// socket's local port is its public port).
+pub fn rendezvous_udp(server: &str, family: IpAddr) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    if server.is_empty() || family.is_ipv6() {
+        return None;
+    }
+    let host = hbb_common::socket_client::check_port(server, hbb_common::config::RENDEZVOUS_PORT);
+    host.to_socket_addrs()
+        .ok()?
+        .find(|a| a.is_ipv4() == family.is_ipv4())
+}
+
+/// How long a lane end asks the rendezvous server for its public port.
+pub const NAT_QUERY_FOR: Duration = Duration::from_millis(1000);
+const NAT_QUERY_EVERY: Duration = Duration::from_millis(150);
+
+/// The public UDP port of `socket` (unconnected) as the rendezvous server sees it: the reply to
+/// a `TestNatRequest`, the query the session's own UDP punch uses. Asked every 150 ms for up to
+/// `wait`; only a reply from `server` counts. None when the server does not answer.
+pub fn nat_port(socket: &UdpSocket, server: SocketAddr, wait: Duration) -> Option<u16> {
+    use hbb_common::{
+        protobuf::Message as _,
+        rendezvous_proto::{rendezvous_message, RendezvousMessage, TestNatRequest},
+    };
+    let mut req = RendezvousMessage::new();
+    req.set_test_nat_request(TestNatRequest::default());
+    let req = req.write_to_bytes().ok()?;
+    let started = Instant::now();
+    let mut next = started;
+    let mut buf = [0u8; 1500];
+    let mut timeout = ReadTimeout::new();
+    loop {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed >= wait {
+            return None;
+        }
+        if now >= next {
+            let _ = socket.send_to(&req, server);
+            next = now + NAT_QUERY_EVERY;
+        }
+        let left = next
+            .saturating_duration_since(now)
+            .min(wait - elapsed)
+            .max(Duration::from_millis(1));
+        timeout.set(socket, left);
+        let Ok((n, src)) = socket.recv_from(&mut buf) else {
+            continue;
+        };
+        if hbb_common::try_into_v4(src) != hbb_common::try_into_v4(server) {
+            continue;
+        }
+        if let Ok(RendezvousMessage {
+            union: Some(rendezvous_message::Union::TestNatResponse(r)),
+            ..
+        }) = RendezvousMessage::parse_from_bytes(&buf[..n])
+        {
+            if let Some(port) = u16::try_from(r.port).ok().filter(|p| *p != 0) {
+                return Some(port);
+            }
+        }
+    }
+}
+
+/// Drops whatever waits in the socket's receive queue (extra NAT replies): `connect` does not
+/// flush it.
+pub fn drain(socket: &UdpSocket) {
+    if socket.set_nonblocking(true).is_ok() {
+        let mut buf = [0u8; 1500];
+        while socket.recv_from(&mut buf).is_ok() {}
+        let _ = socket.set_nonblocking(false);
+    }
+}
+
 /// The IP of an offer's `ip` bytes (4 or 16).
 pub fn ip_from_bytes(b: &[u8]) -> Option<IpAddr> {
     match b.len() {
@@ -253,6 +363,95 @@ mod latency_tests {
         assert_eq!(
             lane_ip("fd00::5".parse().unwrap()),
             Ok("fd00::5".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn latency_wan_ip_gate() {
+        let v4: IpAddr = "8.8.8.8".parse().unwrap();
+        assert_eq!(wan_ip(v4), Ok(v4));
+        let mapped = IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped());
+        assert_eq!(wan_ip(mapped), Ok("1.2.3.4".parse().unwrap()));
+        assert!(wan_ip("100.64.0.1".parse().unwrap()).is_ok());
+        assert!(wan_ip("2001:db8::1".parse().unwrap()).is_ok());
+        for bad in [
+            "192.168.1.20",
+            "10.0.0.1",
+            "0.0.0.0",
+            "127.0.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "fd00::5",
+            "::",
+            "::1",
+        ] {
+            assert!(wan_ip(bad.parse().unwrap()).is_err(), "{bad}");
+        }
+        assert_eq!(
+            any_of_family("1.2.3.4".parse().unwrap()),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(any_of_family("2001:db8::1".parse().unwrap()).is_ipv6());
+    }
+
+    /// A stand-in rendezvous server answers the NAT query with a port; a foreign source's
+    /// answer is ignored, and a silent server gives None after the wait.
+    #[test]
+    fn latency_nat_port_query() {
+        use hbb_common::{
+            protobuf::Message as _,
+            rendezvous_proto::{rendezvous_message, RendezvousMessage, TestNatResponse},
+        };
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let foreign = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let lane = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let lane_addr = lane.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let (n, src) = server.recv_from(&mut buf).unwrap();
+            let req = RendezvousMessage::parse_from_bytes(&buf[..n]).unwrap();
+            assert!(matches!(
+                req.union,
+                Some(rendezvous_message::Union::TestNatRequest(_))
+            ));
+            let answer = |port| {
+                let mut m = RendezvousMessage::new();
+                m.set_test_nat_response(TestNatResponse {
+                    port,
+                    ..Default::default()
+                });
+                m.write_to_bytes().unwrap()
+            };
+            foreign.send_to(&answer(1), src).unwrap();
+            server.send_to(&answer(4242), src).unwrap();
+            src
+        });
+        assert_eq!(
+            nat_port(&lane, server_addr, Duration::from_secs(2)),
+            Some(4242)
+        );
+        assert_eq!(t.join().unwrap(), lane_addr);
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            nat_port(&lane, silent.local_addr().unwrap(), Duration::from_millis(200)),
+            None
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(rendezvous_udp("", "1.2.3.4".parse().unwrap()), None);
+        assert_eq!(
+            rendezvous_udp("127.0.0.1", "2001:db8::1".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            rendezvous_udp("127.0.0.1", "1.2.3.4".parse().unwrap()),
+            Some(
+                format!("127.0.0.1:{}", hbb_common::config::RENDEZVOUS_PORT)
+                    .parse()
+                    .unwrap()
+            )
         );
     }
 

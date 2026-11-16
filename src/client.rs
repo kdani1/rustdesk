@@ -651,8 +651,13 @@ impl Client {
         if config::is_incoming_only() && !is_switch_sides_back(conn_type, &interface).await {
             bail!("Incoming only mode");
         }
+        // Set again below only by a direct path that knows the host's address.
+        interface.get_lch().write().unwrap().udp_video_host = None;
         // to-do: remember the port for each peer, so that we can retry easier
         if hbb_common::is_ip_str(peer) {
+            if let Ok(addr) = check_port(peer, RELAY_PORT + 1).parse::<SocketAddr>() {
+                interface.get_lch().write().unwrap().udp_video_host = Some(addr.ip());
+            }
             return Ok((
                 (
                     connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
@@ -1755,6 +1760,10 @@ impl Client {
         // always direct; WebRTC is direct only when ICE nominated a non-TURN pair.
         let mut direct_futures = Vec::new();
         let race_log = RaceLog::new("connect");
+        // The host's address on each direct path, for an internet UDP video lane (M24): the
+        // TCP target, or the punched UDP sockets' peers (connected before this call).
+        let udp_peer = udp_socket_nat.as_ref().and_then(|s| s.peer_addr().ok());
+        let v6_peer = udp_socket_v6.as_ref().and_then(|s| s.peer_addr().ok());
         if allow_tcp_punch {
             let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
             direct_futures.push(race_log.track(
@@ -1874,6 +1883,12 @@ impl Client {
         }
         race_log.finish(if conn.is_ok() { typ } else { "" });
         let mut conn = conn?;
+        interface.get_lch().write().unwrap().udp_video_host = match typ {
+            "TCP" => Some(peer.ip()),
+            "UDP" => udp_peer.map(|a| a.ip()),
+            "IPv6" => v6_peer.map(|a| a.ip()),
+            _ => None,
+        };
         log::info!(
             "{:?} used to establish {typ} connection with {} punch",
             start.elapsed(),
@@ -3415,6 +3430,10 @@ pub struct LoginConfigHandler {
     // The peer-scoped part of it, and the only part that may be written back to the peer.
     pub peer_relay: bool,
     pub direct: Option<bool>,
+    /// The host's address as the last connect reached it on a direct path (TCP punch, direct
+    /// IP, KCP over a punched UDP socket); None on relay and WebRTC. The UDP video lane's
+    /// internet path (M24) sends to it.
+    pub udp_video_host: Option<std::net::IpAddr>,
     pub received: bool,
     switch_uuid: Option<String>,
     #[cfg(feature = "flutter")]
@@ -4433,7 +4452,8 @@ impl LoginConfigHandler {
             _ => {}
         }
         // Fork-only UDP video lane (docs/UDP-VIDEO.md); 0 leaves the field off the wire.
-        lr.udp_video_version = crate::udp_video::viewer::advertised_version(self.conn_type);
+        lr.udp_video_version =
+            crate::udp_video::viewer::advertised_version(self.conn_type, self.udp_video_host);
 
         let mut msg_out = Message::new();
         msg_out.set_login_request(lr);

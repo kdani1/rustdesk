@@ -473,9 +473,11 @@ pub struct Connection {
     udp_gate: crate::udp_video::host::Gate,
     udp_tap: Arc<crate::udp_video::host::VideoTap>,
     udp_video: Option<crate::udp_video::host::UdpVideoHost>,
-    // Live mode: after a fallback to TCP, the next offer and how many were made.
+    // Live mode: after a fallback to TCP, the next offer and how many were made, and the
+    // schedule of the lane that fell back last (LAN or internet).
     udp_retry_at: Option<Instant>,
     udp_retries: usize,
+    udp_backoff: &'static [Duration],
     // M22: held while this connection's lane takes recovery points, so HEVC on NVIDIA is
     // encoded by the NV SDK driver (reference frame invalidation).
     #[cfg(all(windows, feature = "vram"))]
@@ -681,6 +683,14 @@ impl Connection {
                     | super::TransportKind::TcpPunch
                     | super::TransportKind::Direct
             ),
+            direct_any: matches!(
+                transport,
+                super::TransportKind::Intranet
+                    | super::TransportKind::TcpPunch
+                    | super::TransportKind::Direct
+                    | super::TransportKind::KcpUdp
+                    | super::TransportKind::KcpIpv6
+            ),
             secured: stream.is_secured(),
             local: stream.local_addr(),
             peer: addr,
@@ -791,6 +801,7 @@ impl Connection {
             udp_video: None,
             udp_retry_at: None,
             udp_retries: 0,
+            udp_backoff: &crate::udp_video::host::RETRY_BACKOFF,
             #[cfg(all(windows, feature = "vram"))]
             udp_rfi_encoder: None,
             video_feedback_log: Default::default(),
@@ -6042,7 +6053,14 @@ impl Connection {
             _ if self.video_ack_required => {
                 Err("the viewer acknowledges frames (web client)".to_owned())
             }
-            Some(mode) => udp::offer_gate(&self.udp_gate).map(|(l, v)| (l, v, mode)),
+            // The LAN lane first, unchanged; an internet lane (M24) only where it refuses.
+            Some(mode) => match udp::offer_gate(&self.udp_gate) {
+                Ok((l, v)) => Ok((Some(l), v, mode)),
+                Err(lan) => self
+                    .udp_wan_gate(version)
+                    .map(|v| (None, v, mode))
+                    .map_err(|wan| format!("{lan}; internet lane: {wan}")),
+            },
         };
         let (local, viewer, mode) = match gate {
             Ok(v) => v,
@@ -6091,7 +6109,37 @@ impl Connection {
                 }),
             })
         });
-        match udp::UdpVideoHost::start(id, self.udp_tap.clone(), local, viewer, params, hooks) {
+        let started = match local {
+            Some(local) => {
+                udp::UdpVideoHost::start(id, self.udp_tap.clone(), local, viewer, params, hooks)
+                    .map(|(lane, offer)| (lane, Some(offer)))
+            }
+            None => {
+                // The lane's receive thread sends the offer after its NAT query, through the
+                // connection's message channel (the session writer, as every service does).
+                let tx = self.inner.tx.clone();
+                let deliver: udp::DeliverOffer = Box::new(move |offer| {
+                    let mut misc = Misc::new();
+                    misc.set_udp_video_offer(offer);
+                    let mut msg = Message::new();
+                    msg.set_misc(misc);
+                    if let Some(tx) = tx {
+                        let _ = tx.send((Instant::now(), Arc::new(msg)));
+                    }
+                });
+                udp::UdpVideoHost::start_wan(
+                    id,
+                    self.udp_tap.clone(),
+                    viewer,
+                    params,
+                    hooks,
+                    Config::get_rendezvous_server(),
+                    deliver,
+                )
+                .map(|lane| (lane, None))
+            }
+        };
+        match started {
             Ok((lane, offer)) => {
                 if let Some(fb) = self.video_feedback.as_mut() {
                     fb.lane_started();
@@ -6118,14 +6166,38 @@ impl Connection {
                         .get_or_insert_with(scrap::vram::RfiEncoderWanted::new);
                 }
                 self.udp_video = Some(lane);
-                let mut misc = Misc::new();
-                misc.set_udp_video_offer(offer);
-                let mut msg = Message::new();
-                msg.set_misc(misc);
-                self.send(msg).await;
+                if let Some(offer) = offer {
+                    let mut misc = Misc::new();
+                    misc.set_udp_video_offer(offer);
+                    let mut msg = Message::new();
+                    msg.set_misc(misc);
+                    self.send(msg).await;
+                }
             }
             Err(why) => log::warn!("UDPVIDEO host conn={id} not offered: {why}"),
         }
+    }
+
+    /// The viewer IP of an internet lane (M24), or why there is none: host option
+    /// enable-udp-video-wan=Y, a viewer of lane v6, no proxy, and `wan_gate` (a direct path,
+    /// encrypted, the viewer off the LAN).
+    fn udp_wan_gate(&self, version: u32) -> Result<IpAddr, String> {
+        use crate::udp_video::host as udp;
+        let option = Config::get_option(keys::OPTION_ENABLE_UDP_VIDEO_WAN);
+        if option != "Y" {
+            return Err(format!("host option enable-udp-video-wan is \"{option}\""));
+        }
+        if version < udp::VIEWER_WAN_VERSION {
+            return Err(format!(
+                "the viewer's lane v{version} has none (v{} needs a newer viewer with \
+                 enable-udp-video-wan not N on a direct session)",
+                udp::VIEWER_WAN_VERSION
+            ));
+        }
+        if Config::get_socks().is_some() || hbb_common::config::use_ws() {
+            return Err("a proxy or WebSocket is set (no UDP to the rendezvous server)".to_owned());
+        }
+        udp::wan_gate(&self.udp_gate)
     }
 
     async fn on_udp_video_control(&mut self, c: &UdpVideoControl) {
@@ -6144,6 +6216,11 @@ impl Connection {
             Ok(udp_video_control::Kind::KindRequestStop) => {
                 let why = format!("viewer asked: {}", c.reason);
                 self.udp_video_stop(&why, false).await;
+            }
+            Ok(udp_video_control::Kind::KindCandidate) => {
+                if let Err(why) = lane.on_candidate(c.lane_id, c.port) {
+                    self.udp_video_stop(&why, true).await;
+                }
             }
             _ => {}
         }
@@ -6232,7 +6309,7 @@ impl Connection {
                 "UDPVIDEO host conn={} retry {} of {}",
                 self.inner.id,
                 self.udp_retries,
-                crate::udp_video::host::RETRY_BACKOFF.len()
+                self.udp_backoff.len()
             );
             self.udp_video_offer().await;
         }
@@ -6243,6 +6320,7 @@ impl Connection {
             return;
         };
         let lane_id = lane.lane_id();
+        let backoff = lane.retry_backoff();
         let info = lane.shutdown(why);
         // The encoder already opened keeps its driver; the next one is chosen without this lane.
         #[cfg(all(windows, feature = "vram"))]
@@ -6282,7 +6360,7 @@ impl Connection {
             }
         }
         if info.was_live {
-            let backoff = crate::udp_video::host::RETRY_BACKOFF;
+            self.udp_backoff = backoff;
             if let Some(after) = backoff.get(self.udp_retries) {
                 self.udp_retries += 1;
                 self.udp_retry_at = Some(Instant::now() + *after);

@@ -12,7 +12,11 @@ per-frame feedback (arrival, decode and present times, UDP losses) over the sess
 transport; the host measures the one-way queueing delay from it and, when told to, uses it for
 QoS, an adaptive FEC level and the lane's fallback (see "Per-frame feedback (M23)"). Since M22
 a lost frame FEC could not save can be repaired by reference frame invalidation on NVENC (HEVC)
-instead of a key frame (`enable-nvenc-rfi`, see "RFI (M22)"). Off by default on the host.
+instead of a key frame (`enable-nvenc-rfi`, see "RFI (M22)"). Since M24 the same lane also runs
+over the internet when the session is on a direct path (TCP punch, direct IP, KCP): its own UDP
+socket on each end, public ports learned from the rendezvous server and exchanged over the
+session stream, a punch from both ends, WAN datagram sizes and no DSCP (`enable-udp-video-wan`,
+see "Internet lane (M24)"). Off by default on the host.
 Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), M22 (RFI), M23
 (feedback), M24 (internet).
 
@@ -26,7 +30,7 @@ Roadmap: `PLAN-full.hu.md` M19 (shadow test), M20 (live on the LAN), M21 (FEC), 
 | `src/udp_video/fec.rs` | Reed-Solomon erasure code over GF(256) (in-tree, AVX2/SSSE3 on x86-64), the frame's FEC block layout, `protect` (M21) |
 | `src/udp_video/pacing.rs` | Token-bucket pacer, target rate, `wait_until`, `Waiter` (high-resolution waitable timer) |
 | `src/udp_video/lane.rs` | `LaneSender` / `LaneReceiver`: the two ends without sockets |
-| `src/udp_video/net.rs` | LAN address gate, socket setup (`SIO_UDP_CONNRESET` off, buffers), lane clock |
+| `src/udp_video/net.rs` | LAN and internet address gates, socket setup (`SIO_UDP_CONNRESET` off, buffers), the rendezvous NAT query (M24), lane clock |
 | `src/udp_video/host.rs` | Offer gate, `UdpVideoHost` (socket, receive and sender threads, send window, QoS signal), `VideoTap` (routing, ACTIVE/STOP markers) |
 | `src/udp_video/viewer.rs` | Offer check, `UdpVideoClient` (socket, receive thread, ACKs), `ViewerLane` (io_loop state: hold, epochs, key frame requests, watchdog) |
 | `src/udp_video/shadow.rs` | Pairing of UDP and TCP copies by pts, window statistics |
@@ -179,6 +183,8 @@ live sender uses a high-resolution waitable timer on Windows.
 | `udp-video-burst` | host, server option | `8` | Live: datagrams per paced burst (1..=64; `0` = unpaced, a frame at once). Read at each offer. |
 | `udp-video-timeout-ms` | host, server option | `1000` | Live: no datagram from the other end this long ends the lane (200..=10000). Sent in the offer; the viewer uses the same value. Read at each offer. |
 | `udp-video-fec-percent` | host, server option | `20` | FEC parity per block in percent of its data shards (0..=100; `0` = no parity; empty or invalid: 20), at least 2 per block. Live and shadow lanes, viewers of lane v4 only. Read at each offer (M21). |
+| `enable-udp-video-wan` | host, server option | off | `Y`: also offer the lane (in the `enable-udp-video` mode) on a direct internet path to a viewer of lane v6 (M24). Read at each offer. |
+| `enable-udp-video-wan` | viewer, local option | on | `N`: advertise lane v5 (no internet lanes) and refuse an internet offer; LAN lanes unaffected (M24). |
 
 `rustdesk.exe --option enable-udp-video shadow` (or `Y`) on the host (elevated, installed)
 turns the probe on, `live` live mode, `N` off; it applies from the next login. **Note:** `Y`
@@ -192,7 +198,9 @@ frame.
 Tag plan of the fork: Misc 1001 `pointer_captured`; the lane uses LoginRequest 1001 and Misc
 1002 (`UdpVideoOffer`, field 10 `fec_percent` since M21), 1003 (`UdpVideoControl`) and 1004
 (`UdpVideoFeedback`, M20); the per-frame feedback (M23) uses Features 1001 (`video_feedback`)
-and Misc 1005 (`VideoFeedback`). Next free: Misc 1006, Features 1002, LoginRequest 1002. The fast
+and Misc 1005 (`VideoFeedback`); the internet lane (M24) adds `UdpVideoOffer.wan` (11),
+`UdpVideoControl.Kind.KindCandidate` (6) and `UdpVideoControl.port` (7). Next free: Misc 1006,
+Features 1002, LoginRequest 1002, `UdpVideoOffer` 12, `UdpVideoControl` 8. The fast
 ABR design's own plan (Features 1001 / Misc 1002 for the feedback) is superseded by this one:
 Misc 1002 was taken by the lane.
 
@@ -200,7 +208,8 @@ Misc 1002 was taken by the lane.
    remote control unless `enable-udp-video` is `N`: 1 by an M19 viewer (shadow only), 2 by the
    first M20 build (live without EPOCH markers), 3 since the M20 review (live with them), 4
    since M21 (also takes FEC parity datagrams), 5 since M22 (resumes a broken display at a
-   `RECOVERY_POINT` frame too). Stock hosts ignore the field. A host with
+   `RECOVERY_POINT` frame too), 6 since M24 (also takes internet lanes; only when the session
+   is direct and the viewer knows the host's address off the LAN). Stock hosts ignore the field. A host with
    `live` offers live mode to v3 and later only; an older viewer gets a `not offered` line
    instead. Only a v4 viewer gets `fec_percent` > 0. Shadow offers have version 1, live offers version 2 (EPOCH
    markers); the viewer refuses a live offer of version 1 (the first M20 host). The datagram
@@ -767,3 +776,112 @@ frame repairs it.
   and no static refine.
 - **Hardware validation**: Iris Xe and the RTX viewer decoding a stream with skipped
   invalidated frames, recovery time and spike size against IDR (the roadmap gate).
+
+## Internet lane (M24)
+
+The LAN lane of M19-M23 over the internet: the same wire format, crypto, live mode, FEC, RFI,
+feedback and fallback, carried by a UDP socket of its own on each end that both ends punch
+through their NATs. The roadmap's other carriers (KCP socket mux, WebRTC data channel over
+TURN) are left out, see below.
+
+### When
+
+The host offers an internet lane only where the LAN gate refuses (a LAN session keeps its LAN
+lane, unchanged) and all of these hold:
+
+- host option `enable-udp-video-wan=Y` (off by default) and `enable-udp-video` = `live` or
+  `shadow`, as for a LAN lane;
+- the viewer advertised lane **v6**: a Windows viewer with `enable-udp-video-wan` not `N` whose
+  session is direct (`connect` won with TCP punch, direct IP access, or KCP over a punched UDP
+  socket, IPv4 or IPv6) and which knows the host's address there, off the LAN
+  (`LoginConfigHandler::udp_video_host`, set by `Client::connect`; None on relay and WebRTC). A
+  viewer that cannot address the host never advertises v6, so the host never offers a lane it
+  could not use;
+- the host's transport (`TransportInfo`) is direct: intranet, TCP punch, direct, KCP-UDP or
+  KCP-IPv6 (never relay or WebRTC: the address the connection keys on would not be the viewer's);
+- the session stream is encrypted (the lane secret travels in it);
+- the viewer's address (the session peer, normalized) is a unicast address off the LAN
+  (`net::wan_ip`: not loopback, unspecified, link-local, multicast; CGNAT counts as internet);
+- no SOCKS proxy or WebSocket is set on the host (no UDP to the rendezvous server).
+
+The viewer takes an internet offer only with `enable-udp-video-wan` not `N`, on a round whose
+session is direct, encrypted, not WebRTC, with a known host address off the LAN
+(`check_wan_offer`: the offer's `max_datagram` at most the WAN budget of that family).
+
+### Handshake
+
+1. **Host:** binds the wildcard of the viewer's family (port 0), and on the lane's receive
+   thread asks the rendezvous server (`Config::get_rendezvous_server()`, UDP port 21116) for the
+   socket's public port with the `TestNatRequest` the session's own UDP punch uses (every
+   150 ms, up to 1 s; only the server's reply counts). The offer (`wan=true`, no `ip`, `port` =
+   that public port, or the local port without an answer or on IPv6, `max_datagram` 1024 or
+   1184) then goes to the connection's message channel. The connection never waits for the
+   query: it runs the session.
+2. **Viewer:** binds the wildcard of the host's family, asks its own rendezvous server the same
+   way on the lane thread, and reports its public port (or local port) as
+   `UdpVideoControl{KindCandidate, port}` over the session stream. Then it `connect()`s to the
+   host IP it reached the session on, at the offer's port, and sends HELLO every 20 ms for up to
+   3 s (LAN: 1 s).
+3. **Host:** on the candidate, the receive thread sends a punch every 20 ms to the viewer's
+   session IP at that port: a HELLO sealed with the host's keys (the viewer ignores it if it gets
+   through). It opens the host side's NAT mapping and filter toward the viewer. The first HELLO
+   from the viewer's IP that opens with the lane keys ends the punch; the host `connect()`s to
+   its source (which may differ from the candidate) and answers HELLO_ACK, as on the LAN.
+4. READY, ACTIVE, video, ACKs and the rest as on the LAN. The host's handshake timeout is 6 s
+   (the two queries, the candidate's trip and the HELLOs).
+
+Both ends send first, so a port-preserving or endpoint-independent NAT on either side, and an
+address-dependent filter on either side, are crossed. A NAT that maps per destination (symmetric
+NAT, many CGNATs) gives the peer a port it will never see traffic from: the handshake then times
+out and the session stays on its transport. The rendezvous server must answer UDP
+`TestNatRequest` (hbbs does, it is the UDP punch's query); without an answer the local port is
+offered, which works only behind a port-preserving NAT.
+
+### On the way
+
+- **Datagram size:** at most 1024 bytes of UDP payload over IPv4 and 1184 over IPv6 (Moonlight's
+  values: tunnels, PPPoE, mobile), so 976 / 1136 bytes of video per fragment; the pacer's burst
+  is counted in those datagrams. LAN lanes stay at 1400.
+- **No DSCP:** the qWAVE AudioVideo flow is added only to a LAN lane's socket; providers bleach
+  or misread DSCP.
+- **NAT keepalive:** the viewer's PINGs (every 200 ms) and live ACKs (every 50 ms) refresh its
+  mapping, the host's PONGs and video refresh the host's. The host's receive thread also sends
+  a PING when it has sent nothing for 500 ms (the roadmap's heartbeat), so its mapping survives
+  lost PINGs on a static screen.
+- **Fallback:** as on the LAN: silence for `udp-video-timeout-ms` (1000 ms by default, both
+  ends), send errors, sustained loss or the viewer's request end the lane, the video goes back
+  to the session stream with a key frame per display and the in-band STOP. The next offers come
+  after **10 s, 30 s and 120 s** (`RETRY_BACKOFF_WAN`; LAN 30 s and 120 s), each with a fresh
+  socket, NAT query, secret and lane id, then never again in that session.
+- Encryption, replay window, FEC, RFI and the per-frame feedback are the LAN lane's.
+
+### Compatibility
+
+- A stock or older fork viewer never advertises v6: it never gets an internet offer, and the
+  host's LAN behaviour toward it is unchanged. A stock host ignores the version.
+- A fork viewer on a LAN session advertises v5 (the host address is on the LAN) and gets the
+  LAN lane as before; on a relay or WebRTC session it advertises v5 too (the address is cleared
+  at the start of every connect and set only by a direct win), and the host's transport gate
+  would refuse anyway.
+- `KindCandidate` is sent only after a `wan` offer, which only a v6-aware host makes.
+- Other platforms compile the code; only Windows hosts offer and only Windows viewers advertise.
+
+### Left out of M24
+
+- **KCP socket mux** (roadmap 4a): the lane on the KCP session's own punched socket, demuxed in
+  `kcp_stream.rs` by an outer header byte. The host's connection never sees the KCP socket
+  (`udp_nat_listen` keeps it in its own future), and a dedicated punched socket covers KCP
+  sessions as well (it costs one more NAT mapping and query). The 1024/1184 budget is used
+  instead of KCP's 1214-byte datagrams.
+- **WebRTC unreliable data channel and TURN** (roadmap 4c): needs a negotiated `webrtc-rs`
+  channel outside the `Stream` enum in hbb_common; relay sessions (most of them caused by a
+  symmetric NAT, where a re-punch fails by construction) and WebRTC sessions keep their video on
+  the session stream. "Relay via TURN only if configured" therefore means: never, in this build.
+- **Several candidates** (LAN addresses next to the public one, both families): one candidate
+  per side; the session's own family decides.
+- **A host-key-derived lane key** (HKDF over the session key through a new `FramedStream` API):
+  the lane keeps its fresh secret sent over the encrypted session stream (see Encryption).
+- **Moving the session itself** between paths (relay to direct): out of scope.
+- **Measurements:** the roadmap gate (phone hotspot and another network: lane loss, jitter and
+  longest gap per 10 s; no multi-frame stall at 1-3% loss) needs two networks; the window lines
+  give the numbers (docs/LATENCY-METRICS.md, "UDP video lane over the internet (M24)").

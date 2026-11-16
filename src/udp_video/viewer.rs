@@ -38,7 +38,10 @@ use super::{
     crypto::{Role, SECRET_LEN},
     fragment::{Event, LossStats, ReassemblyConfig},
     fec,
-    host::{DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_RFI_VERSION},
+    host::{
+        DEFAULT_TIMEOUT, LANE_VERSION, LIVE_LANE_VERSION, TIMEOUT_RANGE_MS, VIEWER_RFI_VERSION,
+        VIEWER_WAN_VERSION,
+    },
     lane::{DropStats, LaneReceiver, LaneSender, Received},
     net::{self, LaneClock, ReadTimeout},
     packet::{Ack, Inner, PathClass, ACK_NO_FRAME, FLAG_KEY, FLAG_RECOVERY_POINT, VIDEO_OVERHEAD},
@@ -67,6 +70,9 @@ use std::{
 
 const HELLO_EVERY: Duration = Duration::from_millis(20);
 const HELLO_FOR: Duration = Duration::from_secs(1);
+/// Internet lane (M24): the host starts punching only once the candidate crossed the session
+/// stream, so HELLOs go on longer (inside the host's 6 s handshake).
+const HELLO_FOR_WAN: Duration = Duration::from_secs(3);
 const PING_EVERY: Duration = Duration::from_millis(200);
 /// Live: every display's ACK is repeated this often even without progress.
 const ACK_EVERY: Duration = Duration::from_millis(50);
@@ -93,18 +99,39 @@ const KF_RETRY: Duration = Duration::from_millis(250);
 /// longest spread (`pacing::MAX_SPREAD`, 25 ms) with room for Wi-Fi jitter.
 pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 
-/// The lane version to advertise in the login request, 0 for none.
-pub fn advertised_version(conn_type: ConnType) -> u32 {
-    if cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled() {
-        VIEWER_RFI_VERSION
-    } else {
+/// The lane version to advertise in the login request, 0 for none. `host_ip`: the host's
+/// address on a direct session (`LoginConfigHandler::udp_video_host`); an internet lane (v6)
+/// is advertised only when it is off the LAN, so a host never offers one the viewer cannot
+/// address.
+pub fn advertised_version(conn_type: ConnType, host_ip: Option<IpAddr>) -> u32 {
+    if !(cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled()) {
         0
+    } else if wan_enabled() && host_ip.map_or(false, |ip| net::wan_ip(ip).is_ok()) {
+        VIEWER_WAN_VERSION
+    } else {
+        VIEWER_RFI_VERSION
     }
 }
 
 /// Viewer option `enable-udp-video`: on unless "N". It only advertises; the host decides.
 pub fn enabled() -> bool {
     LocalConfig::get_option(keys::OPTION_ENABLE_UDP_VIDEO) != "N"
+}
+
+/// Viewer option `enable-udp-video-wan` (M24): on unless "N". It only advertises internet
+/// lanes (and refuses an offer of one); the host decides.
+pub fn wan_enabled() -> bool {
+    LocalConfig::get_option(keys::OPTION_ENABLE_UDP_VIDEO_WAN) != "N"
+}
+
+/// What an io_loop round knows for an internet lane (M24).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WanRound {
+    /// The host's address as this viewer reached the session (TCP punch, direct IP, KCP).
+    pub host: IpAddr,
+    /// The rendezvous server the session went through (host name or address, maybe a port):
+    /// the lane asks it for its public port.
+    pub rendezvous: String,
 }
 
 /// A complete shadow frame, stamped and parsed by the receive thread.
@@ -176,6 +203,13 @@ pub enum ViewerEvent {
     Counts(UdpCounts),
     /// Live: the thread gave up on the lane (silence, socket errors) and stopped.
     Failed(String),
+    /// Internet lane (M24), before the HELLOs: the lane socket's public port (`mapped`: the
+    /// rendezvous server's answer; otherwise its local port), for the host's punch.
+    Candidate {
+        port: u16,
+        mapped: bool,
+        after: Duration,
+    },
     Window(Box<RecvWindow>),
 }
 
@@ -204,10 +238,58 @@ pub struct Accepted {
     /// FEC parity the host adds, in percent (0: none). Logged only: parity shards are taken
     /// whenever they come.
     pub fec: u32,
+    /// Internet lane (M24): the rendezvous server to ask for the public port; `local` is then
+    /// the wildcard of the host's family.
+    pub wan: Option<String>,
 }
 
 /// Checks an offer against what this build speaks and the session's own local address.
 pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted, String> {
+    if offer.wan {
+        return Err("internet lane offered on a LAN check".to_owned());
+    }
+    let mut a = check_common(offer)?;
+    let host_ip = net::ip_from_bytes(&offer.ip).ok_or("bad host address")?;
+    let host_ip = net::lane_ip(host_ip).map_err(|e| format!("host address: {e}"))?;
+    let local_ip = net::lane_ip(local.ip()).map_err(|e| format!("local address {local}: {e}"))?;
+    if local_ip.is_ipv4() != host_ip.is_ipv4() {
+        return Err("address families differ".to_owned());
+    }
+    a.local = local_ip;
+    a.host = SocketAddr::new(host_ip, a.host.port());
+    Ok(a)
+}
+
+/// Checks an internet lane offer (M24): the host IP is the one this viewer reached the session
+/// on (the offer has none), the port the offer's, the datagram budget at most the WAN one of
+/// that family.
+pub fn check_wan_offer(offer: &UdpVideoOffer, wan: &WanRound) -> Result<Accepted, String> {
+    if !offer.wan {
+        return Err("LAN lane offered on an internet check".to_owned());
+    }
+    let host_ip = net::wan_ip(wan.host).map_err(|e| format!("host address {}: {e}", wan.host))?;
+    let path = if host_ip.is_ipv4() {
+        PathClass::WanV4
+    } else {
+        PathClass::WanV6
+    };
+    if offer.max_datagram as usize > path.max_datagram() {
+        return Err(format!(
+            "max_datagram {} above the {} budget {}",
+            offer.max_datagram,
+            path.label(),
+            path.max_datagram()
+        ));
+    }
+    let mut a = check_common(offer)?;
+    a.local = net::any_of_family(host_ip);
+    a.host = SocketAddr::new(host_ip, a.host.port());
+    a.wan = Some(wan.rendezvous.clone());
+    Ok(a)
+}
+
+/// The checks every offer needs; `local` and the host IP are left unspecified.
+fn check_common(offer: &UdpVideoOffer) -> Result<Accepted, String> {
     let live = match offer.mode.enum_value() {
         Ok(udp_video_offer::Mode::ModeShadow) => false,
         Ok(udp_video_offer::Mode::ModeLive) => true,
@@ -232,28 +314,24 @@ pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted,
     if max <= VIDEO_OVERHEAD || max > RECV_BUF {
         return Err(format!("max_datagram {max}"));
     }
-    let host_ip = net::ip_from_bytes(&offer.ip).ok_or("bad host address")?;
-    let host_ip = net::lane_ip(host_ip).map_err(|e| format!("host address: {e}"))?;
     let port = u16::try_from(offer.port)
         .ok()
         .filter(|p| *p != 0)
         .ok_or_else(|| format!("port {}", offer.port))?;
-    let local_ip = net::lane_ip(local.ip()).map_err(|e| format!("local address {local}: {e}"))?;
-    if local_ip.is_ipv4() != host_ip.is_ipv4() {
-        return Err("address families differ".to_owned());
-    }
     let timeout = Some(offer.timeout_ms as u64)
         .filter(|ms| (TIMEOUT_RANGE_MS.0..=TIMEOUT_RANGE_MS.1).contains(ms))
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT);
+    let none = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
     Ok(Accepted {
-        local: local_ip,
-        host: SocketAddr::new(host_ip, port),
+        local: none,
+        host: SocketAddr::new(none, port),
         secret,
         every: offer.shadow_every.max(1),
         live,
         timeout,
         fec: offer.fec_percent.min(fec::MAX_PERCENT),
+        wan: None,
     })
 }
 
@@ -268,9 +346,13 @@ impl UdpVideoClient {
         for n in notes {
             log::warn!("UDPVIDEO viewer socket option failed: {n}");
         }
-        socket
-            .connect(a.host)
-            .map_err(|e| format!("connect {}: {e}", a.host))?;
+        // An internet lane connects on its thread, after the NAT query (which needs the socket
+        // unconnected to hear the rendezvous server).
+        if a.wan.is_none() {
+            socket
+                .connect(a.host)
+                .map_err(|e| format!("connect {}: {e}", a.host))?;
+        }
         let local = socket.local_addr().map_err(|e| e.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
         let params = RecvParams {
@@ -278,6 +360,7 @@ impl UdpVideoClient {
             lane_id,
             live: a.live,
             timeout: a.timeout,
+            wan: a.wan.clone().map(|server| (server, a.host)),
         };
         let stop2 = stop.clone();
         std::thread::Builder::new()
@@ -293,6 +376,34 @@ struct RecvParams {
     lane_id: u64,
     live: bool,
     timeout: Duration,
+    /// Internet lane: the rendezvous server (for the NAT query) and the host's address.
+    wan: Option<(String, SocketAddr)>,
+}
+
+/// Internet lane, on the receive thread before the HELLOs: asks the rendezvous server for the
+/// socket's public port, reports it (the local port without an answer) for the host's punch,
+/// then connects the socket to the host. Err when the socket cannot be connected.
+fn wan_prepare(
+    socket: &UdpSocket,
+    server: &str,
+    host: SocketAddr,
+    tx: &mpsc::UnboundedSender<ViewerEvent>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let mapped = net::rendezvous_udp(server, host.ip())
+        .and_then(|rs| net::nat_port(socket, rs, net::NAT_QUERY_FOR));
+    let _ = tx.send(ViewerEvent::Candidate {
+        port: mapped.unwrap_or(local_port),
+        mapped: mapped.is_some(),
+        after: started.elapsed(),
+    });
+    socket
+        .connect(host)
+        .map_err(|e| format!("connect {host}: {e}"))?;
+    // Later NAT replies would only count as malformed datagrams.
+    net::drain(socket);
+    Ok(())
 }
 
 /// Live: what the next ACK of a display says besides `settled`.
@@ -328,6 +439,15 @@ fn recv_loop(
     #[cfg(windows)]
     let _boost = crate::platform::windows::viewer_thread_boost("udp_video", None);
     let lane_id = p.lane_id;
+    let hello_for = if let Some((server, host)) = &p.wan {
+        if let Err(e) = wan_prepare(&socket, server, *host, &tx) {
+            let _ = tx.send(ViewerEvent::HandshakeFailed(e));
+            return;
+        }
+        HELLO_FOR_WAN
+    } else {
+        HELLO_FOR
+    };
     let mut lane_tx = LaneSender::new(&p.secret, lane_id, Role::Viewer, PathClass::Lan);
     let config = if p.live {
         // Live: never a frame whose reference is missing; a display starts at frame 0, the
@@ -375,10 +495,10 @@ fn recv_loop(
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if !acked {
-            if now.duration_since(started) >= HELLO_FOR {
+            if now.duration_since(started) >= hello_for {
                 let _ = tx.send(ViewerEvent::HandshakeFailed(format!(
                     "no HELLO_ACK in {} ms after {hellos} HELLO",
-                    HELLO_FOR.as_millis()
+                    hello_for.as_millis()
                 )));
                 return;
             }
@@ -653,6 +773,9 @@ fn keyframe_request(lane_id: u64, display: u8, from: u32, to: u32) -> Message {
 struct Round {
     /// The session stream's local address, when the session may take a lane.
     local: Option<SocketAddr>,
+    /// Internet lane (M24): the host's address and the rendezvous server, when the session may
+    /// take one.
+    wan: Option<WanRound>,
     tx: mpsc::UnboundedSender<ViewerEvent>,
 }
 
@@ -769,11 +892,14 @@ pub struct ViewerLane {
 
 impl ViewerLane {
     /// A new io_loop round. `local` is the session stream's local address when the session is
-    /// direct TCP (no KCP, no WebRTC, no relay) and encrypted, else None (an offer is refused).
+    /// direct TCP (no KCP, no WebRTC, no relay) and encrypted, else None (a LAN offer is
+    /// refused). `wan`: what an internet lane needs when the session is direct (KCP too) and
+    /// encrypted and the host's address is known, else None (an internet offer is refused).
     pub fn begin_round(
         &mut self,
         peer: &str,
         local: Option<SocketAddr>,
+        wan: Option<WanRound>,
     ) -> mpsc::UnboundedReceiver<ViewerEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.client = None;
@@ -785,7 +911,7 @@ impl ViewerLane {
         self.fb_lost.clear();
         self.matcher = ShadowMatcher::default();
         self.peer = peer.to_owned();
-        self.round = Some(Round { local, tx });
+        self.round = Some(Round { local, wan, tx });
         rx
     }
 
@@ -826,10 +952,24 @@ impl ViewerLane {
         let Some(round) = &self.round else {
             return refuse("no session round".to_owned());
         };
-        let Some(local) = round.local else {
-            return refuse("session is not direct encrypted TCP".to_owned());
+        let checked = if offer.wan {
+            if !wan_enabled() {
+                return refuse("enable-udp-video-wan is N".to_owned());
+            }
+            let Some(wan) = &round.wan else {
+                return refuse(
+                    "internet lane: session is not direct and encrypted, or the host address is unknown"
+                        .to_owned(),
+                );
+            };
+            check_wan_offer(offer, wan)
+        } else {
+            let Some(local) = round.local else {
+                return refuse("session is not direct encrypted TCP".to_owned());
+            };
+            check_offer(offer, local)
         };
-        let a = match check_offer(offer, local) {
+        let a = match checked {
             Ok(a) => a,
             Err(why) => return refuse(why),
         };
@@ -839,7 +979,7 @@ impl ViewerLane {
         match UdpVideoClient::start(&a, offer.lane_id, tx) {
             Ok((client, bound)) => {
                 log::info!(
-                    "UDPVIDEO viewer peer={} accepted lane={:016x} mode={} host={} local={} every={} timeout_ms={} fec={}",
+                    "UDPVIDEO viewer peer={} accepted lane={:016x} mode={} host={} local={} every={} timeout_ms={} fec={} path={} max_datagram={}",
                     self.peer,
                     offer.lane_id,
                     if a.live { "live" } else { "shadow" },
@@ -847,7 +987,13 @@ impl ViewerLane {
                     bound,
                     a.every,
                     a.timeout.as_millis(),
-                    a.fec
+                    a.fec,
+                    match (&a.wan, a.host.is_ipv4()) {
+                        (None, _) => PathClass::Lan.label(),
+                        (Some(_), true) => PathClass::WanV4.label(),
+                        (Some(_), false) => PathClass::WanV6.label(),
+                    },
+                    offer.max_datagram
                 );
                 self.client = Some(client);
                 self.matcher = ShadowMatcher::default();
@@ -1075,10 +1221,32 @@ impl ViewerLane {
                 );
                 Some(control(udp_video_control::Kind::KindReady, lane_id, ""))
             }
+            ViewerEvent::Candidate {
+                port,
+                mapped,
+                after,
+            } => {
+                log::info!(
+                    "UDPVIDEO viewer peer={} candidate lane={lane_id:016x} port={port} mapped={mapped} nat_ms={}",
+                    self.peer,
+                    after.as_millis()
+                );
+                let mut misc = Misc::new();
+                misc.set_udp_video_control(UdpVideoControl {
+                    kind: udp_video_control::Kind::KindCandidate.into(),
+                    lane_id,
+                    port: port as u32,
+                    ..Default::default()
+                });
+                let mut msg = Message::new();
+                msg.set_misc(misc);
+                Some(msg)
+            }
             ViewerEvent::HandshakeFailed(why) => {
                 log::warn!(
                     "UDPVIDEO viewer peer={} handshake failed lane={lane_id:016x}: {why} \
-                     (UDP from this viewer to the host, or back, is blocked)",
+                     (UDP from this viewer to the host, or back, is blocked; on an internet \
+                     lane also a NAT that maps or filters per destination)",
                     self.peer
                 );
                 self.client = None;
@@ -1463,6 +1631,7 @@ mod latency_tests {
             live: false,
             timeout: DEFAULT_TIMEOUT,
             fec: offer.fec_percent,
+            wan: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_client, _) = UdpVideoClient::start(&a, offer.lane_id, tx).unwrap();
@@ -1511,6 +1680,7 @@ mod latency_tests {
             live: true,
             timeout: DEFAULT_TIMEOUT,
             fec: 0,
+            wan: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_client, _) = UdpVideoClient::start(&a, offer.lane_id, tx).unwrap();
@@ -1563,6 +1733,125 @@ mod latency_tests {
             panic!("no control");
         };
         assert_eq!(c.last_frames[0].frame_id, 7);
+    }
+
+    /// Internet lane offers (M24): the host IP comes from the session, the bind address is the
+    /// wildcard of its family, the datagram budget is capped by the WAN one; LAN and internet
+    /// offers never pass each other's check.
+    #[test]
+    fn latency_check_wan_offer_rules() {
+        let wan = WanRound {
+            host: "81.2.3.4".parse().unwrap(),
+            rendezvous: "rs.example".to_owned(),
+        };
+        let mut o = offer();
+        o.ip = Default::default();
+        o.wan = true;
+        o.max_datagram = 1024;
+        let a = check_wan_offer(&o, &wan).unwrap();
+        assert_eq!(a.host, "81.2.3.4:40000".parse().unwrap());
+        assert_eq!(a.local, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(a.wan.as_deref(), Some("rs.example"));
+        assert!(check_offer(&o, "192.168.1.9:50123".parse().unwrap()).is_err());
+        assert!(check_wan_offer(&offer(), &wan).is_err());
+        o.max_datagram = 1400;
+        assert!(check_wan_offer(&o, &wan).is_err());
+        let v6 = WanRound {
+            host: "2001:db8::2".parse().unwrap(),
+            ..wan.clone()
+        };
+        o.max_datagram = 1184;
+        let a = check_wan_offer(&o, &v6).unwrap();
+        assert!(a.local.is_ipv6());
+        assert_eq!(a.host, "[2001:db8::2]:40000".parse().unwrap());
+        let lan = WanRound {
+            host: "192.168.1.5".parse().unwrap(),
+            ..wan.clone()
+        };
+        assert!(check_wan_offer(&o, &lan).is_err());
+        o.port = 0;
+        assert!(check_wan_offer(&o, &v6).is_err());
+        // Never more than the RFI lane without a usable host address; nothing for file transfer.
+        assert!(
+            advertised_version(ConnType::DEFAULT_CONN, Some("192.168.1.5".parse().unwrap()))
+                <= VIEWER_RFI_VERSION
+        );
+        assert!(advertised_version(ConnType::DEFAULT_CONN, None) <= VIEWER_RFI_VERSION);
+        assert_eq!(
+            advertised_version(ConnType::FILE_TRANSFER, Some("81.2.3.4".parse().unwrap())),
+            0
+        );
+    }
+
+    /// An internet lane end to end over loopback (the WAN address checks are bypassed: they
+    /// refuse loopback): the host's offer comes through `deliver`, the viewer's thread reports
+    /// its candidate before any HELLO, the host takes it and punches, HELLO_ACK, READY, and live
+    /// frames arrive whole in WAN-sized datagrams.
+    #[test]
+    fn latency_loopback_wan_candidate_and_live_frames() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let tap = Arc::new(VideoTap::default());
+        let (hooks, _fetched) = counting_hooks();
+        let (offer_tx, offer_rx) = std::sync::mpsc::channel();
+        let mut host = UdpVideoHost::start_wan(
+            5,
+            tap.clone(),
+            lo,
+            params(Mode::Live),
+            Some(hooks),
+            String::new(),
+            Box::new(move |o| {
+                let _ = offer_tx.send(o);
+            }),
+        )
+        .unwrap();
+        let offer = offer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(offer.wan);
+        assert_eq!(offer.max_datagram, 1024);
+        let a = Accepted {
+            local: lo,
+            host: SocketAddr::new(lo, offer.port as u16),
+            secret: offer.secret.as_ref().try_into().unwrap(),
+            every: 1,
+            live: true,
+            timeout: DEFAULT_TIMEOUT,
+            fec: offer.fec_percent,
+            wan: Some(String::new()),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_client, bound) = UdpVideoClient::start(&a, offer.lane_id, tx).unwrap();
+        match next_event(&mut rx) {
+            ViewerEvent::Candidate { port, mapped, .. } => {
+                assert!(!mapped);
+                assert_eq!(port, bound.port());
+                host.on_candidate(offer.lane_id, port as u32).unwrap();
+            }
+            _ => panic!("expected the candidate first"),
+        }
+        match next_event(&mut rx) {
+            ViewerEvent::HelloAck { .. } => {}
+            _ => panic!("expected HELLO_ACK"),
+        }
+        host.on_ready(offer.lane_id).unwrap();
+        // Big enough for several WAN datagrams each.
+        let sent: Vec<_> = (0..4).map(|pts| video(0, pts * 500, pts == 0)).collect();
+        for m in &sent {
+            assert!(!tap.route(m, Instant::now()).tcp);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut got = 0u32;
+        while got < sent.len() as u32 {
+            match next_event(&mut rx) {
+                ViewerEvent::Live(f) => {
+                    assert_eq!(f.frame_id, got);
+                    got += 1;
+                }
+                ViewerEvent::Lost { .. } => panic!("loss on loopback"),
+                _ => {}
+            }
+        }
+        assert!(host.check().is_ok());
+        host.shutdown("test");
     }
 
     fn live_frame(display: u8, frame_id: u32, epoch: u8, key: bool) -> LiveFrame {
@@ -1707,6 +1996,7 @@ mod latency_tests {
             live: true,
             timeout: DEFAULT_TIMEOUT,
             fec: 0,
+            wan: None,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut lane = ViewerLane::default();
@@ -1799,6 +2089,7 @@ mod latency_tests {
             live: true,
             timeout: DEFAULT_TIMEOUT,
             fec: 0,
+            wan: None,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut lane = ViewerLane::default();

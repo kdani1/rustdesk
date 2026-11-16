@@ -3,7 +3,9 @@
 //! host's copy of every Nth frame, the viewer's pairing with the TCP copy). M20: live mode,
 //! video frames over UDP with paced bursts, a send window, key frames on loss and a fallback
 //! to TCP video in the same session. M21: Reed-Solomon FEC per frame. M22: loss repaired by
-//! reference frame invalidation. See docs/UDP-VIDEO.md.
+//! reference frame invalidation. M24: the same lane over the internet on direct sessions (own
+//! punched socket per end, public ports from the rendezvous server, WAN datagram sizes, no
+//! DSCP). See docs/UDP-VIDEO.md.
 //!
 //! - `packet`: wire format (frame id, fragment index/count, FEC block fields and parity
 //!   datagrams, epoch, flags).
@@ -14,7 +16,7 @@
 //!   block layout (M21).
 //! - `pacing`: token-bucket pacing, the target rate and a high-resolution waiter (live mode).
 //! - `lane`: sender and receiver ends without sockets.
-//! - `net`: LAN address gate, socket setup, lane clock.
+//! - `net`: LAN and internet address gates, socket setup, the NAT query, lane clock.
 //! - `host`: offer gate, `UdpVideoHost` (socket, receive and sender threads), `VideoTap`.
 //! - `viewer`: offer check, `UdpVideoClient` (socket, receive thread), `ViewerLane`.
 //! - `shadow`: UDP/TCP pairing and window statistics.

@@ -311,7 +311,21 @@ impl<T: InvokeUiSession> Remote<T> {
                     && kcp.is_none()
                     && !peer.is_webrtc())
                 .then(|| peer.local_addr());
-                let mut udp_rx = self.udp_video.begin_round(&self.handler.get_id(), udp_local);
+                // An internet lane (M24) also on KCP, wherever connect reached the host
+                // directly and knows its address.
+                let udp_wan = (conn_type == ConnType::DEFAULT_CONN
+                    && direct
+                    && is_secured
+                    && !peer.is_webrtc())
+                .then(|| self.handler.lc.read().unwrap().udp_video_host)
+                .flatten()
+                .map(|host| crate::udp_video::viewer::WanRound {
+                    host,
+                    rendezvous: rendezvous_server.clone(),
+                });
+                let mut udp_rx =
+                    self.udp_video
+                        .begin_round(&self.handler.get_id(), udp_local, udp_wan);
                 // Per-frame feedback is decided again by this round's PeerInfo.
                 self.video_feedback = None;
 

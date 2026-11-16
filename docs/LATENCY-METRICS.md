@@ -537,6 +537,64 @@ Roadmap gate: with the same loss pattern, `rfi_idr` low, `fix_ms` and the viewer
 worse than with the option off, and `rfi_max` well below the `keymax` of the IDR run; the Dell
 (Iris Xe) decodes the stream after a recovery point without artefacts.
 
+### UDP video lane over the internet (M24)
+
+Host server option `enable-udp-video-wan=Y` (off by default) on top of `enable-udp-video`
+(`live` or `shadow`), a viewer of lane v6 (`enable-udp-video-wan` not `N` on it, a direct
+session whose host address it knows), and a session on a direct internet path: TCP punch,
+direct IP access or KCP over a punched UDP socket, never relay or WebRTC (docs/UDP-VIDEO.md,
+"Internet lane (M24)"). Every line of the sections above applies; the window lines are the
+same. The handshake adds:
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=0.0.0.0:61234 every=2 burst=8 timeout_ms=1000 fec=20 rfi=false viewer=81.2.3.4 installed=true path=wan4 public_port=40312 mapped=true nat_ms=38 rendezvous=203.0.113.7:21116
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=live host=198.51.100.9:40312 local=0.0.0.0:50511 every=2 timeout_ms=1000 fec=20 path=wan4 max_datagram=1024
+UDPVIDEO viewer peer=123456789 candidate lane=3f2a… port=61877 mapped=true nat_ms=41
+UDPVIDEO host conn=5 candidate lane=3f2a… viewer=81.2.3.4:61877 after_ms=1180
+UDPVIDEO host conn=5 HELLO from 81.2.3.4:61877 lane=3f2a… at_us=1250312 path=wan4 punches=3
+UDPVIDEO viewer peer=123456789 ready lane=3f2a… after_ms=96 hellos=5
+UDPVIDEO host conn=5 stop lane=3f2a…: internet lane: no HELLO from the viewer 81.2.3.4 in 6 s (offered=true candidate=81.2.3.4:61877 punches=240 refused=0): …
+UDPVIDEO host conn=5 not offered (viewer v5): not a LAN address; internet lane: the viewer's lane v5 has none (…)
+```
+
+Host `offer` line (an internet lane logs it on the lane's receive thread once the NAT query is
+done, so it may come up to 1 s after the login):
+
+| Field | Meaning |
+|---|---|
+| `addr` | the lane socket: the wildcard of the viewer's family and its local port |
+| `path` | `wan4` (datagrams at most 1024 bytes) or `wan6` (1184); LAN lanes do not print it (1400) |
+| `public_port` | the port the offer names: the rendezvous server's answer (`mapped=true`), else the local port (no answer within 1 s, IPv6, no server) |
+| `mapped` | the rendezvous server answered the `TestNatRequest` from the lane socket |
+| `nat_ms` | time the query took (up to 1000 when there was no answer) |
+| `rendezvous` | the server address asked, `none` for IPv6 or an empty server |
+
+Viewer `accepted` line: `path` (`lan`, `wan4`, `wan6`) and `max_datagram` (the offer's budget).
+`host` is the host IP this viewer reached the session on, with the offer's port.
+
+Viewer `candidate` line, from the lane thread before the first HELLO: `port` is the lane socket's
+public port (`mapped=true`: the rendezvous server's answer) or its local port, sent to the host
+in `UdpVideoControl{KindCandidate}`; `nat_ms` the query time. Host `candidate` line: the address
+the host punches (the viewer's session IP and that port) and `after_ms` since the offer was
+made. Host `HELLO` line: `path` and `punches`, the punch datagrams sent before the viewer's first
+HELLO came in (0: the viewer got through without the host's NAT needing them).
+
+Internet stop reasons (host): `no HELLO ... in 6 s` with `offered` (the offer went out),
+`candidate` (`none`: the viewer never reported one: it refused or its NAT query and HELLOs never
+started), `punches` and `refused` (datagrams from other addresses or failing the crypto). Many
+punches and no HELLO means a NAT on either side that maps or filters per destination (symmetric
+NAT, CGNAT) or a path that drops UDP; the session stays on TCP/KCP and the next offer comes after
+10 s, 30 s and 120 s (`RETRY_BACKOFF_WAN`), then never in that session. The viewer's
+`handshake failed` line says the same from its side (`no HELLO_ACK in 3000 ms`).
+
+Keepalive: on an internet lane the host's receive thread sends a PING when it has sent nothing
+for 500 ms (the viewer's PINGs every 200 ms are answered with PONGs, so this only fires when
+those are lost). It shows in no line; the viewer takes it as traffic (its silence timer).
+
+Roadmap gate (4a/5): on a phone hotspot and another network, the live window lines (`lost`,
+`fec_rec`, `fec_unrec`, `rtt_ms`, `owd_var_ms`) per 5 s, and at 1-3% loss no multi-frame stall
+(`fix_ms`, the viewer's `kf_req`).
+
 ### Per-frame feedback (M23)
 
 Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows

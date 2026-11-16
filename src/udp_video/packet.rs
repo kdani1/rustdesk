@@ -54,6 +54,15 @@ impl PathClass {
         }
     }
 
+    /// The `path=` field of the lane log lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::WanV4 => "wan4",
+            Self::WanV6 => "wan6",
+        }
+    }
+
     /// Fragment payload per video datagram.
     pub fn max_fragment_payload(self) -> usize {
         self.max_datagram() - VIDEO_OVERHEAD

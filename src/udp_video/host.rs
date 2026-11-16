@@ -30,6 +30,12 @@
 //! does, once the frame is out and at most [`WINDOW_FRAMES`] frames of that display are not yet
 //! settled by the viewer's ACKs (or after [`WINDOW_WAIT_MAX`]).
 //!
+//! Internet lanes (M24, [`UdpVideoHost::start_wan`]): the socket is bound to the wildcard of the
+//! viewer's family; the receive thread first asks the rendezvous server for its public port and
+//! hands the offer to the connection, then punches toward the viewer's candidate
+//! (`KindCandidate`) every 20 ms until the viewer's HELLO comes, and later sends a keepalive PING
+//! when it sent nothing for 500 ms. Datagrams follow the WAN budget; no DSCP.
+//!
 //! Dropping `UdpVideoHost` stops both threads (they exit within 100 ms; nothing joins them on
 //! the async runtime) and closes the socket when the last thread lets go of it.
 
@@ -76,8 +82,21 @@ pub const VIEWER_FEC_VERSION: u32 = 4;
 /// `LoginRequest.udp_video_version` of a viewer that resumes a broken display at a
 /// `RECOVERY_POINT` frame too (M22): only its lanes get reference frame invalidation.
 pub const VIEWER_RFI_VERSION: u32 = 5;
+/// `LoginRequest.udp_video_version` of a viewer that takes internet lanes (M24): `wan` offers,
+/// its public port in `KindCandidate`. A viewer advertises it only when its session is direct
+/// and it knows the host's address.
+pub const VIEWER_WAN_VERSION: u32 = 6;
 /// From the offer to the viewer's READY.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The same for an internet lane: both ends ask the rendezvous server for their public port
+/// (up to 1 s each) and the candidate crosses the session stream before the punch can work.
+pub const HANDSHAKE_TIMEOUT_WAN: Duration = Duration::from_secs(6);
+/// Internet lane: punch datagrams to the viewer's candidate this often until its HELLO came.
+const PUNCH_EVERY: Duration = Duration::from_millis(20);
+/// Internet lane: the receive thread sends a PING when it sent nothing for this long, so the
+/// host side's NAT mapping and firewall state stay open also while the viewer's PINGs (every
+/// 200 ms, each answered) are lost and no video goes out (roadmap: 500 ms heartbeat).
+pub const WAN_KEEPALIVE: Duration = Duration::from_millis(500);
 /// Default of `udp-video-shadow-every`: half the frames, so the extra Wi-Fi load stays at half
 /// the video bitrate.
 pub const DEFAULT_SHADOW_EVERY: u32 = 2;
@@ -102,12 +121,18 @@ pub const LOSS_PENALTY_MS: u32 = 150;
 /// After a live lane fell back to TCP, the next offers come this long after each fallback;
 /// then the session stays on TCP.
 pub const RETRY_BACKOFF: [Duration; 2] = [Duration::from_secs(30), Duration::from_secs(120)];
+/// The same for an internet lane (roadmap M24: a new probe after 10 s).
+pub const RETRY_BACKOFF_WAN: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+];
 /// Datagram send errors in a row that end a live lane.
 const SEND_ERRORS_MAX: u32 = 5;
 const QUEUE: usize = 4;
 /// Only reached when the capture loop's fetched wait timed out; a drop is a loss.
 const LIVE_QUEUE: usize = 8;
-/// Lanes are offered on LAN paths only.
+/// The datagram budget of a LAN lane (internet lanes: `Params::path`).
 const PATH: PathClass = PathClass::Lan;
 /// Live: a display's newest frame not settled by the viewer's ACKs this long (plus the ACK round
 /// trip baseline) after it went out, with nothing newer sent, is a tail loss: no later frame
@@ -147,6 +172,10 @@ impl Mode {
 pub struct Gate {
     /// The session came in on a direct TCP path (intranet, direct IP access, TCP punch).
     pub direct_tcp: bool,
+    /// The session runs on any direct path: direct TCP or KCP over a punched UDP socket (IPv4
+    /// or IPv6), never relay or WebRTC. An internet lane (M24) needs it: the viewer's address
+    /// the connection keys on is then the viewer's own public address.
+    pub direct_any: bool,
     pub secured: bool,
     /// The session stream's local address (the host IP the viewer reached).
     pub local: SocketAddr,
@@ -169,6 +198,19 @@ pub fn offer_gate(g: &Gate) -> Result<(IpAddr, IpAddr), String> {
         return Err("address families differ".to_owned());
     }
     Ok((local, peer))
+}
+
+/// The viewer IP of an internet lane (M24), or why there is none. Checked after `offer_gate`
+/// refused: a LAN session keeps its LAN lane. The host's own address does not matter: an
+/// internet lane binds the wildcard of the viewer's family.
+pub fn wan_gate(g: &Gate) -> Result<IpAddr, String> {
+    if !g.direct_any {
+        return Err("transport is not direct (relay or WebRTC)".to_owned());
+    }
+    if !g.secured {
+        return Err("session stream not encrypted".to_owned());
+    }
+    net::wan_ip(g.peer.ip()).map_err(|e| format!("peer address {}: {e}", g.peer))
 }
 
 /// The lane mode the host option asks for: "live" live; "shadow" or "Y" shadow (M19 used `Y`
@@ -196,6 +238,8 @@ pub struct Params {
     /// Live: losses are repaired by reference frame invalidation where the encoder can (M22).
     /// The caller sets it for a viewer of [`VIEWER_RFI_VERSION`] with `enable-nvenc-rfi=Y`.
     pub rfi: bool,
+    /// Datagram budget: LAN, or an internet lane's (set by [`UdpVideoHost::start_wan`]).
+    pub path: PathClass,
 }
 
 impl Params {
@@ -231,6 +275,7 @@ impl Params {
                 .filter(|n| *n <= fec::MAX_PERCENT)
                 .unwrap_or(fec::DEFAULT_PERCENT),
             rfi: false,
+            path: PATH,
         }
     }
 }
@@ -414,6 +459,12 @@ struct Shared {
     /// FEC percentage set by the adaptive FEC of the per-frame feedback (M23); `FEC_UNSET`:
     /// the lane's `Params::fec_percent`.
     fec_now: AtomicU32,
+    /// Internet lane (M24): the viewer's candidate (its IP as the session sees it, the port
+    /// from `KindCandidate`), punched toward until its HELLO comes; and the punches sent.
+    punch_to: Mutex<Option<SocketAddr>>,
+    punches: AtomicU64,
+    /// Internet lane: the offer is out (after the NAT query).
+    offered: AtomicBool,
 }
 
 /// `Shared::fec_now` before any adaptive change.
@@ -441,6 +492,9 @@ impl Shared {
             fatal: Mutex::new(None),
             live: Mutex::new(Live::default()),
             fec_now: AtomicU32::new(FEC_UNSET),
+            punch_to: Mutex::new(None),
+            punches: AtomicU64::new(0),
+            offered: AtomicBool::new(false),
         }
     }
 
@@ -973,6 +1027,19 @@ pub struct UdpVideoHost {
     hooks: Option<Arc<LiveHooks>>,
     kf_reqs: VecDeque<Instant>,
     live_counted: bool,
+    /// Internet lane (M24): the viewer's IP (the punch goes to it at the candidate port).
+    wan: Option<IpAddr>,
+}
+
+/// Hands an internet lane's offer to the connection, which sends it over the session stream.
+pub type DeliverOffer = Box<dyn FnOnce(UdpVideoOffer) + Send>;
+
+/// Internet lane setup the receive thread runs before its loop: the NAT query, then the offer.
+struct WanSetup {
+    /// The rendezvous server's UDP address for the NAT query; None: offer the local port.
+    rendezvous: Option<SocketAddr>,
+    offer: UdpVideoOffer,
+    deliver: DeliverOffer,
 }
 
 impl UdpVideoHost {
@@ -986,6 +1053,52 @@ impl UdpVideoHost {
         params: Params,
         hooks: Option<Arc<LiveHooks>>,
     ) -> Result<(Self, UdpVideoOffer), String> {
+        let params = Params { path: PATH, ..params };
+        let (lane, offer) = Self::start_inner(conn_id, tap, local, viewer, params, hooks, None)?;
+        Ok((lane, offer.ok_or("no offer")?))
+    }
+
+    /// An internet lane (M24): binds the wildcard of the viewer's family, starts the threads,
+    /// and returns at once. The receive thread first asks `rendezvous` (the server's host name
+    /// or address; empty or IPv6: none) for the socket's public port, for up to 1 s, then hands
+    /// the offer (`wan`, that port or the local one) to `deliver`, which sends it over the
+    /// session stream. The connection must not wait for the query: it runs the session.
+    pub fn start_wan(
+        conn_id: i32,
+        tap: Arc<VideoTap>,
+        viewer: IpAddr,
+        params: Params,
+        hooks: Option<Arc<LiveHooks>>,
+        rendezvous: String,
+        deliver: DeliverOffer,
+    ) -> Result<Self, String> {
+        let path = if viewer.is_ipv4() {
+            PathClass::WanV4
+        } else {
+            PathClass::WanV6
+        };
+        let params = Params { path, ..params };
+        let (lane, _) = Self::start_inner(
+            conn_id,
+            tap,
+            net::any_of_family(viewer),
+            viewer,
+            params,
+            hooks,
+            Some((rendezvous, deliver)),
+        )?;
+        Ok(lane)
+    }
+
+    fn start_inner(
+        conn_id: i32,
+        tap: Arc<VideoTap>,
+        local: IpAddr,
+        viewer: IpAddr,
+        params: Params,
+        hooks: Option<Arc<LiveHooks>>,
+        wan: Option<(String, DeliverOffer)>,
+    ) -> Result<(Self, Option<UdpVideoOffer>), String> {
         if params.mode == Mode::Live && hooks.is_none() {
             return Err("live mode without hooks".to_owned());
         }
@@ -1007,27 +1120,56 @@ impl UdpVideoHost {
             &secret,
             lane_id,
             Role::Host,
-            PATH,
+            params.path,
         )));
         let queue = match params.mode {
             Mode::Shadow => QUEUE,
             Mode::Live => LIVE_QUEUE,
         };
         let (job_tx, job_rx) = mpsc::sync_channel::<Job>(queue);
+        let mode = match params.mode {
+            Mode::Shadow => udp_video_offer::Mode::ModeShadow,
+            Mode::Live => udp_video_offer::Mode::ModeLive,
+        };
+        let is_wan = wan.is_some();
+        let offer = UdpVideoOffer {
+            version: match params.mode {
+                Mode::Shadow => LANE_VERSION,
+                Mode::Live => LIVE_LANE_VERSION,
+            },
+            mode: mode.into(),
+            lane_id,
+            secret: secret.to_vec().into(),
+            // An internet lane's host does not know its public address: the viewer uses the
+            // one it reached the session on.
+            ip: if is_wan {
+                Default::default()
+            } else {
+                net::ip_to_bytes(local).into()
+            },
+            port: port as u32,
+            max_datagram: params.path.max_datagram() as u32,
+            shadow_every: params.every,
+            timeout_ms: params.timeout.as_millis() as u32,
+            fec_percent: params.fec_percent,
+            wan: is_wan,
+            ..Default::default()
+        };
+        let wan = wan.map(|(server, deliver)| (server, offer.clone(), deliver));
         {
             let (socket, sender, shared) = (socket.clone(), sender.clone(), shared.clone());
             std::thread::Builder::new()
                 .name("udp-video-host-rx".to_owned())
                 .spawn(move || {
+                    // Blocking DNS on this thread, never on the connection's.
+                    let wan = wan.map(|(server, offer, deliver)| WanSetup {
+                        rendezvous: net::rendezvous_udp(&server, viewer),
+                        offer,
+                        deliver,
+                    });
                     recv_loop(
-                        &socket,
-                        &sender,
-                        &shared,
-                        &secret,
-                        lane_id,
-                        viewer,
-                        conn_id,
-                        params.mode,
+                        &socket, &sender, &shared, &secret, lane_id, viewer, conn_id, params,
+                        wan,
                     )
                 })
                 .map_err(|e| format!("spawn: {e}"))?;
@@ -1046,37 +1188,10 @@ impl UdpVideoHost {
             shared.stop.store(true, Ordering::Relaxed);
             return Err(format!("spawn: {e}"));
         }
-        let mode = match params.mode {
-            Mode::Shadow => udp_video_offer::Mode::ModeShadow,
-            Mode::Live => udp_video_offer::Mode::ModeLive,
-        };
-        let offer = UdpVideoOffer {
-            version: match params.mode {
-                Mode::Shadow => LANE_VERSION,
-                Mode::Live => LIVE_LANE_VERSION,
-            },
-            mode: mode.into(),
-            lane_id,
-            secret: secret.to_vec().into(),
-            ip: net::ip_to_bytes(local).into(),
-            port: port as u32,
-            max_datagram: PATH.max_datagram() as u32,
-            shadow_every: params.every,
-            timeout_ms: params.timeout.as_millis() as u32,
-            fec_percent: params.fec_percent,
-            ..Default::default()
-        };
-        log::info!(
-            "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={} every={} burst={} timeout_ms={} fec={} rfi={} viewer={viewer} installed={}",
-            params.mode.label(),
-            SocketAddr::new(local, port),
-            params.every,
-            params.burst,
-            params.timeout.as_millis(),
-            params.fec_percent,
-            params.rfi,
-            installed()
-        );
+        // An internet lane logs its offer line once the NAT query is done.
+        if !is_wan {
+            log_offer(conn_id, lane_id, &params, SocketAddr::new(local, port), viewer, "");
+        }
         Ok((
             Self {
                 conn_id,
@@ -1090,9 +1205,59 @@ impl UdpVideoHost {
                 hooks,
                 kf_reqs: VecDeque::new(),
                 live_counted: false,
+                wan: is_wan.then_some(viewer),
             },
-            offer,
+            (!is_wan).then_some(offer),
         ))
+    }
+
+    /// An internet lane (M24).
+    pub fn is_wan(&self) -> bool {
+        self.wan.is_some()
+    }
+
+    /// The pauses before the next offers after a live lane fell back.
+    pub fn retry_backoff(&self) -> &'static [Duration] {
+        if self.is_wan() {
+            &RETRY_BACKOFF_WAN
+        } else {
+            &RETRY_BACKOFF
+        }
+    }
+
+    /// Internet lane: the viewer's public lane port (`KindCandidate`). The receive thread
+    /// punches toward the viewer's IP at that port until the viewer's HELLO comes in. Err for a
+    /// LAN lane or port 0 (the lane must end); ignored for another lane or after the handshake.
+    pub fn on_candidate(&mut self, lane_id: u64, port: u32) -> Result<(), String> {
+        let Some(viewer) = self.wan else {
+            return Err("candidate for a LAN lane".to_owned());
+        };
+        if lane_id != self.lane_id || self.state != State::Offered {
+            return Ok(());
+        }
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("candidate port {port}"))?;
+        let to = SocketAddr::new(viewer, port);
+        if let Ok(mut p) = self.shared.punch_to.lock() {
+            *p = Some(to);
+        }
+        log::info!(
+            "UDPVIDEO host conn={} candidate lane={:016x} viewer={to} after_ms={}",
+            self.conn_id,
+            self.lane_id,
+            self.offered_at.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    fn handshake_timeout(&self) -> Duration {
+        if self.is_wan() {
+            HANDSHAKE_TIMEOUT_WAN
+        } else {
+            HANDSHAKE_TIMEOUT
+        }
     }
 
     pub fn lane_id(&self) -> u64 {
@@ -1164,7 +1329,7 @@ impl UdpVideoHost {
     /// viewer silent for `timeout`, the socket failing, sustained tail losses).
     pub fn check(&mut self) -> Result<(), String> {
         match self.state {
-            State::Offered if self.offered_at.elapsed() >= HANDSHAKE_TIMEOUT => {}
+            State::Offered if self.offered_at.elapsed() >= self.handshake_timeout() => {}
             State::Active if self.params.mode == Mode::Live => {
                 if let Some(e) = self.shared.fatal.lock().ok().and_then(|f| f.clone()) {
                     return Err(e);
@@ -1191,6 +1356,20 @@ impl UdpVideoHost {
             _ => return Ok(()),
         }
         let hellos = self.shared.hellos.load(Ordering::Relaxed);
+        if let (Some(viewer), 0) = (self.wan, hellos) {
+            let candidate = self.shared.punch_to.lock().ok().and_then(|p| *p);
+            return Err(format!(
+                "internet lane: no HELLO from the viewer {viewer} in {} s (offered={} \
+                 candidate={} punches={} refused={}): without a candidate the viewer never got \
+                 that far; with punches, a NAT on either side maps or filters per destination \
+                 (symmetric NAT, CGNAT) or the path drops UDP",
+                HANDSHAKE_TIMEOUT_WAN.as_secs(),
+                self.shared.offered.load(Ordering::Relaxed),
+                candidate.map_or_else(|| "none".to_owned(), |c| c.to_string()),
+                self.shared.punches.load(Ordering::Relaxed),
+                self.shared.refused.load(Ordering::Relaxed)
+            ));
+        }
         if hellos == 0 {
             Err(format!(
                 "no HELLO from the viewer in {} s: inbound UDP to this host looks blocked \
@@ -1206,7 +1385,7 @@ impl UdpVideoHost {
             Err(format!(
                 "{hellos} HELLO answered but no READY over TCP in {} s \
                  (HELLO_ACK lost on the way back?)",
-                HANDSHAKE_TIMEOUT.as_secs()
+                self.handshake_timeout().as_secs()
             ))
         }
     }
@@ -1347,6 +1526,75 @@ fn installed() -> bool {
     }
 }
 
+/// The `UDPVIDEO host ... offer` line; `extra` is appended (an internet lane's NAT fields).
+fn log_offer(
+    conn_id: i32,
+    lane_id: u64,
+    params: &Params,
+    addr: SocketAddr,
+    viewer: IpAddr,
+    extra: &str,
+) {
+    log::info!(
+        "UDPVIDEO host conn={conn_id} offer lane={lane_id:016x} mode={} addr={addr} every={} burst={} timeout_ms={} fec={} rfi={} viewer={viewer} installed={}{extra}",
+        params.mode.label(),
+        params.every,
+        params.burst,
+        params.timeout.as_millis(),
+        params.fec_percent,
+        params.rfi,
+        installed()
+    );
+}
+
+/// Internet lane, on the receive thread before its loop: asks the rendezvous server for the
+/// socket's public port, puts it in the offer (the local port when there is no answer) and
+/// hands the offer to the connection. False when the lane was stopped meanwhile.
+#[allow(clippy::too_many_arguments)]
+fn wan_offer(
+    socket: &UdpSocket,
+    shared: &Shared,
+    conn_id: i32,
+    lane_id: u64,
+    viewer: IpAddr,
+    params: &Params,
+    w: WanSetup,
+) -> bool {
+    let local = socket.local_addr().ok();
+    let started = Instant::now();
+    let mapped = w
+        .rendezvous
+        .and_then(|server| net::nat_port(socket, server, net::NAT_QUERY_FOR));
+    // Later NAT replies would only count as refused datagrams.
+    net::drain(socket);
+    if shared.stop.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut offer = w.offer;
+    if let Some(port) = mapped {
+        offer.port = port as u32;
+    }
+    log_offer(
+        conn_id,
+        lane_id,
+        params,
+        local.unwrap_or_else(|| SocketAddr::new(net::any_of_family(viewer), 0)),
+        viewer,
+        &format!(
+            " path={} public_port={} mapped={} nat_ms={} rendezvous={}",
+            params.path.label(),
+            offer.port,
+            mapped.is_some(),
+            started.elapsed().as_millis(),
+            w.rendezvous
+                .map_or_else(|| "none".to_owned(), |a| a.to_string())
+        ),
+    );
+    shared.offered.store(true, Ordering::Relaxed);
+    (w.deliver)(offer);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recv_loop(
     socket: &UdpSocket,
@@ -1356,21 +1604,69 @@ fn recv_loop(
     lane_id: u64,
     viewer: IpAddr,
     conn_id: i32,
-    mode: Mode,
+    params: Params,
+    wan: Option<WanSetup>,
 ) {
-    // Live: qWAVE AudioVideo marking (DSCP 40, WMM video) once the socket is connected; dropped
-    // at the end of this function, while the socket is still open.
+    // Live on the LAN: qWAVE AudioVideo marking (DSCP 40, WMM video) once the socket is
+    // connected; dropped at the end of this function, while the socket is still open. Never on
+    // an internet lane: DSCP is bleached or misread by the providers on the way.
     #[cfg(windows)]
     let mut _qos: Option<crate::platform::windows_qos::UdpQos> = None;
-    #[cfg(not(windows))]
-    let _ = mode;
     let clock = shared.clock;
+    let is_wan = wan.is_some();
+    if let Some(w) = wan {
+        if !wan_offer(socket, shared, conn_id, lane_id, viewer, &params, w) {
+            return;
+        }
+    }
     let mut rx = LaneReceiver::new(secret, lane_id, Role::Host, Default::default());
-    let _ = socket.set_read_timeout(Some(net::RECV_TIMEOUT_IDLE));
+    let mut timeout = net::ReadTimeout::new();
     let mut buf = [0u8; 2048];
     let mut connected = false;
     let mut first_error_logged = false;
+    // Internet lane: the next punch, and when this thread last sent anything (keepalive).
+    let mut next_punch = Instant::now();
+    let mut last_tx = Instant::now();
+    let mut keepalive_id = 0u32;
     while !shared.stop.load(Ordering::Relaxed) {
+        let punch_to = if is_wan && !connected {
+            shared.punch_to.lock().ok().and_then(|p| *p)
+        } else {
+            None
+        };
+        let now = Instant::now();
+        if let Some(to) = punch_to {
+            // A HELLO sealed with the host's keys: it opens this side's NAT mapping and
+            // filter toward the viewer's candidate; the viewer ignores it if it gets through.
+            if now >= next_punch {
+                if seal_send(sender, &Inner::Hello { lane_id }, |d| socket.send_to(d, to)).is_ok()
+                {
+                    shared.punches.fetch_add(1, Ordering::Relaxed);
+                    last_tx = now;
+                }
+                next_punch = now + PUNCH_EVERY;
+            }
+        } else if is_wan && connected && now.saturating_duration_since(last_tx) >= WAN_KEEPALIVE {
+            keepalive_id = keepalive_id.wrapping_add(1);
+            let ping = Inner::Ping {
+                id: keepalive_id,
+                send_us: clock.now_us(),
+            };
+            if let Err(e) = seal_send(sender, &ping, |d| socket.send(d)) {
+                log::debug!("UDPVIDEO host conn={conn_id} keepalive send: {e}");
+            }
+            last_tx = now;
+        }
+        // An internet lane polls at the punch period through its handshake, so the first punch
+        // follows the candidate within 20 ms.
+        timeout.set(
+            socket,
+            if is_wan && !connected {
+                PUNCH_EVERY
+            } else {
+                net::RECV_TIMEOUT_IDLE
+            },
+        );
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) if net::is_timeout(&e) => continue,
@@ -1405,7 +1701,7 @@ fn recv_loop(
                         *p = Some(src);
                     }
                     #[cfg(windows)]
-                    if mode == Mode::Live {
+                    if params.mode == Mode::Live && params.path == PathClass::Lan {
                         match crate::platform::windows_qos::mark_udp(socket) {
                             Some(Ok(q)) => {
                                 _qos = Some(q);
@@ -1420,8 +1716,10 @@ fn recv_loop(
                         }
                     }
                     log::info!(
-                        "UDPVIDEO host conn={conn_id} HELLO from {src} lane={lane_id:016x} at_us={}",
-                        clock.now_us()
+                        "UDPVIDEO host conn={conn_id} HELLO from {src} lane={lane_id:016x} at_us={} path={} punches={}",
+                        clock.now_us(),
+                        params.path.label(),
+                        shared.punches.load(Ordering::Relaxed)
                     );
                 }
                 Inner::HelloAck { lane_id }
@@ -1443,8 +1741,9 @@ fn recv_loop(
                 continue;
             }
         };
-        if let Err(e) = seal_send(sender, &reply, |d| socket.send(d)) {
-            log::debug!("UDPVIDEO host conn={conn_id} reply send: {e}");
+        match seal_send(sender, &reply, |d| socket.send(d)) {
+            Ok(_) => last_tx = Instant::now(),
+            Err(e) => log::debug!("UDPVIDEO host conn={conn_id} reply send: {e}"),
         }
     }
 }
@@ -1526,11 +1825,11 @@ struct Pacing {
 }
 
 impl Pacing {
-    fn new(burst: usize) -> Self {
+    fn new(burst: usize, path: PathClass) -> Self {
         let now = Instant::now();
         Self {
             burst,
-            pacer: Pacer::new(0.0, burst.max(1) * PATH.max_datagram(), now),
+            pacer: Pacer::new(0.0, burst.max(1) * path.max_datagram(), now),
             waiter: Waiter::new(),
             interval: Duration::from_micros(16_667),
             last_queued: None,
@@ -1581,7 +1880,7 @@ fn send_loop(
     // copy the tap dropped is not counted as loss by the viewer. Live ids come from the tap.
     let mut ids: Vec<(u8, u32)> = Vec::new();
     let mut w = Window::default();
-    let mut pacing = (params.mode == Mode::Live).then(|| Pacing::new(params.burst));
+    let mut pacing = (params.mode == Mode::Live).then(|| Pacing::new(params.burst, params.path));
     if let Some(p) = &pacing {
         log::info!(
             "UDPVIDEO host conn={conn_id} lane={lane_id:016x} pacing burst={} hires_timer={}",
@@ -1790,7 +2089,8 @@ fn send_live(
         flags: job.flags,
         send_us: clock.now_us(),
     };
-    let parts = match fragment(&bytes, meta, PATH.max_fragment_payload()) {
+    let payload = sender.lock().map_or(PATH, |s| s.path()).max_fragment_payload();
+    let parts = match fragment(&bytes, meta, payload) {
         Ok(p) => p,
         Err(e) => {
             w.errors += 1;
@@ -1895,7 +2195,8 @@ fn send_job(
         flags: job.flags,
         send_us: clock.now_us(),
     };
-    let parts = match fragment(&bytes, meta, PATH.max_fragment_payload()) {
+    let payload = sender.lock().map_or(PATH, |s| s.path()).max_fragment_payload();
+    let parts = match fragment(&bytes, meta, payload) {
         Ok(p) => p,
         Err(e) => {
             w.errors += 1;
@@ -2065,10 +2366,136 @@ pub(crate) mod latency_tests {
     fn gate(local: &str, peer: &str) -> Gate {
         Gate {
             direct_tcp: true,
+            direct_any: true,
             secured: true,
             local: local.parse().unwrap(),
             peer: peer.parse().unwrap(),
         }
+    }
+
+    /// Internet lane gate (M24): any direct path (KCP too), encrypted, a viewer address off the
+    /// LAN; the host's own address does not matter (KCP streams report an unspecified one).
+    #[test]
+    fn latency_wan_gate_rules() {
+        let kcp = Gate {
+            direct_tcp: false,
+            ..gate("0.0.0.0:0", "81.2.3.4:40000")
+        };
+        assert_eq!(wan_gate(&kcp), Ok("81.2.3.4".parse().unwrap()));
+        assert_eq!(
+            wan_gate(&gate("[::]:0", "[::ffff:81.2.3.4]:1")),
+            Ok("81.2.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            wan_gate(&gate("[::]:0", "[2001:db8::7]:1")),
+            Ok("2001:db8::7".parse().unwrap())
+        );
+        assert!(wan_gate(&Gate {
+            direct_any: false,
+            ..kcp
+        })
+        .is_err());
+        assert!(wan_gate(&Gate {
+            secured: false,
+            ..kcp
+        })
+        .is_err());
+        // A LAN peer belongs to the LAN gate; loopback and link-local never get a lane.
+        assert!(wan_gate(&gate("192.168.1.5:1", "192.168.1.9:1")).is_err());
+        assert!(wan_gate(&gate("127.0.0.1:1", "127.0.0.1:2")).is_err());
+        assert!(wan_gate(&gate("[fe80::1]:1", "[fe80::2]:1")).is_err());
+        assert_eq!(
+            Params::from_options(Mode::Live, "", "", "", "").path,
+            PathClass::Lan
+        );
+    }
+
+    /// The internet lane's handshake over loopback: the offer comes through `deliver` with
+    /// `wan` set, no host address and the WAN datagram budget; the viewer's candidate starts the
+    /// punch (HELLOs from the host's keys arrive at the candidate) until its own HELLO came;
+    /// then HELLO_ACK, and the lane goes live on READY. A candidate for a LAN lane is refused.
+    #[test]
+    fn latency_wan_offer_candidate_and_punch() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let tap = Arc::new(VideoTap::default());
+        let (hooks, _) = counting_hooks();
+        let (offer_tx, offer_rx) = mpsc::channel();
+        let params = Params::from_options(Mode::Live, "", "", "", "");
+        let mut host = UdpVideoHost::start_wan(
+            3,
+            tap,
+            lo,
+            params,
+            Some(hooks),
+            String::new(),
+            Box::new(move |o| {
+                let _ = offer_tx.send(o);
+            }),
+        )
+        .unwrap();
+        assert!(host.is_wan());
+        assert_eq!(host.retry_backoff(), &RETRY_BACKOFF_WAN);
+        let offer = offer_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(offer.wan);
+        assert!(offer.ip.is_empty());
+        assert_eq!(offer.max_datagram as usize, PathClass::WanV4.max_datagram());
+        assert_ne!(offer.port, 0);
+        let secret: [u8; SECRET_LEN] = offer.secret.as_ref().try_into().unwrap();
+        // The viewer's lane socket; its port is the candidate.
+        let viewer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        viewer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(host.on_candidate(offer.lane_id, 0).is_err());
+        host.on_candidate(offer.lane_id, viewer.local_addr().unwrap().port() as u32)
+            .unwrap();
+        let mut rx = LaneReceiver::new(&secret, offer.lane_id, Role::Viewer, Default::default());
+        let mut buf = [0u8; 2048];
+        let (n, _) = viewer.recv_from(&mut buf).unwrap();
+        let lane_id = offer.lane_id;
+        assert!(matches!(
+            rx.on_datagram(&mut buf[..n], Instant::now()),
+            Ok(Received::Hello { lane_id: l }) if l == lane_id
+        ));
+        let mut tx = LaneSender::new(&secret, offer.lane_id, Role::Viewer, PathClass::Lan);
+        let host_addr = SocketAddr::new(lo, offer.port as u16);
+        let hello = tx
+            .seal(&Inner::Hello {
+                lane_id: offer.lane_id,
+            })
+            .unwrap();
+        viewer.send_to(&hello, host_addr).unwrap();
+        let acked = (0..50).any(|_| match viewer.recv_from(&mut buf) {
+            Ok((n, _)) => matches!(
+                rx.on_datagram(&mut buf[..n], Instant::now()),
+                Ok(Received::HelloAck { .. })
+            ),
+            Err(_) => false,
+        });
+        assert!(acked, "no HELLO_ACK");
+        assert!(host.shared.punches.load(Ordering::Relaxed) >= 1);
+        host.on_ready(offer.lane_id).unwrap();
+        assert!(host.is_live_active());
+        // Live, connected, silent: the keepalive PING comes within WAN_KEEPALIVE (+ timeout).
+        let deadline = Instant::now() + WAN_KEEPALIVE + Duration::from_millis(500);
+        let mut ping = false;
+        while !ping && Instant::now() < deadline {
+            if let Ok((n, _)) = viewer.recv_from(&mut buf) {
+                ping = matches!(
+                    rx.on_datagram(&mut buf[..n], Instant::now()),
+                    Ok(Received::Ping { .. })
+                );
+            }
+        }
+        assert!(ping, "no keepalive");
+        host.shutdown("test");
+        let lan = Params::from_options(Mode::Shadow, "", "", "", "");
+        let (mut lan_host, lan_offer) =
+            UdpVideoHost::start(4, Arc::new(VideoTap::default()), lo, lo, lan, None).unwrap();
+        assert!(!lan_offer.wan);
+        assert!(!lan_host.is_wan());
+        assert_eq!(lan_host.retry_backoff(), &RETRY_BACKOFF);
+        assert!(lan_host.on_candidate(lan_offer.lane_id, 5).is_err());
     }
 
     #[test]
@@ -2519,7 +2946,7 @@ pub(crate) mod latency_tests {
             frame_id: Some(0),
             fetched: None,
         };
-        let mut p = Pacing::new(4);
+        let mut p = Pacing::new(4, PATH);
         let mut w = Window::default();
         let mut wire: Vec<(Instant, Vec<u8>)> = Vec::new();
         let took = send_live(&sender, &mut p, &mut w, &job, 0, LaneClock::new(), 20, |d| {
