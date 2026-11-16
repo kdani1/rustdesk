@@ -901,22 +901,32 @@ fn run(vs: VideoService) -> ResultType<()> {
             let now = Instant::now();
             if key_refresh.take_due(now) {
                 request_refresh_key(&mut encoder, &mut key_refresh)?;
+                if vs.source.is_monitor() {
+                    super::video_qos::primary::set_key_supported(display_idx);
+                }
             }
-            // Primary viewer rule: connections dropping to a key frame get one, at most once per
-            // LAG_KEY_INTERVAL; never counted as a viewer's refresh.
-            if super::video_qos::primary::key_wanted(display_idx)
+            // Primary viewer rule: connections this loop sends to that drop to a key frame get
+            // one, at most once per LAG_KEY_INTERVAL; never counted as a viewer's refresh.
+            // Monitors only, and never again on an encoder that refused one.
+            let lag_dropping = if vs.source.is_monitor()
+                && super::video_qos::primary::key_on_demand(display_idx)
+                && super::video_qos::primary::key_wanted(display_idx)
                 && now.saturating_duration_since(lag_key_at)
                     >= super::video_qos::primary::LAG_KEY_INTERVAL
                 && key_refresh.on_lag_key(now)
             {
+                super::video_qos::primary::dropping_among(
+                    display_idx,
+                    &frame_controller.send_conn_ids,
+                )
+            } else {
+                0
+            };
+            if lag_dropping > 0 {
                 lag_key_at = now;
                 if encoder.request_keyframe() {
                     key_refresh.on_lag_requested(now);
-                    log::info!(
-                        "PRIMARY key display={} dropping={}",
-                        display_idx,
-                        super::video_qos::primary::dropping(display_idx)
-                    );
+                    log::info!("PRIMARY key display={display_idx} dropping={lag_dropping}");
                 } else {
                     super::video_qos::primary::set_key_unsupported(display_idx);
                     bail_switch!("lag_key_unsupported");
@@ -1303,7 +1313,9 @@ fn run(vs: VideoService) -> ResultType<()> {
         let slice_millis = stall_slice.map_or(300, |d| d.as_millis() as u64);
         // Primary viewer rule: LAGGING connections are waited for one frame period at most,
         // where their frames can be dropped to a key frame.
-        let lagging = if super::video_qos::primary::key_on_demand(display_idx) {
+        let lagging = if vs.source.is_monitor()
+            && super::video_qos::primary::key_on_demand(display_idx)
+        {
             lag_cache.get()
         } else {
             &no_lagging

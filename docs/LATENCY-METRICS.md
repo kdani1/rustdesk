@@ -626,7 +626,9 @@ and the filters below), `src/server/video_service.rs` (wait, key frames),
 - **Fps floor for viewer requests** (roadmap open question 5; the same floor as the viewer's
   gentle fps control, M5): while the rule is on, a `custom_fps` lower than the one the viewer
   logged in with (stock viewers halve it under decode load) counts as at least min(login
-  value, 24). This protects the other viewers from a loaded stock viewer even when it is
+  value, 24). Only the login options' `custom_fps` is the reference (a viewer sends one there
+  only at "custom" image quality); without one it is 30, so a Balanced-quality stock viewer's
+  first reduction (15) counts as 24. This protects the other viewers from a loaded stock viewer even when it is
   primary, at the cost of sending that viewer more frames than it decodes. A user who lowers
   the fps on a stock viewer mid-session gets the same floor. `auto_adjust_fps` (a fork
   viewer's decode limit with `enable-fps-cap-split`) is taken as it is.
@@ -652,8 +654,15 @@ and the filters below), `src/server/video_service.rs` (wait, key frames),
   only); these key frames do not count toward that option's escalation to `SWITCH`, nor as
   refresh key frames in the `LATENCY` counters. An encoder that refuses a forced key frame is
   restarted once (`SWITCH` reason `lag_key_unsupported`; its first frame is a key frame) and
-  that display stops dropping and leaving LAGGING connections behind until the host process
-  restarts. The shared encoder means every viewer of the display gets these key frames.
+  that display stops dropping and leaving LAGGING connections behind, and is never asked for
+  a lag key frame again, until a viewer refresh's forced key frame (`enable-refresh-keyframe`)
+  is accepted on it, else until the host process restarts. The shared encoder means every
+  viewer of the display gets these key frames. Only a connection the loop still sends to
+  counts: one that switched to another display (or closed this one) keeps its drop run until
+  it gets a key frame of the display or goes, but no longer makes the loop force key frames.
+- **Monitors only.** View-camera connections have no gate (their frames carry the camera index
+  as `display`) and camera capture loops neither leave connections behind nor force lag key
+  frames.
 - **Displays.** A gate tracks displays 0-7; frames of higher display indexes are never dropped
   and their LAGGING connections are waited for as before.
 
@@ -661,7 +670,9 @@ Cost with the rule off: per video frame and connection one atomic flag test plus
 add and max (queue count) on the capture thread and one atomic subtract after the write; per
 input event one `Instant::now` and an atomic store; once a second a `Config` read. With the
 rule on, also once a second a lock of the gate registry; per frame a check of the LAGGING set
-(a copy is refreshed only when it changes). The key flag of a frame is only looked at for a
+(a copy is refreshed only when it changes); while some connection drops to a key frame of a
+display, once the 3 s interval is over, a lock of the gate registry per frame of that display
+until the key frame is requested. The key flag of a frame is only looked at for a
 LAGGING or dropping connection.
 
 ```
@@ -671,6 +682,7 @@ PRIMARY key display=0 dropping=1
 PRIMARY drops conn=7 frames=212 runs=4 peak_queue=3 lagging=true
 PRIMARY rule=off fps=30 ratio=0.670 quality=Balanced
 PRIMARY display=0 encoder has no forced key frame: lagging viewers are no longer dropped to key frames
+PRIMARY display=0 encoder takes forced key frames again
 ```
 
 | Line / field | Meaning |
@@ -679,9 +691,10 @@ PRIMARY display=0 encoder has no forced key frame: lagging viewers are no longer
 | `primary=` / `secondary=` | connection ids that steer the stream / that do not |
 | `lagging=` | the LAGGING connections (left behind by the capture loop, dropped to key frames) |
 | `fps` / `ratio` / `quality` | the stream's fps, bitrate ratio and quality after the change |
-| `PRIMARY key display= dropping=` | the capture loop forced a key frame for connections dropping to one; `dropping` how many wait for it (at most one line per 3 s per display) |
+| `PRIMARY key display= dropping=` | the capture loop forced a key frame for connections dropping to one; `dropping` how many of the connections it sends to wait for it (at most one line per 3 s per display) |
 | `PRIMARY drops conn=` | at most every 10 s, per secondary connection that dropped frames since the last line: `frames` dropped, `runs` drop-to-key runs started, `peak_queue` the highest number of unwritten frames seen at an enqueue, `lagging` its state now |
-| `PRIMARY display= encoder has no forced key frame` | warning, once per display: no drop-to-key there any more |
+| `PRIMARY display= encoder has no forced key frame` | warning, once per display: no drop-to-key there any more (until the next line) |
+| `PRIMARY display= encoder takes forced key frames again` | a viewer refresh's forced key frame was accepted on a display marked above: drop-to-key is back on there |
 
 Tests (`cargo test latency_primary`): the gate (drop run to the next key frame, key frames pass
 a full queue, no drop unless LAGGING, counts released when a connection goes, no underflow),

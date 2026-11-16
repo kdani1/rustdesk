@@ -8,9 +8,12 @@
 //!   (`LAG_ENTER_SECS` seconds in a row) until it keeps up for `LAG_LEAVE_SECS`. The capture
 //!   loop waits for it at most one frame period, and its video queue is bounded: with
 //!   `LAG_QUEUE_FRAMES` frames still unwritten its next frames are dropped up to the next key
-//!   frame, which the capture loop requests at most once per `LAG_KEY_INTERVAL` per display.
-//! - Fps floor for viewer requests: a viewer's custom_fps below the one it logged in with
-//!   (stock viewers halve it under load) counts as at least min(login value, `REQUEST_FLOOR_FPS`).
+//!   frame, which the capture loop requests at most once per `LAG_KEY_INTERVAL` per display
+//!   while one of the connections it sends to waits for it. Monitor streams only: view-camera
+//!   connections have no gate (camera frames carry the camera index in `display`).
+//! - Fps floor for viewer requests: a viewer's custom_fps below the one it logged in with (FPS
+//!   when the login options had none; stock viewers halve it under load) counts as at least
+//!   min(login value, `REQUEST_FLOOR_FPS`).
 //!
 //! `VideoGate` is the per-connection state the capture thread (enqueue), the connection or its
 //! writer task (written) and the connection loop (input, control) share; atomics only. See
@@ -58,10 +61,13 @@ static LAGGING_GEN: AtomicU64 = AtomicU64::new(0);
 const ZERO_U32: AtomicU32 = AtomicU32::new(0);
 #[allow(clippy::declare_interior_mutable_const)]
 const FALSE: AtomicBool = AtomicBool::new(false);
-// Connections dropping frames of each display until a key frame.
+// Connections dropping frames of each display until a key frame. A connection that stopped
+// receiving the display (display switch) keeps its count until it goes or gets a key frame of
+// the display, so the capture loop asks `dropping_among` its own receivers.
 static DROPPING: [AtomicU32; MAX_DISPLAYS] = [ZERO_U32; MAX_DISPLAYS];
-// The encoder of this display refused a forced key frame: no drop-to-key there (sticky until a
-// forced key frame is accepted again).
+// The encoder of this display refused a forced key frame: no drop-to-key there until a viewer
+// refresh's forced key frame is accepted again (`set_key_supported`), else until the host
+// process restarts.
 static KEY_UNSUPPORTED: [AtomicBool; MAX_DISPLAYS] = [FALSE; MAX_DISPLAYS];
 
 /// enable-primary-viewer-rule: Windows hosts, off unless "Y". Read once per second.
@@ -254,28 +260,48 @@ pub fn key_on_demand(display: usize) -> bool {
     cfg!(windows) && display < MAX_DISPLAYS && !KEY_UNSUPPORTED[display].load(Ordering::Relaxed)
 }
 
-/// Some connection waits for a key frame of this display.
+/// Some connection waits for a key frame of this display (a cheap hint: it may no longer
+/// receive the display; see `dropping_among`).
 pub fn key_wanted(display: usize) -> bool {
     display < MAX_DISPLAYS && DROPPING[display].load(Ordering::Relaxed) > 0
 }
 
-/// Connections dropping frames of this display until a key frame.
-pub fn dropping(display: usize) -> u32 {
-    if display < MAX_DISPLAYS {
-        DROPPING[display].load(Ordering::Relaxed)
-    } else {
-        0
+/// How many of `conns` (the connections a capture loop sends to) drop frames of this display
+/// until a key frame. Locks the gate registry only while `key_wanted`.
+pub fn dropping_among(display: usize, conns: &HashSet<i32>) -> u32 {
+    if !key_wanted(display) || conns.is_empty() {
+        return 0;
     }
+    let bit = 1u8 << display;
+    let gates = GATES.lock().unwrap();
+    conns
+        .iter()
+        .filter(|id| {
+            gates
+                .get(id)
+                .and_then(|g| g.upgrade())
+                .is_some_and(|g| g.dropping.load(Ordering::Relaxed) & bit != 0)
+        })
+        .count() as u32
 }
 
 /// The encoder of this display refused a forced key frame: lagging connections are no longer
-/// dropped to key frames there until the host process restarts (the capture loop restarts the
-/// encoder once, which gives the dropping connections their key frame).
+/// dropped to key frames there (the capture loop restarts the encoder once, which gives the
+/// dropping connections their key frame) until `set_key_supported`, else until the host
+/// process restarts.
 pub fn set_key_unsupported(display: usize) {
     if display < MAX_DISPLAYS && !KEY_UNSUPPORTED[display].swap(true, Ordering::Relaxed) {
         log::warn!(
             "PRIMARY display={display} encoder has no forced key frame: lagging viewers are no longer dropped to key frames"
         );
+    }
+}
+
+/// A forced key frame of this display was accepted again (a viewer refresh with
+/// enable-refresh-keyframe): lagging connections may be dropped to key frames there again.
+pub fn set_key_supported(display: usize) {
+    if display < MAX_DISPLAYS && KEY_UNSUPPORTED[display].swap(false, Ordering::Relaxed) {
+        log::info!("PRIMARY display={display} encoder takes forced key frames again");
     }
 }
 
@@ -456,6 +482,36 @@ mod tests {
             assert!(g.on_enqueue(5, || true));
         }
         assert_eq!(g.take().dropped, 0);
+    }
+
+    // Display 3: a connection that stopped receiving the display keeps DROPPING up, but is not
+    // counted among another loop's receivers.
+    #[test]
+    fn latency_primary_dropping_among_only_receivers() {
+        let d = 3;
+        let id = 1_000_003;
+        let g = register(id);
+        g.lagging.store(true, Ordering::Relaxed);
+        for _ in 0..LAG_QUEUE_FRAMES {
+            g.on_enqueue(d, || false);
+        }
+        assert!(!g.on_enqueue(d, || false));
+        assert!(key_wanted(d));
+        assert_eq!(dropping_among(d, &HashSet::from([id, 1_000_004])), 1);
+        assert_eq!(dropping_among(d, &HashSet::from([1_000_004])), 0);
+        assert_eq!(dropping_among(d, &HashSet::new()), 0);
+        drop(g);
+        assert_eq!(dropping_among(d, &HashSet::from([id])), 0);
+    }
+
+    // Display 2: the unsupported mark ends when a forced key frame is accepted again.
+    #[test]
+    fn latency_primary_key_unsupported_cleared() {
+        let d = 2;
+        set_key_unsupported(d);
+        assert!(!key_on_demand(d));
+        set_key_supported(d);
+        assert_eq!(key_on_demand(d), cfg!(windows));
     }
 
     #[test]

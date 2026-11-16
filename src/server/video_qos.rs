@@ -299,7 +299,8 @@ struct UserData {
     // Fast mode: the ratio this connection's estimator target stands for; None when it does
     // not drive the stream (no estimator, shadow, not eligible).
     fast_ratio: Option<f32>,
-    // The first custom_fps (the one sent with the login options), for the request floor.
+    // The custom_fps of the login options, for the request floor; None: the login options had
+    // none (the viewer's quality is not "custom"), which counts as FPS.
     login_custom_fps: Option<u32>,
     // Primary viewer rule: in force (mirrors VideoQoS::primary_rule), and this viewer's state.
     rule: bool,
@@ -312,7 +313,7 @@ impl UserData {
         let mut fps = self.custom_fps.unwrap_or(FPS);
         // Primary viewer rule: a lowered request counts as at least the floor.
         if self.rule && self.custom_fps.is_some() {
-            fps = primary::floored_custom_fps(fps, self.login_custom_fps);
+            fps = primary::floored_custom_fps(fps, Some(self.login_custom_fps.unwrap_or(FPS)));
         }
         if let Some(auto_adjust_fps) = self.auto_adjust_fps {
             if fps == 0 || auto_adjust_fps < fps {
@@ -723,7 +724,18 @@ impl VideoQoS {
         }
         if let Some(user) = self.users.get_mut(&id) {
             user.custom_fps = Some(fps);
-            user.login_custom_fps.get_or_insert(fps);
+        }
+    }
+
+    /// The custom_fps of a viewer's login options (before `user_custom_fps` with the same
+    /// value): the reference of the primary viewer rule's request floor. A later custom_fps,
+    /// such as a stock viewer's first fps reduction, never becomes the reference.
+    pub fn user_login_custom_fps(&mut self, id: i32, fps: u32) {
+        if fps < MIN_FPS || fps > MAX_FPS {
+            return;
+        }
+        if let Some(user) = self.users.get_mut(&id) {
+            user.login_custom_fps = Some(fps);
         }
     }
 

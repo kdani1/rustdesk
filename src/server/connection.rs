@@ -2235,6 +2235,11 @@ impl Connection {
         } else {
             (0, AuthConnType::Remote)
         };
+        if auth_conn_type == AuthConnType::ViewCamera {
+            // Primary viewer rule (M18): monitor streams only; camera frames carry the camera
+            // index in `display`, which the gate would mix up with the monitor of that index.
+            self.inner.video_gate = None;
+        }
         self.authed_conn_id = Some(self::raii::AuthedConnID::new(
             self.inner.id(),
             auth_conn_type,
@@ -6345,6 +6350,13 @@ impl Connection {
             );
         }
         if let Some(option) = scoped {
+            if option.custom_fps > 0 {
+                // Primary viewer rule (M18): the reference of the fps request floor.
+                video_service::VIDEO_QOS
+                    .lock()
+                    .unwrap()
+                    .user_login_custom_fps(self.inner.id(), option.custom_fps as _);
+            }
             self.update_options(&option).await;
         }
     }

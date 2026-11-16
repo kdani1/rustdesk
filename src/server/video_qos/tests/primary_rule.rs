@@ -157,6 +157,7 @@ fn latency_primary_rule_floor_for_lowered_custom_fps() {
     // Nobody primary by input: both count; the Quest logged in at 30 and halves to 15.
     let all = HashMap::from([(DELL, input(60)), (QUEST, infos[&QUEST])]);
     qos.apply_primary(true, &all);
+    qos.user_login_custom_fps(QUEST, 30);
     qos.user_custom_fps(QUEST, 30);
     qos.user_custom_fps(QUEST, 15);
     qos.user_network_delay(QUEST, 10);
@@ -178,4 +179,22 @@ fn latency_primary_rule_new_viewer_not_primary_while_one_is_by_input() {
         qos.user_network_delay(DELL, 10);
     }
     assert!(qos.fps() > INIT_FPS);
+}
+
+#[test]
+fn latency_primary_rule_floor_without_login_custom_fps() {
+    // A stock viewer at Balanced quality sends no custom_fps at login; its first custom_fps is
+    // its fps controller's first reduction, which must not become the reference.
+    let (mut qos, _) = two_viewers();
+    qos.on_connection_open(3);
+    qos.apply_primary(true, &HashMap::new());
+    qos.user_custom_fps(3, 15);
+    assert_eq!(qos.users[&3].fps_cap(), 24);
+    qos.user_custom_fps(3, 10);
+    assert_eq!(qos.users[&3].fps_cap(), 24);
+    // A login custom_fps below the floor is its own floor.
+    qos.user_login_custom_fps(3, 20);
+    assert_eq!(qos.users[&3].fps_cap(), 20);
+    qos.apply_primary(false, &HashMap::new());
+    assert_eq!(qos.users[&3].fps_cap(), 10);
 }
