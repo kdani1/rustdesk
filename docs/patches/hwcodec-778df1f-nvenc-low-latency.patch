@@ -965,19 +965,101 @@ index 5b8f40a..8024bfb 100644
      sts = resetMFX();
      CHECK_STATUS(sts, "resetMFX");
 diff --git a/cpp/nv/nv_encode.cpp b/cpp/nv/nv_encode.cpp
-index 0887d0b..a3ebeff 100644
+index 0887d0b..c303b84 100644
 --- a/cpp/nv/nv_encode.cpp
 +++ b/cpp/nv/nv_encode.cpp
-@@ -75,6 +75,8 @@ public:
+@@ -12,8 +12,10 @@
+ #include <libavutil/pixfmt.h>
+ #include <memory>
+ 
++#include <atomic>
+ #include <d3d11.h>
+ #include <d3d9.h>
++#include <deque>
+ #include <wrl/client.h>
+ 
+ using Microsoft::WRL::ComPtr;
+@@ -35,6 +37,42 @@ namespace {
+ 
+ #define succ(call) ((call) == 0)
+ 
++// nv_set_rfi (fork, roadmap M22): encoders opened while it is on keep their input for
++// encode_last and forced IDRs, log the NVENC caps, and (HEVC with the caps) run with a DPB of
++// RFI_DPB references and one L0 reference so a loss can be repaired by reference frame
++// invalidation instead of an IDR.
++std::atomic<int> g_nv_rfi{0};
++
++// References kept in the DPB with RFI: a lost frame up to RFI_DPB - 1 frames back leaves a
++// valid reference for the next frame.
++const uint32_t RFI_DPB = 5;
++// Frames remembered for invalidation (at least RFI_DPB).
++const size_t RFI_RING = 16;
++
++// NvEncoderD3D11 with access to the session's function list (protected in NvEncoder).
++class NvEncoderD3D11Rfi : public NvEncoderD3D11 {
++public:
++  using NvEncoderD3D11::NvEncoderD3D11;
++
++  NVENCSTATUS InvalidateRefFrame(uint64_t timestamp) {
++    if (!m_hEncoder || !m_nvenc.nvEncInvalidateRefFrames)
++      return NV_ENC_ERR_UNSUPPORTED_PARAM;
++    return m_nvenc.nvEncInvalidateRefFrames(m_hEncoder, timestamp);
++  }
++
++  // 0 when the query fails (NvEncoder::GetCapabilityValue leaves it unset).
++  int Caps(GUID codec, NV_ENC_CAPS cap) {
++    if (!m_hEncoder)
++      return 0;
++    NV_ENC_CAPS_PARAM param = {NV_ENC_CAPS_PARAM_VER};
++    param.capsToQuery = cap;
++    int v = 0;
++    if (m_nvenc.nvEncGetEncodeCaps(m_hEncoder, codec, &param, &v) != NV_ENC_SUCCESS)
++      return 0;
++    return v;
++  }
++};
++
+ void load_driver(CudaFunctions **pp_cuda_dl, NvencFunctions **pp_nvenc_dl) {
+   if (cuda_load_functions(pp_cuda_dl, NULL) < 0) {
+     LOG_TRACE(std::string("cuda_load_functions failed"));
+@@ -60,7 +98,7 @@ void free_driver(CudaFunctions **pp_cuda_dl, NvencFunctions **pp_nvenc_dl) {
+ class NvencEncoder {
+ public:
+   std::unique_ptr<NativeDevice> native_ = nullptr;
+-  NvEncoderD3D11 *pEnc_ = nullptr;
++  NvEncoderD3D11Rfi *pEnc_ = nullptr;
+   CudaFunctions *cuda_dl_ = nullptr;
+   NvencFunctions *nvenc_dl_ = nullptr;
+ 
+@@ -75,6 +113,27 @@ public:
    bool full_range_ = false;
    bool bt709_ = false;
    NV_ENC_CONFIG encodeConfig_ = {0};
 +  // The next encode is an IDR with SPS/PPS (request_keyframe).
 +  bool force_idr_ = false;
++  // nv_set_rfi was on at creation: forced IDRs and encode_last (the single input buffer keeps
++  // the last image), caps logged.
++  bool keep_last_ = false;
++  // An image was encoded, so encode_last has something to encode again.
++  bool has_input_ = false;
++  // Reference frame invalidation: keep_last_, HEVC and NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION.
++  bool rfi_ = false;
++  // inputTimeStamp of the last submitted picture: a counter, so RFI names frames unambiguously.
++  uint64_t frame_no_ = 0;
++  struct Sent {
++    uint64_t no;
++    int64_t ms;
++    bool invalid;
++  };
++  // Frames encoded since the last IDR (that one first), newest last, at most RFI_RING.
++  std::deque<Sent> sent_;
++  // Frames were invalidated: the next encoded picture is a recovery point (key 2 in the
++  // callback unless it is an IDR).
++  bool recovery_next_ = false;
  
    NvencEncoder(void *handle, int64_t luid, DataFormat dataFormat,
                 int32_t width, int32_t height, int32_t kbs, int32_t framerate,
-@@ -122,6 +124,7 @@ public:
+@@ -122,6 +181,7 @@ public:
        return false;
      }
  #endif
@@ -985,11 +1067,152 @@ index 0887d0b..a3ebeff 100644
  
      CUdevice cuDevice = 0;
      if (!succ(cuda_dl_->cuD3D11GetDevice(&cuDevice, native_->adapter_.Get()))) {
-@@ -187,7 +190,12 @@ public:
+@@ -130,17 +190,21 @@ public:
+     }
  
+     int nExtraOutputDelay = 0;
+-    pEnc_ = new NvEncoderD3D11(cuda_dl_, nvenc_dl_, native_->device_.Get(),
++    pEnc_ = new NvEncoderD3D11Rfi(cuda_dl_, nvenc_dl_, native_->device_.Get(),
+                                width_, height_, NV_ENC_BUFFER_FORMAT_ARGB,
+                                nExtraOutputDelay, false, false); // no delay
+     NV_ENC_INITIALIZE_PARAMS initializeParams = {0};
+     ZeroMemory(&initializeParams, sizeof(initializeParams));
+     ZeroMemory(&encodeConfig_, sizeof(encodeConfig_));
+     initializeParams.encodeConfig = &encodeConfig_;
++    keep_last_ = g_nv_rfi.load() != 0;
++    // With nv_set_rfi this driver replaces FFmpeg nvenc, which RustDesk runs with p2 and
++    // ultra-low-latency tuning: the same here, so the switch costs no latency.
+     pEnc_->CreateDefaultEncoderParams(
+         &initializeParams, guidCodec,
+-        NV_ENC_PRESET_P3_GUID /*NV_ENC_PRESET_LOW_LATENCY_HP_GUID*/,
+-        NV_ENC_TUNING_INFO_LOW_LATENCY);
++        keep_last_ ? NV_ENC_PRESET_P2_GUID
++                   : NV_ENC_PRESET_P3_GUID /*NV_ENC_PRESET_LOW_LATENCY_HP_GUID*/,
++        keep_last_ ? NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY : NV_ENC_TUNING_INFO_LOW_LATENCY);
+ 
+     // no delay
+     initializeParams.encodeConfig->frameIntervalP = 1;
+@@ -163,14 +227,46 @@ public:
+     } else {
+       setup_hevc(initializeParams.encodeConfig);
+     }
++    if (keep_last_) {
++      setup_rfi(initializeParams.encodeConfig);
++    }
+ 
+     pEnc_->CreateEncoder(&initializeParams);
+     return true;
+   }
+ 
++  // Logs the caps the roadmap asks for (both codecs) and, for HEVC with RFI support, sets a DPB
++  // of RFI_DPB references with one L0 reference.
++  void setup_rfi(NV_ENC_CONFIG *encodeConfig) {
++    auto caps = [&](GUID codec) {
++      return std::string("rfi=") +
++             std::to_string(pEnc_->Caps(codec, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION)) +
++             " ir=" + std::to_string(pEnc_->Caps(codec, NV_ENC_CAPS_SUPPORT_INTRA_REFRESH)) +
++             " ss_ir=" +
++             std::to_string(pEnc_->Caps(codec, NV_ENC_CAPS_SINGLE_SLICE_INTRA_REFRESH)) +
++             " multiref=" +
++             std::to_string(pEnc_->Caps(codec, NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES));
++    };
++    bool multiref =
++        pEnc_->Caps(NV_ENC_CODEC_HEVC_GUID, NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES) > 0;
++    rfi_ = dataFormat_ == H265 &&
++           pEnc_->Caps(NV_ENC_CODEC_HEVC_GUID, NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION) > 0;
++    if (rfi_) {
++      NV_ENC_CONFIG_HEVC *hevc = &encodeConfig->encodeCodecConfig.hevcConfig;
++      hevc->maxNumRefFramesInDPB = RFI_DPB;
++      if (multiref) {
++        hevc->numRefL0 = NV_ENC_NUM_REF_FRAMES_1;
++      }
++    }
++    LOG_INFO(std::string("caps hevc: ") + caps(NV_ENC_CODEC_HEVC_GUID) +
++             " h264: " + caps(NV_ENC_CODEC_H264_GUID) + "; " +
++             (dataFormat_ == H265 ? "hevc" : "h264") + " encoder rfi=" +
++             (rfi_ ? std::string("on dpb=") + std::to_string(RFI_DPB) +
++                         " numRefL0=" + (multiref ? "1" : "auto")
++                   : std::string("off")));
++  }
++
+   int encode(void *texture, EncodeCallback callback, void *obj, int64_t ms) {
+-    bool encoded = false;
+-    std::vector<NvPacket> vPacket;
+     const NvEncInputFrame *pEncInput = pEnc_->GetNextInputFrame();
+ 
+     // TODO: sdk can ensure the inputPtr's width, height same as width_,
+@@ -184,21 +280,104 @@ public:
+     native_->context_->CopyResource(
+         pBgraTextyure, reinterpret_cast<ID3D11Texture2D *>(texture));
+ #endif
++    has_input_ = true;
++    return submit(callback, obj, ms);
++  }
++
++  // Encodes the input buffer again: with one encoder buffer (no output delay) it still holds the
++  // last image. -1: not kept (nv_set_rfi off at creation) or nothing encoded yet.
++  int encode_last(EncodeCallback callback, void *obj, int64_t ms) {
++    if (!keep_last_ || !has_input_ || pEnc_->GetEncoderBufferCount() != 1)
++      return -1;
++    return submit(callback, obj, ms);
++  }
++
++  // Invalidates every frame from the oldest one with pts `from_ms` on, so the next picture
++  // references only older frames and is a recovery point for a viewer that lost them.
++  // 0: done; -1: no RFI on this encoder; -2: not possible (frame unknown or no valid
++  // reference left in the DPB: the caller forces an IDR instead).
++  int invalidate(int64_t from_ms) {
++    if (!rfi_)
++      return -1;
++    int first = -1;
++    for (int i = 0; i < (int)sent_.size(); i++) {
++      if (sent_[i].ms == from_ms) {
++        first = i;
++        break;
++      }
++    }
++    if (first < 0) {
++      LOG_DEBUG(std::string("rfi: pts ") + std::to_string(from_ms) + " not among the last " +
++                std::to_string(sent_.size()) + " frames");
++      return -2;
++    }
++    int newest = (int)sent_.size() - 1;
++    // The next picture can reference the last RFI_DPB frames, none before the IDR the ring
++    // starts with, none invalidated before.
++    bool ref_left = false;
++    for (int j = first - 1; j >= 0 && newest - j < (int)RFI_DPB; j--) {
++      if (!sent_[j].invalid) {
++        ref_left = true;
++        break;
++      }
++    }
++    if (!ref_left) {
++      LOG_DEBUG(std::string("rfi: no valid reference left for ") +
++                std::to_string(newest - first + 1) + " lost frames");
++      return -2;
++    }
++    for (int i = first; i <= newest; i++) {
++      if (sent_[i].invalid)
++        continue;
++      NVENCSTATUS st = pEnc_->InvalidateRefFrame(sent_[i].no);
++      if (st != NV_ENC_SUCCESS) {
++        LOG_WARN(std::string("nvEncInvalidateRefFrames failed: ") + std::to_string(st));
++        return -2;
++      }
++      sent_[i].invalid = true;
++    }
++    recovery_next_ = true;
++    return 0;
++  }
+ 
++  int submit(EncodeCallback callback, void *obj, int64_t ms) {
++    bool encoded = false;
++    bool idr = false;
++    std::vector<NvPacket> vPacket;
      NV_ENC_PIC_PARAMS picParams = {0};
-     picParams.inputTimeStamp = ms;
+-    picParams.inputTimeStamp = ms;
 -    pEnc_->EncodeFrame(vPacket);
++    picParams.inputTimeStamp = ++frame_no_;
 +    if (force_idr_) {
 +      picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
 +      force_idr_ = false;
@@ -999,13 +1222,42 @@ index 0887d0b..a3ebeff 100644
      for (NvPacket &packet : vPacket) {
        int32_t key = (packet.pictureType == NV_ENC_PIC_TYPE_IDR ||
                       packet.pictureType == NV_ENC_PIC_TYPE_I)
-@@ -450,6 +458,17 @@ int nv_set_bitrate(void *e, int32_t kbs) {
+                         ? 1
+                         : 0;
++      idr = idr || packet.pictureType == NV_ENC_PIC_TYPE_IDR;
++      // After an invalidation: a recovery point, also when NVENC chose an intra picture (an
++      // I picture is not an IDR: no SPS/PPS, not a start for a new decoder).
++      if (recovery_next_ && packet.pictureType != NV_ENC_PIC_TYPE_IDR)
++        key = 2;
+       if (packet.data.size() > 0) {
+         if (callback)
+           callback(packet.data.data(), packet.data.size(), key, obj, ms);
+         encoded = true;
+       }
+     }
++    if (encoded) {
++      recovery_next_ = false;
++      if (rfi_) {
++        if (idr)
++          sent_.clear();
++        sent_.push_back(Sent{frame_no_, ms, false});
++        while (sent_.size() > RFI_RING)
++          sent_.pop_front();
++      }
++    }
+     return encoded ? 0 : -1;
+   }
+ 
+@@ -450,6 +629,42 @@ int nv_set_bitrate(void *e, int32_t kbs) {
    return -1;
  }
  
 +int nv_request_keyframe(void *e) {
 +  try {
 +    NvencEncoder *enc = (NvencEncoder *)e;
++    // Only with encode_last: on a static screen the key frame comes from the kept image.
++    if (!enc->keep_last_)
++      return -1;
 +    enc->force_idr_ = true;
 +    return 0;
 +  } catch (const std::exception &e) {
@@ -1014,19 +1266,58 @@ index 0887d0b..a3ebeff 100644
 +  return -1;
 +}
 +
++int nv_encode_last(void *e, EncodeCallback callback, void *obj, int64_t ms) {
++  try {
++    NvencEncoder *enc = (NvencEncoder *)e;
++    return enc->encode_last(callback, obj, ms);
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("encode_last failed: ") + e.what());
++  }
++  return -1;
++}
++
++int nv_invalidate_refs(void *e, int64_t from_ms) {
++  try {
++    NvencEncoder *enc = (NvencEncoder *)e;
++    return enc->invalidate(from_ms);
++  } catch (const std::exception &e) {
++    LOG_ERROR(std::string("invalidate refs failed: ") + e.what());
++  }
++  return -2;
++}
++
++void nv_set_rfi(int32_t on) { g_nv_rfi.store(on ? 1 : 0); }
++
  int nv_set_framerate(void *e, int32_t framerate) {
    try {
      RECONFIGURE_HEAD
 diff --git a/cpp/nv/nv_ffi.h b/cpp/nv/nv_ffi.h
-index 06a82fc..900290d 100644
+index 06a82fc..ef795a9 100644
 --- a/cpp/nv/nv_ffi.h
 +++ b/cpp/nv/nv_ffi.h
-@@ -37,4 +37,7 @@ int nv_set_bitrate(void *encoder, int32_t kbs);
+@@ -37,4 +37,24 @@ int nv_set_bitrate(void *encoder, int32_t kbs);
  
  int nv_set_framerate(void *encoder, int32_t framerate);
  
-+// The next encode is an IDR with SPS/PPS. 0: requested.
++// The next encode or encode_last is an IDR with SPS/PPS. 0: requested; -1: the encoder was
++// opened without nv_set_rfi (no encode_last).
 +int nv_request_keyframe(void *encoder);
++
++// Encodes the last input again (no new texture). 0: a packet came; -1: not kept (encoder opened
++// without nv_set_rfi), nothing encoded yet, or no packet.
++int nv_encode_last(void *encoder, EncodeCallback callback, void *obj, int64_t ms);
++
++// Reference frame invalidation (fork, roadmap M22): the frames from the oldest one encoded with
++// pts `from_ms` on are no longer referenced, and the next encoded picture is a recovery point
++// (callback key 2, or 1 if it is an IDR). 0: done; -1: no RFI on this encoder (H.264, no caps,
++// opened without nv_set_rfi); -2: not possible now (pts unknown, or no valid reference left in
++// the DPB): force an IDR instead.
++int nv_invalidate_refs(void *encoder, int64_t from_ms);
++
++// Encoders opened from now on keep their last input (forced IDRs and encode_last), log the NVENC
++// caps, and with HEVC and the caps run with RFI (DPB 5, one L0 reference). 0 (default): as
++// upstream.
++void nv_set_rfi(int32_t on);
 +
  #endif // NV_FFI_H
 \ No newline at end of file
@@ -1100,7 +1391,7 @@ index 73417b4..73164b5 100644
          if name.contains("h264") {
              return Ok(H264);
 diff --git a/src/vram/amf.rs b/src/vram/amf.rs
-index cb43a28..ce130fc 100644
+index cb43a28..92a7c25 100644
 --- a/src/vram/amf.rs
 +++ b/src/vram/amf.rs
 @@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/amf_ffi.rs"));
@@ -1109,18 +1400,19 @@ index cb43a28..ce130fc 100644
      common::DataFormat::*,
 -    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
 +    vram::inner::{
-+        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
++        encode_last_unsupported, invalidate_refs_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
 +        InnerDecodeContext, InnerEncodeContext,
 +    },
  };
  
  pub fn encode_calls() -> EncodeCalls {
-@@ -17,6 +20,8 @@ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,9 @@ pub fn encode_calls() -> EncodeCalls {
          test: amf_test_encode,
          set_bitrate: amf_set_bitrate,
          set_framerate: amf_set_framerate,
 +        request_keyframe: request_keyframe_unsupported,
 +        encode_last: encode_last_unsupported,
++        invalidate_refs: invalidate_refs_unsupported,
      }
  }
  
@@ -1166,14 +1458,15 @@ index aa43ad7..e49575b 100644
          let frames = &mut *(obj as *mut Vec<DecodeFrame>);
          let mut width = 0;
 diff --git a/src/vram/encode.rs b/src/vram/encode.rs
-index 928fbe0..822045e 100644
+index 928fbe0..011a056 100644
 --- a/src/vram/encode.rs
 +++ b/src/vram/encode.rs
-@@ -84,6 +84,35 @@ impl Encoder {
+@@ -84,6 +84,49 @@ impl Encoder {
          }
      }
  
-+    /// Encodes the last input again, without a new texture (FFmpeg driver only). The frames
++    /// Encodes the last input again, without a new texture (FFmpeg driver, and the NV driver
++    /// opened with `set_nv_rfi(true)`). The frames
 +    /// are returned like `encode`'s.
 +    pub fn encode_last(&mut self, ms: i64) -> Result<&mut Vec<EncodeFrame>, i32> {
 +        unsafe {
@@ -1202,30 +1495,76 @@ index 928fbe0..822045e 100644
 +        }
 +    }
 +
++    /// Reference frame invalidation (fork, M22, NV driver opened with `set_nv_rfi(true)`, HEVC):
++    /// the frames from the one encoded with `pts` on are no longer referenced, and the next
++    /// encoded frame is a recovery point (`EncodeFrame::key` 2). Err(-1): not supported by this
++    /// encoder; Err(-2): not possible now (pts unknown or too old): force an IDR instead.
++    pub fn invalidate_refs(&mut self, pts: i64) -> Result<(), i32> {
++        unsafe {
++            match (self.calls.invalidate_refs)(self.codec, pts) {
++                0 => Ok(()),
++                err => Err(err),
++            }
++        }
++    }
++
      pub fn set_bitrate(&mut self, kbs: i32) -> Result<(), i32> {
          unsafe {
              match (self.calls.set_bitrate)(self.codec, kbs) {
+@@ -114,9 +157,17 @@ impl Drop for Encoder {
+     }
+ }
+ 
++/// NV driver encoders opened from now on (fork, M22) keep their last input (forced key frames and
++/// `encode_last`), log the NVENC caps, and for HEVC with the caps run with reference frame
++/// invalidation (DPB 5, one L0 reference). Off (default): as upstream.
++pub fn set_nv_rfi(on: bool) {
++    unsafe { nv::nv_set_rfi(on as i32) }
++}
++
+ pub struct EncodeFrame {
+     pub data: Vec<u8>,
+     pub pts: i64,
++    /// 1: key frame (IDR/I); 2: recovery point after `invalidate_refs` (fork); 0: other.
+     pub key: i32,
+ }
+ 
 diff --git a/src/vram/ffmpeg.rs b/src/vram/ffmpeg.rs
-index c4813cf..1a2fd23 100644
+index c4813cf..a6a0546 100644
 --- a/src/vram/ffmpeg.rs
 +++ b/src/vram/ffmpeg.rs
-@@ -17,6 +17,8 @@ pub fn encode_calls() -> EncodeCalls {
+@@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/ffmpeg_vram_ffi.rs"));
+ 
+ use crate::{
+     common::DataFormat::*,
+-    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
++    vram::inner::{
++        invalidate_refs_unsupported, DecodeCalls, EncodeCalls, InnerDecodeContext,
++        InnerEncodeContext,
++    },
+ };
+ 
+ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,9 @@ pub fn encode_calls() -> EncodeCalls {
          test: ffmpeg_vram_test_encode,
          set_bitrate: ffmpeg_vram_set_bitrate,
          set_framerate: ffmpeg_vram_set_framerate,
 +        request_keyframe: ffmpeg_vram_request_keyframe,
 +        encode_last: ffmpeg_vram_encode_last,
++        invalidate_refs: invalidate_refs_unsupported,
      }
  }
  
 diff --git a/src/vram/inner.rs b/src/vram/inner.rs
-index fbb8962..7e0ba15 100644
+index fbb8962..9a3fdf5 100644
 --- a/src/vram/inner.rs
 +++ b/src/vram/inner.rs
-@@ -64,6 +64,14 @@ pub type IVCall = unsafe extern "C" fn(v: *mut c_void) -> c_int;
+@@ -64,6 +64,16 @@ pub type IVCall = unsafe extern "C" fn(v: *mut c_void) -> c_int;
  
  pub type IVICall = unsafe extern "C" fn(v: *mut c_void, i: i32) -> c_int;
  
++pub type IVLCall = unsafe extern "C" fn(v: *mut c_void, l: i64) -> c_int;
++
 +/// Encodes the encoder's last input again (no new texture).
 +pub type EncodeLastCall = unsafe extern "C" fn(
 +    encoder: *mut c_void,
@@ -1237,14 +1576,17 @@ index fbb8962..7e0ba15 100644
  pub struct EncodeCalls {
      pub new: NewEncoderCall,
      pub encode: EncodeCall,
-@@ -71,6 +79,24 @@ pub struct EncodeCalls {
+@@ -71,7 +81,34 @@ pub struct EncodeCalls {
      pub test: TestEncodeCall,
      pub set_bitrate: IVICall,
      pub set_framerate: IVICall,
 +    /// The next encode is an IDR. Nonzero: not supported.
 +    pub request_keyframe: IVCall,
 +    pub encode_last: EncodeLastCall,
-+}
++    /// Reference frame invalidation from the frame encoded with this pts on (fork, M22).
++    /// 0: done, the next frame is a recovery point; -1: not supported; -2: not possible now.
++    pub invalidate_refs: IVLCall,
+ }
 +
 +/// For drivers without a forced keyframe.
 +pub(crate) unsafe extern "C" fn request_keyframe_unsupported(_: *mut c_void) -> c_int {
@@ -1259,11 +1601,18 @@ index fbb8962..7e0ba15 100644
 +    _: i64,
 +) -> c_int {
 +    -1
- }
++}
++
++/// For drivers without reference frame invalidation.
++pub(crate) unsafe extern "C" fn invalidate_refs_unsupported(_: *mut c_void, _: i64) -> c_int {
++    -1
++}
++
  pub struct DecodeCalls {
      pub new: NewDecoderCall,
+     pub decode: DecodeCall,
 diff --git a/src/vram/mfx.rs b/src/vram/mfx.rs
-index 68753c1..89e4b40 100644
+index 68753c1..090497e 100644
 --- a/src/vram/mfx.rs
 +++ b/src/vram/mfx.rs
 @@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/mfx_ffi.rs"));
@@ -1272,47 +1621,36 @@ index 68753c1..89e4b40 100644
      common::DataFormat::*,
 -    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
 +    vram::inner::{
-+        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
++        encode_last_unsupported, invalidate_refs_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
 +        InnerDecodeContext, InnerEncodeContext,
 +    },
  };
  
  pub fn encode_calls() -> EncodeCalls {
-@@ -17,6 +20,8 @@ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +20,9 @@ pub fn encode_calls() -> EncodeCalls {
          test: mfx_test_encode,
          set_bitrate: mfx_set_bitrate,
          set_framerate: mfx_set_framerate,
 +        request_keyframe: request_keyframe_unsupported,
 +        encode_last: encode_last_unsupported,
++        invalidate_refs: invalidate_refs_unsupported,
      }
  }
  
 diff --git a/src/vram/nv.rs b/src/vram/nv.rs
-index a78b9df..1751984 100644
+index a78b9df..a4e38bc 100644
 --- a/src/vram/nv.rs
 +++ b/src/vram/nv.rs
-@@ -6,7 +6,10 @@ include!(concat!(env!("OUT_DIR"), "/nv_ffi.rs"));
- 
- use crate::{
-     common::DataFormat::*,
--    vram::inner::{DecodeCalls, EncodeCalls, InnerDecodeContext, InnerEncodeContext},
-+    vram::inner::{
-+        encode_last_unsupported, request_keyframe_unsupported, DecodeCalls, EncodeCalls,
-+        InnerDecodeContext, InnerEncodeContext,
-+    },
- };
- 
- pub fn encode_calls() -> EncodeCalls {
-@@ -17,6 +20,12 @@ pub fn encode_calls() -> EncodeCalls {
+@@ -17,6 +17,12 @@ pub fn encode_calls() -> EncodeCalls {
          test: nv_test_encode,
          set_bitrate: nv_set_bitrate,
          set_framerate: nv_set_framerate,
-+        // No forced keyframe until this driver has `encode_last` as well: RustDesk serves a
-+        // refresh on a static screen from the kept image, so with only one of the two a refresh
-+        // would wait for that deadline and then restart anyway. `nv_request_keyframe` stays for
-+        // when `encode_last` is added.
-+        request_keyframe: request_keyframe_unsupported,
-+        encode_last: encode_last_unsupported,
++        // Forced keyframes and `encode_last` only for encoders opened with `set_nv_rfi(true)`
++        // (fork, M22): both return -1 otherwise, so a refresh restarts as upstream. RustDesk
++        // serves a refresh on a static screen from the kept image and needs the two together.
++        request_keyframe: nv_request_keyframe,
++        encode_last: nv_encode_last,
++        invalidate_refs: nv_invalidate_refs,
      }
  }
  

@@ -1,11 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use crate::{
-    codec::{enable_vram_option, EncoderApi, EncoderCfg},
+    codec::{enable_vram_option, EncoderApi, EncoderCfg, Rfi},
     hwcodec::HwCodecConfig,
     AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
@@ -33,6 +36,33 @@ lazy_static::lazy_static! {
     static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<String>>> = Default::default();
 }
 
+// Roadmap M22: UDP lanes that want reference frame invalidation now (`RfiEncoderWanted`), and
+// whether the NV SDK driver failed in this process (open or encode): then FFmpeg stays.
+static RFI_WANTED: AtomicUsize = AtomicUsize::new(0);
+static NV_RFI_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Held while a UDP lane that takes recovery points is offered or live (roadmap M22, host option
+/// `enable-nvenc-rfi`): HEVC encoders on NVIDIA opened meanwhile use hwcodec's NV SDK driver,
+/// which has reference frame invalidation, instead of FFmpeg nvenc.
+pub struct RfiEncoderWanted(());
+
+impl RfiEncoderWanted {
+    pub fn new() -> Self {
+        RFI_WANTED.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for RfiEncoderWanted {
+    fn drop(&mut self) {
+        RFI_WANTED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn rfi_wanted() -> bool {
+    RFI_WANTED.load(Ordering::Relaxed) > 0 && !NV_RFI_FAILED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct VRamEncoderConfig {
     pub device: AdapterDevice,
@@ -55,6 +85,13 @@ pub struct VRamEncoder {
     // Virtual framerate: the nominal frame rate this nvenc encoder was opened at
     // (`nvenc-nominal-fps`), 0 when off.
     nominal_fps: u32,
+    // M22: opened as the NV SDK driver with reference frame invalidation (`set_nv_rfi(true)`).
+    nv_rfi: bool,
+    // M22: HEVC on NVIDIA opened without RFI with `enable-nvenc-rfi=Y`: a lane that wants RFI
+    // reopens it (`wants_rfi_encoder`).
+    rfi_upgradable: bool,
+    // The last encode gave a recovery point (`take_recovery_point`).
+    recovery: bool,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -94,11 +131,49 @@ impl EncoderApi for VRamEncoder {
                 };
                 let vbv_frames = crate::codec::nvenc_vbv_frames();
                 hwcodec::ffmpeg::set_nvenc_vbv_frames(vbv_frames);
+                // M22: HEVC on NVIDIA with `enable-nvenc-rfi=Y`. While a lane wants RFI it opens as
+                // the NV SDK driver with RFI (`set_nv_rfi`: keeps its input, HEVC RFI): FFmpeg
+                // nvenc is replaced by it, an NV SDK driver encoder hwcodec picked itself gets it
+                // too. Without a lane every encoder opens as upstream.
+                let nv_hevc = crate::codec::enable_nvenc_rfi()
+                    && config.feature.vendor == Driver::NV
+                    && config.feature.data_format == DataFormat::H265;
+                let rfi_on = nv_hevc && rfi_wanted();
+                hwcodec::vram::encode::set_nv_rfi(rfi_on);
+                let mut ctx = ctx;
+                let mut nv_rfi = false;
+                let mut opened = None;
+                if rfi_on {
+                    let mut nv_ctx = ctx.clone();
+                    nv_ctx.f.driver = Driver::NV;
+                    match Encoder::new(nv_ctx.clone()) {
+                        Ok(encoder) => {
+                            log::info!(
+                                "vram encoder: NV SDK driver for reference frame invalidation (luid {})",
+                                nv_ctx.f.luid
+                            );
+                            ctx = nv_ctx;
+                            nv_rfi = true;
+                            opened = Some(encoder);
+                        }
+                        Err(_) => {
+                            NV_RFI_FAILED.store(true, Ordering::Relaxed);
+                            hwcodec::vram::encode::set_nv_rfi(false);
+                            log::warn!(
+                                "vram encoder: the NV SDK driver failed to open with RFI, opened as before (no RFI in this process)"
+                            );
+                        }
+                    }
+                }
+                let opened = match opened {
+                    Some(encoder) => Ok(encoder),
+                    None => Encoder::new(ctx.clone()),
+                };
                 // hwcodec applies the VBV to the FFmpeg driver's nvenc only (`set_vbv`).
                 let small_vbv = vbv_frames > 0
-                    && config.feature.driver == Driver::FFMPEG
-                    && config.feature.vendor == Driver::NV;
-                match Encoder::new(ctx.clone()) {
+                    && ctx.f.driver == Driver::FFMPEG
+                    && ctx.f.vendor == Driver::NV;
+                match opened {
                     Ok(encoder) => Ok(VRamEncoder {
                         encoder,
                         ctx,
@@ -108,6 +183,9 @@ impl EncoderApi for VRamEncoder {
                         same_bad_len_counter: 0,
                         small_vbv,
                         nominal_fps,
+                        nv_rfi,
+                        rfi_upgradable: nv_hevc && !nv_rfi,
+                        recovery: false,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -133,6 +211,8 @@ impl EncoderApi for VRamEncoder {
             .encode(texture, ms)
             .with_context(|| "Failed to encode")?
         {
+            // 2: a recovery point after `invalidate_refs` (M22), sent as a P frame.
+            self.recovery |= frame.key == 2;
             frames.push(EncodedVideoFrame {
                 data: Bytes::from(frame.data),
                 pts: frame.pts,
@@ -195,14 +275,18 @@ impl EncoderApi for VRamEncoder {
     }
 
     fn encode_last(&mut self, ms: i64) -> ResultType<VideoFrame> {
+        let mut recovery = false;
         let frames: Vec<_> = match self.encoder.encode_last(ms) {
             Ok(v) => v
                 .drain(..)
-                .map(|frame| EncodedVideoFrame {
-                    data: Bytes::from(frame.data),
-                    pts: frame.pts,
-                    key: frame.key == 1,
-                    ..Default::default()
+                .map(|frame| {
+                    recovery |= frame.key == 2;
+                    EncodedVideoFrame {
+                        data: Bytes::from(frame.data),
+                        pts: frame.pts,
+                        key: frame.key == 1,
+                        ..Default::default()
+                    }
                 })
                 .collect(),
             Err(code) => bail!("encode_last produced no packet, code: {code}"),
@@ -210,6 +294,7 @@ impl EncoderApi for VRamEncoder {
         if frames.is_empty() {
             bail!("no valid frame");
         }
+        self.recovery |= recovery;
         let frames = EncodedVideoFrames {
             frames: frames.into(),
             ..Default::default()
@@ -272,7 +357,33 @@ impl EncoderApi for VRamEncoder {
     }
 
     fn disable(&self) {
+        if self.nv_rfi {
+            // The NV SDK driver with RFI failed: opened as before (FFmpeg nvenc or the NV SDK
+            // driver without RFI) for this process, hardware stays.
+            NV_RFI_FAILED.store(true, Ordering::Relaxed);
+            log::warn!("vram encoder: the NV SDK driver with RFI failed, no RFI from the next start");
+            return;
+        }
         HwCodecConfig::clear(true, true);
+    }
+
+    fn invalidate_refs(&mut self, from_pts: i64) -> Rfi {
+        if !self.nv_rfi {
+            return Rfi::Unsupported;
+        }
+        match self.encoder.invalidate_refs(from_pts) {
+            Ok(()) => Rfi::Done,
+            Err(-1) => Rfi::Unsupported,
+            Err(_) => Rfi::TooLate,
+        }
+    }
+
+    fn take_recovery_point(&mut self) -> bool {
+        std::mem::take(&mut self.recovery)
+    }
+
+    fn wants_rfi_encoder(&self) -> bool {
+        self.rfi_upgradable && rfi_wanted()
     }
 }
 

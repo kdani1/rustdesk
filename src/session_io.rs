@@ -81,8 +81,15 @@ pub type WriterHandle = JoinHandle<Result<(), String>>;
 
 /// The connection's part of video writes; run by the writer task.
 pub trait WriterHooks: Send + 'static {
-    /// A video item was taken off the channel, before its write ("fetched").
-    fn video_dequeued(&mut self, msg: &Message, queued_at: Instant);
+    /// A video item was taken off the channel, before its write ("fetched"). The shared
+    /// message, so a hook can keep it past the write (the UDP shadow copy). Returns where it
+    /// goes: markers to write first, and whether to write the item itself (a live UDP video
+    /// lane takes video frames off TCP).
+    fn video_dequeued(
+        &mut self,
+        msg: &Arc<Message>,
+        queued_at: Instant,
+    ) -> crate::udp_video::host::Route;
     /// The write of a video item completed.
     fn video_sent(&mut self, msg: &Message, send: Duration);
     /// The writer ended, however: return, error, panic or abort.
@@ -353,12 +360,18 @@ async fn run_writer(
                 res.map_err(|e| e.to_string())?;
             }
             Some((at, msg)) = video.recv() => {
-                hooks.0.video_dequeued(&msg, at);
-                let begin = std::time::Instant::now();
-                let bytes = msg.write_to_bytes().map_err(|e| e.to_string())?;
-                w.write(bytes).await.map_err(|e| e.to_string())?;
-                hooks.0.video_sent(&msg, begin.elapsed());
-                video_run += 1;
+                let route = hooks.0.video_dequeued(&msg, at);
+                for marker in route.before {
+                    let bytes = marker.write_to_bytes().map_err(|e| e.to_string())?;
+                    w.write(bytes).await.map_err(|e| e.to_string())?;
+                }
+                if route.tcp {
+                    let begin = std::time::Instant::now();
+                    let bytes = msg.write_to_bytes().map_err(|e| e.to_string())?;
+                    w.write(bytes).await.map_err(|e| e.to_string())?;
+                    hooks.0.video_sent(&msg, begin.elapsed());
+                    video_run += 1;
+                }
             }
             Some(item) = bulk.recv() => {
                 video_run = 0;
@@ -804,7 +817,13 @@ mod tests {
     struct TestHooks(Arc<AtomicBool>);
 
     impl WriterHooks for TestHooks {
-        fn video_dequeued(&mut self, _: &Message, _: Instant) {}
+        fn video_dequeued(
+            &mut self,
+            _: &Arc<Message>,
+            _: Instant,
+        ) -> crate::udp_video::host::Route {
+            crate::udp_video::host::Route::TCP
+        }
         fn video_sent(&mut self, _: &Message, _: Duration) {}
         fn writer_exited(&mut self) {
             self.0.store(true, Ordering::SeqCst);

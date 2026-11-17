@@ -4,10 +4,11 @@
 
 use super::{
     crypto::{LaneCipher, OpenError, Role, SeqExhausted, SECRET_LEN},
+    fec,
     fragment::{
         fragment, Event, FragmentError, FrameMeta, LossStats, Reassembler, ReassemblyConfig,
     },
-    packet::{decode_inner, encode_inner, Inner, PathClass},
+    packet::{decode_inner, encode_inner, Ack, Inner, PathClass},
 };
 use std::time::Instant;
 
@@ -54,6 +55,24 @@ impl LaneSender {
         Ok(out)
     }
 
+    /// The datagrams of one frame with FEC at `percent` (0: none): each block's data shards,
+    /// then its parity shards.
+    pub fn frame_fec(
+        &mut self,
+        frame: &[u8],
+        meta: FrameMeta,
+        percent: u32,
+    ) -> Result<Vec<Vec<u8>>, SendError> {
+        let parts =
+            fragment(frame, meta, self.path.max_fragment_payload()).map_err(SendError::Fragment)?;
+        let (shards, _) = fec::protect(parts, percent);
+        let mut out = Vec::with_capacity(shards.len());
+        for s in &shards {
+            out.push(self.seal(&s.inner())?);
+        }
+        Ok(out)
+    }
+
     /// One sealed control or video datagram.
     pub fn seal(&mut self, inner: &Inner) -> Result<Vec<u8>, SendError> {
         self.inner.clear();
@@ -72,6 +91,7 @@ pub enum Received {
     HelloAck { lane_id: u64 },
     Ping { id: u32, send_us: u32 },
     Pong { id: u32, echo_us: u32 },
+    Ack(Ack),
 }
 
 /// Datagrams dropped before reassembly, by reason.
@@ -140,10 +160,15 @@ impl LaneReceiver {
                 self.reassembler.push(&h, payload, now);
                 Received::Video
             }
+            Inner::Fec(h, payload) => {
+                self.reassembler.push_parity(&h, payload, now);
+                Received::Video
+            }
             Inner::Hello { lane_id } => Received::Hello { lane_id },
             Inner::HelloAck { lane_id } => Received::HelloAck { lane_id },
             Inner::Ping { id, send_us } => Received::Ping { id, send_us },
             Inner::Pong { id, echo_us } => Received::Pong { id, echo_us },
+            Inner::Ack(a) => Received::Ack(a),
         })
     }
 
@@ -321,5 +346,163 @@ mod latency_tests {
         assert_eq!(drops.unauthenticated, 2);
         // A forged datagram with a fresh seq fails the tag check and leaves the window alone.
         assert_eq!(rx.cipher.highest_received(), 1);
+    }
+
+    /// Positions of the data and parity datagrams of a frame of `n` fragments sent by
+    /// `frame_fec` at `percent`: per block, (data positions, parity positions).
+    fn fec_positions(n: usize, percent: u32) -> Vec<(Vec<usize>, Vec<usize>)> {
+        let blocks = fec::plan_blocks(n, percent).unwrap();
+        let mut at = 0;
+        (0..blocks)
+            .map(|b| {
+                let d = fec::block_range(n, blocks, b).len();
+                let p = fec::parity_for(d, percent);
+                let data = (at..at + d).collect();
+                let parity = (at + d..at + d + p).collect();
+                at += d + p;
+                (data, parity)
+            })
+            .collect()
+    }
+
+    fn send_except(rx: &mut LaneReceiver, dgrams: &[Vec<u8>], drop: &[usize], now: Instant) {
+        for (i, d) in dgrams.iter().enumerate() {
+            if !drop.contains(&i) {
+                assert_eq!(rx.on_datagram(&mut d.clone(), now), Ok(Received::Video));
+            }
+        }
+    }
+
+    #[test]
+    fn latency_fec_rebuilds_lost_fragments_at_once() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        // 30 fragments, the last one short: one block with 6 parity shards.
+        let f0 = frame_bytes(40_000, 3);
+        let d0 = tx.frame_fec(&f0, meta(0, FLAG_KEY), 20).unwrap();
+        let pos = fec_positions(30, 20);
+        assert_eq!(pos.len(), 1);
+        assert_eq!((pos[0].0.len(), pos[0].1.len()), (30, 6));
+        assert_eq!(d0.len(), 36);
+        // Six data fragments lost, the short last one among them, and no parity.
+        send_except(&mut rx, &d0, &[0, 7, 8, 15, 22, 29], t0);
+        // Frame 1 loses nothing; its parity comes after it is delivered.
+        let f1 = frame_bytes(3_000, 4);
+        let d1 = tx.frame_fec(&f1, meta(1, 0), 20).unwrap();
+        assert_eq!(d1.len(), 3 + 2);
+        send_except(&mut rx, &d1, &[], t0);
+        // Frame 2: one fragment, lost, rebuilt from a parity shard.
+        let f2 = frame_bytes(100, 5);
+        let d2 = tx.frame_fec(&f2, meta(2, 0), 20).unwrap();
+        assert_eq!(d2.len(), 1 + 2);
+        send_except(&mut rx, &d2, &[0, 1], t0);
+        // No timeout needed: everything is there at t0.
+        let got = frames_of(&rx.poll(t0));
+        assert_eq!(got, vec![(0, f0), (1, f1), (2, f2)]);
+        let (loss, _) = rx.take_stats();
+        assert_eq!(loss.frames_lost, 0);
+        assert_eq!(loss.fec_recovered, 2);
+        assert_eq!(loss.fec_shards, 7);
+        assert_eq!(loss.fec_unrecoverable, 0);
+        assert_eq!(loss.parity_received, 6 + 2 + 1);
+        // Parity of a delivered frame is neither late nor a duplicate.
+        assert_eq!(
+            (loss.fragments_late, loss.fragments_duplicate, loss.fragments_invalid),
+            (0, 0, 0)
+        );
+        assert_eq!(rx.next_deadline(), None);
+    }
+
+    #[test]
+    fn latency_fec_rebuilt_but_gated_is_not_recovered() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        // Frame 0 arrives whole; frame 1 never arrives; frame 2 (a P-frame) loses one fragment
+        // that parity rebuilds, but it is gated behind the loss of frame 1: FEC saved nothing
+        // the decoder can use.
+        let f0 = frame_bytes(5_000, 1);
+        let d0 = tx.frame_fec(&f0, meta(0, FLAG_KEY), 20).unwrap();
+        send_except(&mut rx, &d0, &[], t0);
+        let _ = tx.frame_fec(&frame_bytes(5_000, 2), meta(1, 0), 20).unwrap();
+        let d2 = tx.frame_fec(&frame_bytes(5_000, 3), meta(2, 0), 20).unwrap();
+        send_except(&mut rx, &d2, &[1], t0);
+        let ev = rx.poll(t0 + Duration::from_millis(60));
+        assert_eq!(frames_of(&ev), vec![(0, f0)]);
+        let (loss, _) = rx.take_stats();
+        assert_eq!((loss.frames_lost, loss.frames_gated), (1, 1));
+        assert_eq!(loss.fec_shards, 1);
+        assert_eq!(loss.fec_recovered, 0);
+    }
+
+    #[test]
+    fn latency_fec_too_many_lost_is_unrecoverable() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        let f0 = frame_bytes(40_000, 6);
+        let d0 = tx.frame_fec(&f0, meta(0, FLAG_KEY), 20).unwrap();
+        // Seven missing (five data, two parity) against six parity shards: four parity arrive
+        // for five holes.
+        send_except(&mut rx, &d0, &[1, 2, 3, 4, 5, 30, 31], t0);
+        assert!(frames_of(&rx.poll(t0)).is_empty());
+        let ev = rx.poll(t0 + Duration::from_millis(60));
+        assert!(ev.contains(&Event::Lost {
+            display: 0,
+            from: 0,
+            to: 0
+        }));
+        let (loss, _) = rx.take_stats();
+        assert_eq!(loss.frames_lost, 1);
+        assert_eq!(loss.fec_unrecoverable, 1);
+        assert_eq!(loss.fec_recovered, 0);
+        assert_eq!(loss.fragments_missing, 5);
+    }
+
+    #[test]
+    fn latency_fec_multi_block_and_reorder() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        let n_bytes: usize = 400_000;
+        let n = n_bytes.div_ceil(PathClass::Lan.max_fragment_payload());
+        let f0 = frame_bytes(n_bytes, 7);
+        let d0 = tx.frame_fec(&f0, meta(0, FLAG_KEY), 20).unwrap();
+        let pos = fec_positions(n, 20);
+        assert_eq!(pos.len(), 2);
+        assert_eq!(d0.len(), n + pos[0].1.len() + pos[1].1.len());
+        // Block 0 loses as many data shards as it has parity; block 1 loses its last data
+        // shard (the short end of the frame) and some parity.
+        let mut drop: Vec<usize> = pos[0].0.iter().step_by(3).take(pos[0].1.len()).copied().collect();
+        drop.push(*pos[1].0.last().unwrap());
+        drop.extend(pos[1].1.iter().take(5));
+        // Data in reverse order, then the parity, also reversed. (Parity before data would
+        // rebuild a block as soon as the holes left match the parity that came, and the data
+        // arriving after that would count as duplicates.)
+        let is_parity = |i: &usize| pos.iter().any(|(_, par)| par.contains(i));
+        let mut order: Vec<usize> = (0..d0.len()).rev().filter(|i| !is_parity(i)).collect();
+        order.extend((0..d0.len()).rev().filter(|i| is_parity(i)));
+        order.retain(|i| !drop.contains(i));
+        for i in order {
+            rx.on_datagram(&mut d0[i].clone(), t0).unwrap();
+        }
+        let got = frames_of(&rx.poll(t0));
+        assert_eq!(got, vec![(0, f0)]);
+        let (loss, _) = rx.take_stats();
+        assert_eq!(loss.fec_recovered, 1);
+        assert_eq!(loss.fec_shards as usize, pos[0].1.len() + 1);
+        assert_eq!(loss.frames_lost, 0);
+    }
+
+    #[test]
+    fn latency_fec_off_is_the_plain_frame() {
+        let (mut tx, mut rx) = ends(PathClass::Lan);
+        let t0 = Instant::now();
+        let f = frame_bytes(10_000, 8);
+        let plain = tx.frame(&f, meta(0, FLAG_KEY)).unwrap();
+        let off = tx.frame_fec(&f, meta(1, 0), 0).unwrap();
+        assert_eq!(plain.len(), off.len());
+        send_except(&mut rx, &plain, &[], t0);
+        send_except(&mut rx, &off, &[], t0);
+        assert_eq!(frames_of(&rx.poll(t0)).len(), 2);
+        let (loss, _) = rx.take_stats();
+        assert_eq!((loss.parity_received, loss.fec_recovered), (0, 0));
     }
 }

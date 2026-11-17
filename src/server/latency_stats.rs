@@ -223,6 +223,12 @@ pub(super) struct LatencyStats {
     // enable-host-dwm-mmcss, Windows): what was applied ("off", "gpu", "dwm", "gpu+dwm", with
     // "-failed" parts), set once at capture start.
     gpuprio: &'static str,
+    // M22 reference frame invalidation: lane requests served by invalidating, requests that fell
+    // back to a key frame, recovery frames encoded from the kept image, the largest recovery frame.
+    rfi: usize,
+    rfi_idr: usize,
+    rfi_kept: usize,
+    rfi_max: usize,
 }
 
 impl LatencyStats {
@@ -261,6 +267,10 @@ impl LatencyStats {
             vfps: 0,
             vfchg: 0,
             gpuprio: "off",
+            rfi: 0,
+            rfi_idr: 0,
+            rfi_kept: 0,
+            rfi_max: 0,
         }
     }
 
@@ -360,6 +370,31 @@ impl LatencyStats {
         }
     }
 
+    /// A lane's RFI request (M22): `done` the frames were invalidated, else a key frame repairs it.
+    pub(super) fn on_rfi(&mut self, done: bool) {
+        if self.enabled {
+            if done {
+                self.rfi += 1;
+            } else {
+                self.rfi_idr += 1;
+            }
+        }
+    }
+
+    /// The recovery frame after an invalidation was encoded from the kept image (static screen).
+    pub(super) fn on_rfi_kept(&mut self) {
+        if self.enabled {
+            self.rfi_kept += 1;
+        }
+    }
+
+    /// A recovery frame of `bytes` went to the connections.
+    pub(super) fn on_recovery(&mut self, bytes: usize) {
+        if self.enabled {
+            self.rfi_max = self.rfi_max.max(bytes);
+        }
+    }
+
     /// One static-refine re-encode of the kept last image.
     pub(super) fn on_refine(&mut self) {
         if self.enabled {
@@ -422,7 +457,7 @@ impl LatencyStats {
         if self.enabled && self.sent + self.skipped + self.idle > 0 {
             let secs = elapsed.as_secs_f64();
             log::info!(
-                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={} vfps={} vfchg={} gpuprio={}",
+                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={} vfps={} vfchg={} gpuprio={} rfi={} rfi_idr={} rfi_kept={} rfi_max={} qos_sig={}",
                 self.display,
                 self.sent as f64 / secs,
                 spf.as_millis(),
@@ -453,6 +488,12 @@ impl LatencyStats {
                 self.vfps,
                 self.vfchg,
                 self.gpuprio,
+                self.rfi,
+                self.rfi_idr,
+                self.rfi_kept,
+                self.rfi_max,
+                // A live UDP lane feeds QoS its own delay signal (docs/UDP-VIDEO.md).
+                if crate::udp_video::host::live_lanes() > 0 { "udp" } else { "tcp" },
             );
         }
         self.window_start = Instant::now();
@@ -477,6 +518,10 @@ impl LatencyStats {
         self.rmerge = 0;
         self.refine = 0;
         self.vfchg = 0;
+        self.rfi = 0;
+        self.rfi_idr = 0;
+        self.rfi_kept = 0;
+        self.rfi_max = 0;
         self.enabled = is_enabled();
         SEND_ENABLED.store(self.enabled, Ordering::Relaxed);
     }

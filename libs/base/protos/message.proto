@@ -84,6 +84,14 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  // Fork-only (docs/UDP-VIDEO.md): the highest UDP video lane version this viewer supports,
+  // 0 or absent = none, 1 = shadow mode only, 2 = live mode of the first M20 build (no EPOCH
+  // marker; offered no live lane any more), 3 = live mode with EPOCH, 4 = also takes FEC parity
+  // shards (M21; offered UdpVideoOffer.fec_percent), 5 = also resumes at RECOVERY_POINT frames
+  // (M22), 6 = also takes internet lanes (M24, UdpVideoOffer.wan; advertised only when the
+  // session is direct and the viewer knows the host's address). Stock hosts ignore it, so they
+  // never offer a lane.
+  uint32 udp_video_version = 1001;
 }
 
 message Terminal {
@@ -101,6 +109,11 @@ message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
   bool port_forward_mux = 3;
+  // Fork-only (docs/UDP-VIDEO.md, "Per-frame feedback (M23)"): the version of per-frame video
+  // feedback (Misc.video_feedback) this host takes, 0 or absent = none. Set only by a fork host
+  // with enable-video-feedback=Y for remote control. Stock viewers ignore it; stock hosts never
+  // set it, so a fork viewer never sends feedback to them.
+  uint32 video_feedback = 1001;
 }
 
 message CodecAbility {
@@ -880,7 +893,167 @@ message Misc {
     // hidden and confined the pointer (a game took the mouse), or released it. Sent on change.
     // Older controllers ignore it.
     bool pointer_captured = 1001;
+    // Fork-only UDP video lane (docs/UDP-VIDEO.md). Sent only to a peer that advertised
+    // LoginRequest.udp_video_version; a stock peer parses an unknown tag as no union and ignores
+    // it. Fork tag plan: 1001 pointer_captured, 1002-1004 the UDP lane, 1005 per-frame video
+    // feedback (M23), next free 1006. Features: 1001 video_feedback, next free 1002.
+    UdpVideoOffer udp_video_offer = 1002;
+    UdpVideoControl udp_video_control = 1003;
+    UdpVideoFeedback udp_video_feedback = 1004;
+    // Fork-only, viewer -> host (M23): sent only to a host that advertised
+    // Features.video_feedback; a stock host never advertises, so it never gets one.
+    VideoFeedback video_feedback = 1005;
   }
+}
+
+// Fork-only, host -> viewer after login: a UDP video lane on the LAN. The secret travels only
+// inside the encrypted session stream; every datagram key is derived from it.
+message UdpVideoOffer {
+  enum Mode {
+    ModeOff = 0;
+    // Video stays on the session stream; a copy of every Nth frame also goes over UDP, to be
+    // measured and dropped by the viewer (M19).
+    ModeShadow = 1;
+    // Video frames go over UDP only (M20); everything else stays on the session stream.
+    // Offered (as lane version 2) only to a viewer that advertised udp_video_version >= 3.
+    ModeLive = 2;
+  }
+  uint32 version = 1;
+  Mode mode = 2;
+  uint64 lane_id = 3;
+  bytes secret = 4;
+  // Host IPv4 (4 bytes) or IPv6 (16 bytes) address and UDP port to send HELLO to.
+  bytes ip = 5;
+  uint32 port = 6;
+  // Largest datagram the host sends (UDP payload bytes).
+  uint32 max_datagram = 7;
+  // Shadow mode: one frame in this many is copied to UDP.
+  uint32 shadow_every = 8;
+  // Live mode: no authenticated datagram from the other end for this long ends the lane
+  // (0 = the viewer's default).
+  uint32 timeout_ms = 9;
+  // FEC (M21): Reed-Solomon parity per frame block in percent of its data shards (min 2 per
+  // block); 0 or absent = no parity datagrams. Set only for a viewer of udp_video_version >= 4.
+  uint32 fec_percent = 10;
+  // Internet lane (M24), only to a viewer of udp_video_version >= 6: `ip` is empty (the host does
+  // not know its public address); the viewer sends HELLO to the host IP it reached the session
+  // on, at `port`, which is the lane socket's public port as the rendezvous server saw it (or
+  // its local port when the server did not answer, and on IPv6). Before its HELLOs the viewer
+  // tells its own public port in UdpVideoControl KindCandidate, so the host can punch toward it.
+  bool wan = 11;
+}
+
+// Fork-only lane control, both directions over the session stream.
+message UdpVideoControl {
+  enum Kind {
+    KindUnknown = 0;
+    // Viewer -> host: HELLO_ACK arrived, the lane works; the host starts sending.
+    KindReady = 1;
+    // Live mode, host -> viewer, in the order of the video stream: every video frame after
+    // this marker comes over UDP, frame ids from 0 per display, with `epoch`.
+    KindActive = 2;
+    // Host -> viewer: the host closed the lane. For a live lane that went active it comes in
+    // the order of the video stream, right before the first video frame on TCP again, with
+    // `last_frames`.
+    KindStop = 3;
+    // Viewer -> host: please close the lane (handshake failed, offer refused, viewer closing).
+    KindRequestStop = 4;
+    // Live mode (lane v2), host -> viewer, right before a SwitchDisplay of the video stream:
+    // the next SwitchDisplay the viewer reads makes `epoch` current. A SwitchDisplay without
+    // this marker (one the host sent outside the video stream) leaves the epoch alone.
+    KindEpoch = 5;
+    // Internet lane (M24), viewer -> host after a `wan` offer: the viewer's lane socket's public
+    // UDP port (`port`) as the rendezvous server saw it (or its local port); the host sends
+    // punch datagrams to the session peer's IP at that port until the viewer's HELLO comes in.
+    KindCandidate = 6;
+  }
+  Kind kind = 1;
+  uint64 lane_id = 2;
+  string reason = 3;
+  // KindActive: the epoch byte of the UDP frames that follow. KindEpoch: the epoch that the
+  // SwitchDisplay right after the marker starts.
+  uint32 epoch = 4;
+  // KindStop of a live lane: the id of the last frame given to UDP, per display that had any.
+  repeated UdpVideoLastFrame last_frames = 5;
+  // KindStop of a live lane: comes in the order of the video stream (see KindStop).
+  bool in_band = 6;
+  // KindCandidate: the viewer's public lane port.
+  uint32 port = 7;
+}
+
+message UdpVideoLastFrame {
+  int32 display = 1;
+  uint32 frame_id = 2;
+}
+
+// Fork-only, viewer -> host over the session stream (M23, docs/UDP-VIDEO.md "Per-frame
+// feedback"): what happened to the video frames since the previous batch. At most one batch
+// per 50 ms, only while there is something to report. Times are microseconds on the viewer's
+// feedback clock (it starts when the viewer reads the host's PeerInfo); only differences mean
+// anything, the host never compares them with its own clock directly.
+message VideoFeedback {
+  // Batch counter from 0 for the session, wrapping.
+  uint32 seq = 1;
+  // Viewer clock when the batch was built.
+  uint64 sent_us = 2;
+  // Frames that arrived (parsed from the session stream, or released by the UDP lane), in
+  // arrival order.
+  repeated VideoFeedbackFrame frames = 3;
+  // Frames the decoder finished since the previous batch (reported once each).
+  repeated VideoFeedbackDone done = 4;
+  // UDP lane: frame ranges declared lost.
+  repeated VideoFeedbackLost lost = 5;
+  // UDP lane: the receiver's counters since the previous batch; absent without a live lane.
+  VideoFeedbackUdp udp = 6;
+  // Entries left out because a batch carries at most 64 frames, 64 done and 16 lost.
+  uint32 dropped = 7;
+}
+message VideoFeedbackFrame {
+  int32 display = 1;
+  // The frame's pts (the largest of its encoded frames), the key the host matches.
+  int64 pts = 2;
+  uint64 arrival_us = 3;
+  // Encoded bytes of the frame.
+  uint32 bytes = 4;
+  // The display's decoder queue length when it arrived.
+  uint32 queue_len = 5;
+  // Came over the UDP video lane.
+  bool udp = 6;
+}
+message VideoFeedbackDone {
+  int32 display = 1;
+  int64 pts = 2;
+  // From arrival to the end of the decode.
+  uint32 decode_us = 3;
+  // From arrival to the end of the hand-over to the UI; 0 = not shown (present pacing).
+  uint32 present_us = 4;
+}
+message VideoFeedbackLost {
+  int32 display = 1;
+  // Lane frame ids, inclusive, wrapping.
+  uint32 from = 2;
+  uint32 to = 3;
+  // A key frame right behind the loss repaired it; no request went out.
+  bool repaired = 4;
+}
+message VideoFeedbackUdp {
+  // Sequence span and datagrams that opened (the lane's whole receive side).
+  uint64 datagrams_expected = 1;
+  uint64 datagrams_received = 2;
+  uint64 frames_completed = 3;
+  uint64 frames_lost = 4;
+  // Frames delivered only thanks to FEC, and frames FEC could not save.
+  uint64 fec_recovered = 5;
+  uint64 fec_unrecoverable = 6;
+}
+// Fork-only, viewer -> host over the session stream, live mode: frames of a display were lost
+// on the lane; the viewer shows nothing of that display until a key frame.
+message UdpVideoFeedback {
+  uint64 lane_id = 1;
+  int32 display = 2;
+  bool request_keyframe = 3;
+  uint32 lost_from = 4;
+  uint32 lost_to = 5;
 }
 
 message VoiceCallRequest {

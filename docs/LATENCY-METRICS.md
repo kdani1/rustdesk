@@ -14,8 +14,8 @@ Code:
 
 | Side | File | Hooks |
 |---|---|---|
-| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`, split session), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`), `src/platform/windows_qos.rs` (TCP meter, `HostSocket`), `src/session_io.rs` (split writer) |
-| Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer, `fps_control`, writes of UI messages), `src/client.rs` `start_video_thread` (`VideoCounters`, `PresentPacer`), `AudioBuffer` / `start_audio_thread`, `src/client/audio_target.rs` (adaptive audio target), `src/platform/windows.rs` (`viewer_thread_boost`, `viewer_process_boost`), `RaceLog`, `VideoHandler`, `src/client/audio_playback.rs` (underruns), `src/ui_session_interface.rs` `Session::send`, `src/flutter.rs` (soft-render handoff, drop and replace, `next_rgba`, quality status) |
+| Host | `src/server/latency_stats.rs` | `src/server/video_service.rs` `run()` and its restart wrapper in `new()`, `src/server/connection.rs` (select loop, `rx_video` video frame write, `refresh_video_display`, split session), `src/server.rs` `create_tcp_connection` (`TransportInfo`), `libs/scrap/src/dxgi/mod.rs` (`last_present_age`), `src/platform/windows_qos.rs` (TCP meter, `HostSocket`), `src/session_io.rs` (split writer), `src/udp_video/host.rs` (UDP lane, `UDPVIDEO host`) |
+| Viewer | `src/client/latency.rs` | `src/client/io_loop.rs` (receive, TestDelay, 1 s status timer, `fps_control`, writes of UI messages), `src/client.rs` `start_video_thread` (`VideoCounters`, `PresentPacer`), `AudioBuffer` / `start_audio_thread`, `src/client/audio_target.rs` (adaptive audio target), `src/platform/windows.rs` (`viewer_thread_boost`, `viewer_process_boost`), `RaceLog`, `VideoHandler`, `src/client/audio_playback.rs` (underruns), `src/ui_session_interface.rs` `Session::send`, `src/flutter.rs` (soft-render handoff, drop and replace, `next_rgba`, quality status), `src/udp_video/viewer.rs` and `shadow.rs` (UDP lane, `UDPVIDEO viewer`) |
 | Flutter | `flutter/lib/models/model.dart` (`ImageModel.onRgba`, `_PaintLatencyStats`, `QualityMonitorModel`) | `flutter/lib/common/widgets/overlay.dart` (`QualityMonitor`) |
 
 ## Turning it on
@@ -47,7 +47,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 vfps=0 vfchg=0 gpuprio=off
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 vfps=0 vfchg=0 gpuprio=off rfi=0 rfi_idr=0 rfi_kept=0 rfi_max=0 qos_sig=tcp
 ```
 
 | Field | Meaning |
@@ -76,14 +76,29 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkey` | Windows host, `enable-refresh-keyframe=Y`: refreshes served by a forced key frame on the running encoder (no restart), counted when the key frame reached at least one connection. Their gaps are in `gap` and in `LATENCY switch` lines with `reason=refresh_keyframe restarts=0`. |
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
+| `qos_sig` | the delay signal `video_qos` adapts fps and bitrate from: `tcp`, the TestDelay round trip on the session stream (always, unless a live UDP lane exists); `udp` while at least one connection of this host has an active live UDP video lane (M20): that connection's TestDelay samples are replaced by TCP delay + the largest queueing excess of the lane's ACK round trips + 150 ms if the viewer lost frames since the last sample (`UDPVIDEO host` `ack_rtt_ms`, `base_ms`, `vlost`). Process-wide, not per display |
+| `rfi` | Windows host, `enable-nvenc-rfi=Y` (M22): live UDP lanes' loss reports served by reference frame invalidation on the running encoder (the lost frames are no longer referenced; the next frame is the recovery point). Requests of several lanes for one display that came within one loop iteration count once; a lane whose wait a recovery frame or key frame ended before the loop took its request withdraws it (not counted) |
+| `rfi_idr` | RFI requests the encoder could not serve (not the NV SDK driver, H.264, the lost frame more than 4 frames back or unknown), and recovery frames the kept image could not give (that invalidation is also in `rfi`): a key frame through the refresh path instead (also counted in `gap`/`rkey` like any refresh) |
+| `rfi_kept` | recovery frames encoded from the kept last image (`encode_last`) because no new image came within one capture wait after the invalidation (static screen) |
+| `rfi_max` | largest recovery frame of the window, bytes (0 when none): compare with `keymax` for the spike RFI saves |
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
 | `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused a rate and was reset to `nvenc-nominal-fps`). When the encoder refuses a rate and also the reset to nominal (in practice only the NVENC SDK driver, whose Reconfigure can fail), it keeps the last applied value, the rate the encoder is stuck at, until the capture restarts; a warning `virtual fps: ... stays at N fps until restart` marks this. Either way later cap changes are not applied until the capture restarts. |
 | `vfchg` | how often `vfps` changed in the window (each one is an IDR-free nvenc reconfigure with the next frame) |
 | `gpuprio` | Windows host (roadmap M17): what this capture loop's start applied. `off`: neither `enable-host-gpu-priority` nor `enable-host-dwm-mmcss` was `Y` (also on other platforms). `gpu`: GPU priority on and in effect (process class `high`/`above_normal`/`held`/`kept:…`, or `SetGPUThreadPriority` on the capture device returned success); `gpu-failed`: the option is on but neither took effect. `dwm`: `DwmEnableMMCSS(TRUE)` succeeded (or was already on); `dwm-failed`: the option is on but the call failed or is unavailable. Both options on: the parts joined by `+` (`gpu+dwm`, `gpu-failed+dwm`, `gpu+dwm-failed`, `gpu-failed+dwm-failed`). Labels A/B windows; the return codes are in the `LATENCY server gpu_priority` line of the same capture start (below). |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
-`rmerge`, `refine` and `vfchg` are only counted while logging is on, like the other fields;
-`set_kbps` and `vfps` are kept always.
+`rmerge`, `refine`, `vfchg` and the `rfi` fields are only counted while logging is on, like the
+other fields; `set_kbps` and `vfps` are kept always.
+
+**With a live UDP video lane (M20) `wait` and `send` mean something else** for that
+connection's frames, so compare TCP and UDP runs field by field with care:
+- `send` is the lane sender thread's time for one frame: serialize, fragment, seal and `send`
+  every datagram, **including the pacer's waits between bursts** (a big frame is spread over up
+  to half a frame period on purpose). It no longer contains any socket back-pressure.
+- `wait` ends when the lane reports the frame fetched: once it is sent and at most 3 frames of
+  that display are not yet settled by the viewer's ACKs (or after 100 ms). It is the send
+  window's back-pressure, the UDP replacement for the TCP write blocking.
+- `send_slow` counts paced sends over 16 ms (an IDR of several hundred kB at a low bitrate).
 
 Not covered: the re-encode of the last image that non-latency-free encoders
 (mediacodec, videotoolbox) do on idle iterations.
@@ -182,6 +197,10 @@ Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL
 | `virtual fps: <service> encoder runs at N fps (cap C)` | the capture loop applied the virtual framerate the first time after an encoder was created |
 | `virtual fps: <service> encoder refused N fps, off until restart` | `set_fps` failed (should not happen with FFmpeg nvenc; the NVENC SDK driver's reconfigure can fail); the encoder keeps the bitrate it had, `vfps` becomes 0 |
 | `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |
+| `[NVENC] caps hevc: rfi=… ir=… ss_ir=… multiref=… h264: …; hevc encoder rfi=on dpb=5 numRefL0=1` | M22, once per encoder of hwcodec's NV SDK driver opened with `enable-nvenc-rfi=Y`: the NVENC caps `SUPPORT_REF_PIC_INVALIDATION`, `SUPPORT_INTRA_REFRESH`, `SINGLE_SLICE_INTRA_REFRESH` and `SUPPORT_MULTIPLE_REF_FRAMES` for both codecs on this GPU and driver, and whether this encoder runs with RFI (HEVC with the cap only; `off` for H.264). The roadmap's precondition for M22 |
+| `vram encoder: NV SDK driver for reference frame invalidation (luid …)` | M22: an HEVC encoder on NVIDIA was opened with the NV SDK driver instead of FFmpeg nvenc because a lane wants RFI |
+| `vram encoder: the NV SDK driver failed to open, FFmpeg nvenc stays (no RFI in this process)` / `… failed, FFmpeg nvenc from the next start` | M22: the NV SDK driver could not be opened, or its encodes failed (the capture loop's usual encode-failure restart): FFmpeg nvenc for the rest of the process, hardware encoding stays on |
+| `switch to the NV SDK driver for reference frame invalidation` | M22: a lane wants RFI while the running HEVC encoder is FFmpeg nvenc: one capture restart, `reason=nv_rfi` |
 
 ### Host: capture restarts, connection loop, transport
 
@@ -195,7 +214,7 @@ TRANSPORT host conn=3 type=TCP-punch peer=192.0.2.10:52311 secure=true detail=ac
 |---|---|
 | `LATENCY switch` | one line per completed capture restart (`gap`), with logging on, at most one per source and display per second. A capture restart is any error return of the capture loop (`run()` in `video_service.rs`), which the service restarts: a `SWITCH` (refresh, codec change, new subscriber, …) or an error. |
 | `source` / `display` | `monitor` or `camera`, and the display index. Gaps are kept per source and display. |
-| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), the `enable-refresh-keyframe` reasons below, `codec`, `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
+| `reason` | why the first restart of the gap happened. For a `SWITCH`: `refresh` (a viewer's `RefreshVideo`; also when a requested refresh was served by a fresh capture start), the `enable-refresh-keyframe` reasons below, `codec`, `nv_rfi` (M22: switch to the NV SDK driver), `portable_service`, `i444`, `gdi_vram`, `screenshot`, `dxgi_access_lost`, `scale` (Android), `privacy_mode`, `new_subscriber`, `encode_fail`, `encoder_need_switch`, `display_changed`, `quality` (encoder that cannot change bitrate), `record`. For any other error: its text, spaces as `_`, at most 60 characters. |
 | `restarts` | restarts within this gap (a restart that failed again before sending a frame adds one). `0` with `reason=refresh_keyframe`: the refresh was served by a key frame without a restart. |
 | `gap_ms` | the gap: from the viewer's refresh request (`RefreshVideo` for one display, recorded in `refresh_video_display`) or, without one, the restart, until the restarted loop handed its first frame to at least one connection. It includes the service's error back-off sleep and the capturer/encoder re-creation. A refresh request for all displays (login, `PeerInfo`) has no request time: its gap starts at the restart. Gaps older than 60 s when the loop starts are dropped (the session that caused it is most likely gone). |
 | `not_logged` | completed gaps of this source and display not logged since the previous line (rate limit); they are still in the `gap` field |
@@ -785,6 +804,361 @@ endpoint's 128-entry send channel can queue in front of the link. A smaller wind
 queue (64: about 180 KB), and also caps KCP's throughput at window x MTU per RTT (64 at 50 ms:
 about 14 Mbps). Works with `allow-kcp-congestion-control` or alone. Not done: the bound of the
 128-entry channel and a `kcp_backlog` field need a kcp-sys change (fork). Rollback: empty.
+
+### UDP video lane (shadow probe)
+
+Roadmap M19, design and negotiation in docs/UDP-VIDEO.md. Off by default: host server option
+`enable-udp-video` `shadow` (or `Y`, the value M19 used, which keeps meaning shadow; live mode
+is `live` since the M20 review, see the next section);
+the viewer option `enable-udp-video` is on by default and only acts when a host offers. The
+video still goes over TCP; every Nth frame (`udp-video-shadow-every`, default 2) is also sent
+over UDP, and the viewer only measures it. These lines are logged whenever a lane exists,
+independent of `enable-latency-log` (the lane exists only to measure). Since M20 the window
+lines carry `mode=shadow` after the lane id.
+
+```
+UDPVIDEO host conn=5 not offered (viewer v1): host option enable-udp-video is "" (live: live, shadow or Y: shadow)
+UDPVIDEO host conn=5 offer lane=3f2a… mode=shadow addr=192.168.1.5:61234 every=2 viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 HELLO from 192.168.1.9:50511 lane=3f2a… at_us=41250
+UDPVIDEO host conn=5 active lane=3f2a… mode=shadow peer=192.168.1.9:50511 every=2 after_ms=47
+UDPVIDEO host conn=5 lane=3f2a… win_s=5.0 frames=150 keys=1 skipped=150 qdrop=0 dgrams=2210 kB=2950 send_ms=0.2/0.6/2.1 lag_ms=0.1/0.3/1.2 err=0 pings=25 refused=0
+UDPVIDEO host conn=5 stop lane=3f2a…: no HELLO from the viewer in 3 s: inbound UDP to this host looks blocked (…)
+UDPVIDEO host conn=5 closed lane=3f2a… state=Active
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=shadow host=192.168.1.5:61234 local=192.168.1.9:50511 every=2
+UDPVIDEO viewer peer=123456789 ready lane=3f2a… after_ms=2 hellos=1
+UDPVIDEO viewer peer=123456789 lane=3f2a… win_s=5.0 frames=150 lost=0 frag_miss=0 dgrams=2235/2235 loss_pct=0.00 reorder=0/0 dup=0 late=0 bad=0 drop=0/0/0/0 matched=150 tcp_first=3 unpaired=0 ahead_net_ms=1.8/6.5/24.0/-0.4 ahead_app_ms=1.1/5.9/22.7/-1.0 owd_var_ms=0.4/2.2/9.8 asm_ms=0.3/1.1/3.0 rtt_ms=2.1/4.0/7.5 pings=25/25 rx_err=0
+UDPVIDEO viewer peer=123456789 refused lane=3f2a…: session is not direct encrypted TCP
+UDPVIDEO viewer peer=123456789 handshake failed lane=3f2a…: no HELLO_ACK in 1000 ms after 50 HELLO (…)
+UDPVIDEO viewer peer=123456789 closed lane=3f2a…: host stopped: …
+```
+
+Host window line (sender thread, every 5 s while the lane is active, and once when it ends):
+
+| Field | Meaning |
+|---|---|
+| `win_s` | length of the window |
+| `frames`, `keys` | shadow copies sent, of them containing a key frame |
+| `skipped` | video frames the every-Nth rule did not copy |
+| `qdrop` | copies dropped because the sender's queue (4) was full: the sender thread fell behind |
+| `dgrams`, `kB` | datagrams and kB the socket took (UDP payload, headers not counted) |
+| `send_ms` | p50/p95/max (nearest rank) of one copy's serialize + seal + `send` of all its datagrams |
+| `lag_ms` | p50/p95/max from the tap to the sender thread taking the copy |
+| `err` | failed serializations, fragmentations and `send` calls; `first_err` is the first one |
+| `pings` | viewer pings answered; `refused`: datagrams dropped before or by the crypto (other source, bad tag, replay) |
+
+Viewer window line (every 5 s from the receive thread's window, combined in the io_loop with
+the pairing of the same 5 s):
+
+| Field | Meaning |
+|---|---|
+| `frames` | shadow frames completed |
+| `lost`, `frag_miss` | frames declared lost (a later frame completed 5 ms earlier, or 500 ms since its first fragment: shadow frames are unpaced and share the link with the TCP copy, so a slow but complete frame is delivered and paired, not lost), and their missing fragments |
+| `dgrams` | datagrams received / expected from the lane seq span (pongs and HELLO_ACK share the seq, so a lost pong counts too; the host sends each datagram under the seal lock, so a pong never overtakes the frame it interrupts) |
+| `loss_pct` | `1 - received/expected`, in % |
+| `reorder` | datagrams that arrived after a higher seq / largest seq distance |
+| `dup`, `late`, `bad` | duplicate fragments, fragments of a frame already complete or lost, inconsistent fragments |
+| `drop` | datagrams refused: malformed / replayed / failed authentication / bad inner part |
+| `matched` | frames whose UDP and TCP copies met (by display and pts) |
+| `tcp_first` | of those, how many times TCP handled its copy before UDP completed its own |
+| `unpaired` | UDP copies that found no TCP copy within 2 s |
+| `ahead_net_ms` | p50/p95/max/min of t(TCP copy returned by `peer.next()` in the io_loop, before its parse) - t(UDP copy complete on the receive thread). Positive: UDP first. Upper bound: it credits UDP with the io_loop's scheduling delay |
+| `ahead_app_ms` | the same against the entry of the io_loop's UDP branch for the copy: both copies pay the loop's delay and neither stamp includes a parse (the UDP copy is parsed for display and pts on the receive thread, so the io_loop does no full-frame parse for it). The number the M20 decision uses |
+| `owd_var_ms` | p50/p95/max of the one-way delay above the window's minimum: arrival of a frame's first fragment on the viewer's lane clock minus `send_us`, which the host stamps after serializing the frame, right before it seals and sends the first datagram (host lane clock; the clock offset cancels). One datagram's delay, independent of frame size; the burst of a big frame shows in `asm_ms` |
+| `asm_ms` | p50/p95/max first to last fragment of a frame |
+| `rtt_ms` | p50/p95/max of PING to PONG over the lane (200 ms interval) |
+| `pings` | sent / answered |
+| `rx_err` | receive errors other than the timeout |
+
+Reading them: `loss_pct`/`lost` near 0 and `ahead_app_ms` p95/max near 0 mean TCP loses
+nothing to retransmission on this link, and M20-M22 can wait. `ahead_app_ms` max spikes at the
+moments `LATENCY tcp` shows retransmissions (or `wait`/`send` spikes on the host) mean UDP would
+have delivered those frames earlier. Always note `every`: the copy itself loads the link.
+
+### UDP video lane (live, M20)
+
+Host server option `enable-udp-video` `live` (off by default; `Y` is shadow) and a viewer that
+advertises lane version 3 (the first M20 viewer, 2, gets no live offer; its host's live offers
+are refused by this viewer): video frames go over UDP, everything else stays on TCP; any
+trouble falls back to TCP video in the same session (docs/UDP-VIDEO.md, "Live mode"). Logged
+whenever a lane exists, like the shadow lines.
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=192.168.1.5:61234 every=2 burst=8 timeout_ms=1000 viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 live: a loss is repaired by a forced key frame (enable-refresh-keyframe=Y)
+UDPVIDEO host conn=5 lane=3f2a… pacing burst=8 hires_timer=true
+UDPVIDEO host conn=5 qWAVE AudioVideo flow added
+UDPVIDEO host conn=5 active lane=3f2a… mode=live peer=192.168.1.9:50511 every=2 after_ms=41
+UDPVIDEO host conn=5 lane=3f2a… mode=live win_s=5.0 frames=300 keys=1 skipped=0 qdrop=0 dgrams=4410 kB=5900 send_ms=0.9/3.1/8.0 lag_ms=0.1/0.2/0.6 err=0 pings=25 refused=0 paced_ms=0.4/2.6/7.6 win_wait_ms=2.0/9.5/31.0 win_to=0 inflight_max=4 acks=410 ack_rtt_ms=2.2/4.9/12.1 base_ms=1.6 vlost=0 kf_req=0 tail_kf=0
+UDPVIDEO host conn=5 stop lane=3f2a… mode=live: sustained loss: 4 key frames in 5 s (last: request for display 0 frames 812..=812) (in_band=true displays=[0])
+UDPVIDEO host conn=5 video back on TCP, next offer in 30 s
+UDPVIDEO host conn=5 retry 1 of 2
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=live host=192.168.1.5:61234 local=192.168.1.9:50511 every=2 timeout_ms=1000
+UDPVIDEO viewer peer=123456789 live lane=3f2a… epoch=0 held=1 closed=false
+UDPVIDEO viewer peer=123456789 lane=3f2a… mode=live win_s=5.0 frames=300 lost=0 gated=0 frag_miss=0 dgrams=4535/4535 loss_pct=0.00 reorder=0/0 dup=0 late=0 bad=0 drop=0/0/0/0 shown=300 held=1/1 stale=0 gated_app=0 kf_req=0 lost_fixed=0 tcp_drop=0 owd_var_ms=0.4/2.0/8.1 asm_ms=0.6/2.9/7.9 rtt_ms=2.0/3.6/6.6 pings=25/25 acks=410 rx_err=0
+UDPVIDEO viewer peer=123456789 request stop lane=3f2a…: display 0 without a key frame 1004 ms after a loss
+UDPVIDEO viewer peer=123456789 live lane=3f2a… back on TCP: key frame awaited on displays [0]
+```
+
+Host: `offer` adds `burst` (`udp-video-burst`, datagrams per paced burst, 0 = unpaced) and
+`timeout_ms` (`udp-video-timeout-ms`); the `live:` line says how a loss is repaired (M13 forced
+key frame, or a capture restart for every viewer when `enable-refresh-keyframe` is not `Y`);
+`pacing` says whether the high-resolution waitable timer is in use (`false`: Windows before 10
+1803, waits are slept and spun); the qWAVE line appears unless `enable-lan-qos` is `N` (a
+failure is logged as a warning, the lane goes on unmarked). The window line has the shadow
+fields (`frames`: frames sent over the lane; `qdrop`: frames dropped from a full queue of 8,
+each a loss on the viewer; `send_ms`: as `send` above) plus:
+
+| Field | Meaning |
+|---|---|
+| `paced_ms` | p50/p95/max of the time one frame waited for the pacer (part of `send_ms`) |
+| `win_wait_ms` | p50/p95/max, frames the send window held: from sent until reported fetched |
+| `win_to` | held frames released by the 100 ms limit instead of an ACK |
+| `inflight_max` | most frames of one display sent and not yet settled by the viewer |
+| `acks` | viewer ACK datagrams (each display on progress, and every 50 ms) |
+| `ack_rtt_ms` | p50/p95/max of the ACK round trip: host time at the ACK minus the acked frame's `send_us`, minus the viewer's hold from that frame's first fragment to the ACK. The first fragment's trip plus the ACK's |
+| `base_ms` | the QoS baseline: the lowest ACK round trip of this and the previous 10 s window; QoS gets the excess over it (`qos_sig=udp`) |
+| `vlost` | frames the viewer declared lost (from the ACKs' running count) |
+| `kf_req` | key frame requests (`UdpVideoFeedback`) the viewer sent over TCP |
+| `tail_kf` | key frames the host asked for itself on a tail loss: a display's newest frame (sent, or dropped from the full queue) not settled by the ACKs 200 ms (plus `base_ms`) after it went out, with nothing newer sent, so no later frame could show the viewer the gap (one small frame lost on a static screen). Once per newest frame id. `kf_req` and `tail_kf` together, 4 within 5 s, end the lane (sustained loss) |
+
+The `stop` line gives the reason (handshake timeout, `no datagram from the viewer in N ms`,
+`N datagram sends failed in a row`, `sustained loss` with the last request or `tail losses`,
+`viewer asked: …`), `in_band` (the STOP
+marker waits for the next video item, so it comes right before the first TCP frame) and the
+displays that get a key frame for their restart on TCP. After a live lane ends the host offers
+again after 30 s and 120 s, then stays on TCP.
+
+Viewer window line, live (`mode=live`): the receive-side fields as in the shadow line (`lost`
+here: 80 ms after a frame's first fragment, above the pacer's 25 ms longest spread of a frame,
+or 5 ms after a later frame completed), plus:
+
+| Field | Meaning |
+|---|---|
+| `gated` | complete frames the receive thread dropped after a loss because they were not key frames (their reference is missing) |
+| `shown` | frames handed to the decoder path (decoder queue, pacer, fps control, latency stats, as TCP frames are) |
+| `held` | frames held for the ACTIVE marker or the SwitchDisplay of their epoch / most held at once. Only a SwitchDisplay right after an EPOCH marker starts an epoch; the ones the host sends outside the video stream (display switch answer, message query) do not |
+| `stale` | frames of an epoch before a SwitchDisplay already read, dropped |
+| `gated_app` | frames the io_loop dropped while the display waited for a key frame (a held frame lost to the 32-frame hold limit, or a loss it had already seen) |
+| `kf_req` | key frame requests sent: one when a display breaks (a loss, or a held frame dropped by the hold limit), then one every 250 ms while no key frame came. Losses while a display waits ask nothing |
+| `lost_fixed` | losses a key frame completed in the same poll right behind them repaired (the host's tail loss key frame, typically): no request |
+| `tcp_drop` | TCP frames dropped after the lane ended until a key frame, for displays whose last UDP frames did not all arrive |
+| `acks` | ACK datagrams sent |
+
+The viewer asks the host to stop the lane (`request stop`) when a display has no key frame 1 s
+after a loss, frames wait 1 s for ACTIVE or for the SwitchDisplay of their epoch, frames arrive
+for 1 s but only of an ended epoch (none shown), the host is silent for `timeout_ms`, or 5
+receive errors come in a row (the watchdog runs on the 1 s status tick, so it acts after 1-2 s). With a live lane the viewer's `LATENCY client` fields keep their meaning:
+UDP frames enter the same handling as TCP frames; the session `kB/s` counts both.
+
+### UDP video lane (FEC, M21)
+
+Host server option `udp-video-fec-percent` (default 20, `0` = no parity) and a viewer that
+advertises lane version 4: every frame carries Reed-Solomon parity (at least 2 per block of at
+most 200 data shards, at most 4 blocks per frame), live and shadow lanes alike
+(docs/UDP-VIDEO.md, "FEC (M21)"). The fields below are added to the lines of the two sections
+above.
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=192.168.1.5:61234 every=2 burst=8 timeout_ms=1000 fec=20 viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 lane=3f2a… mode=live win_s=5.0 frames=300 keys=1 skipped=0 qdrop=0 dgrams=5320 kB=7050 send_ms=1.0/3.4/8.6 lag_ms=0.1/0.2/0.6 err=0 pings=25 refused=0 fec_frames=300 fec_dgrams=910 fec_off=0 fec_ms=0.01/0.03/0.40 paced_ms=… vlost=0 kf_req=0 tail_kf=0
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=live host=192.168.1.5:61234 local=192.168.1.9:50511 every=2 timeout_ms=1000 fec=20
+UDPVIDEO viewer peer=123456789 lane=3f2a… mode=live win_s=5.0 frames=300 lost=0 gated=0 frag_miss=0 dgrams=5402/5445 loss_pct=0.79 … rx_err=0 fec_rec=21 fec_unrec=0 fec_shards=37 parity=880
+```
+
+Host: `fec` in the `offer` line is the parity percentage offered (0: none, also for a viewer
+below lane v4). The window line gets, while the lane sends parity:
+
+| Field | Meaning |
+|---|---|
+| `fec_frames` | frames sent with parity |
+| `fec_dgrams` | parity datagrams among `dgrams` (`kB` includes them) |
+| `fec_off` | frames sent without parity because they are larger than 4 blocks of 254 fragments (about 1.37 MB) |
+| `fec_ms` | p50/p95/max of the parity encoding time per protected frame (part of `send_ms`). Each block's parity is encoded after its data shards were handed to the socket, so it delays later blocks and the parity, never the first datagram or `send_us` |
+
+Viewer: `fec` in the `accepted` line is the host's percentage. Both window lines (shadow and
+live) end with:
+
+| Field | Meaning |
+|---|---|
+| `fec_rec` | delivered frames that completed only because lost data fragments were rebuilt from parity: losses repaired on arrival, with no key frame, request or wait. Counted on delivery: a rebuilt frame that is then gated behind an earlier loss counts in `gated` only. A data fragment merely reordered behind the parity that rebuilt it also counts here (the frame completed early) and then as `dup` |
+| `fec_unrec` | frames declared lost although at least one of their shards arrived and carried FEC: a block missed more shards than parity arrived. Part of `lost`; a frame of which nothing arrived counts in `lost` only |
+| `fec_shards` | data fragments rebuilt |
+| `parity` | parity datagrams received, also those of frames that needed none (they arrive after the frame was delivered and are only counted) |
+
+`dgrams` and `loss_pct` count parity datagrams like any other, so they are the raw datagram
+loss; `lost`, `frag_miss` and `kf_req` are what was left after FEC. Roadmap gate: with the same
+loss pattern as an M20 run, fewer `lost` and more `fec_rec`.
+
+### UDP video lane (RFI, M22)
+
+Host server option `enable-nvenc-rfi=Y` (off by default), a viewer that advertises lane version
+5, an NVIDIA GPU and HEVC: a lost frame is repaired by reference frame invalidation instead of a
+key frame where possible (docs/UDP-VIDEO.md, "RFI (M22)"). The fields below are added to the
+lines of the live sections above and to `LATENCY server` (`rfi`, `rfi_idr`, `rfi_kept`,
+`rfi_max`, see "Host").
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=192.168.1.5:61234 every=2 burst=8 timeout_ms=1000 fec=20 rfi=true viewer=192.168.1.9 installed=true
+UDPVIDEO host conn=5 live: a loss is repaired by reference frame invalidation where the encoder can (enable-nvenc-rfi=Y), else a forced key frame (enable-refresh-keyframe=Y)
+[NVENC] caps hevc: rfi=1 ir=1 ss_ir=1 multiref=1 h264: rfi=1 ir=1 ss_ir=1 multiref=1; hevc encoder rfi=on dpb=5 numRefL0=1
+UDPVIDEO host conn=5 lane=3f2a… mode=live win_s=5.0 frames=300 … vlost=1 kf_req=1 tail_kf=0 rfi_req=1 rp=1
+UDPVIDEO viewer peer=123456789 lane=3f2a… mode=live win_s=5.0 frames=300 lost=1 gated=2 … kf_req=1 lost_fixed=0 tcp_drop=0 rp=1 fix_ms=31.2/31.2/31.2 owd_var_ms=…
+LATENCY server display=0 fps=59.8 … key=0 keymax=0 … rfi=1 rfi_idr=0 rfi_kept=0 rfi_max=41220 qos_sig=udp
+```
+
+(The caps values above are an example; the first run on the RTX 5060 Ti logs the real ones.)
+
+Host: `rfi` in the `offer` line says the lane takes recovery points (option on, viewer lane v5,
+live mode). The window line gets:
+
+| Field | Meaning |
+|---|---|
+| `rfi_req` | loss reports (part of `kf_req`) turned into an RFI request to the capture loop: the lane still knew the first lost frame's pts (the last 128 frames since the display's last key frame). The rest asked for a key frame as before; the capture loop may still answer an RFI request with a key frame (`rfi_idr`) |
+| `rp` | frames sent to this viewer flagged `RECOVERY_POINT`: a recovery frame whose invalidation started at or before this viewer's first lost frame. Another viewer's recovery frame is not flagged here (it may reference a frame this viewer lost) |
+
+`kf_req` and `tail_kf` still count toward sustained loss (4 within 5 s end the lane), RFI or not.
+
+Viewer window line (`mode=live`) adds:
+
+| Field | Meaning |
+|---|---|
+| `rp` | broken displays that resumed at a `RECOVERY_POINT` frame instead of a key frame |
+| `fix_ms` | p50/p95/max from a display breaking (the loss reached the io_loop) to the frame that resumed it, key frame or recovery point: the recovery time the roadmap gate compares between RFI and IDR |
+
+Roadmap gate: with the same loss pattern, `rfi_idr` low, `fix_ms` and the viewer's `lost` no
+worse than with the option off, and `rfi_max` well below the `keymax` of the IDR run; the Dell
+(Iris Xe) decodes the stream after a recovery point without artefacts.
+
+### UDP video lane over the internet (M24)
+
+Host server option `enable-udp-video-wan=Y` (off by default) on top of `enable-udp-video`
+(`live` or `shadow`), a viewer of lane v6 (`enable-udp-video-wan` not `N` on it, a direct
+session whose host address it knows, no proxy or WebSocket on it), and a session on a direct
+internet path: TCP punch, direct IP access or KCP over a punched IPv4 UDP socket, never relay,
+WebRTC or KCP over IPv6 (docs/UDP-VIDEO.md,
+"Internet lane (M24)"). Every line of the sections above applies; the window lines are the
+same. The handshake adds:
+
+```
+UDPVIDEO host conn=5 offer lane=3f2a… mode=live addr=0.0.0.0:61234 every=2 burst=8 timeout_ms=1000 fec=20 rfi=false viewer=81.2.3.4 installed=true path=wan4 public_port=40312 mapped=true nat_ms=38 rendezvous=203.0.113.7:21116
+UDPVIDEO viewer peer=123456789 accepted lane=3f2a… mode=live host=198.51.100.9:40312 local=0.0.0.0:50511 every=2 timeout_ms=1000 fec=20 path=wan4 max_datagram=1024
+UDPVIDEO viewer peer=123456789 candidate lane=3f2a… port=61877 mapped=true nat_ms=41
+UDPVIDEO host conn=5 candidate lane=3f2a… viewer=81.2.3.4:61877 after_ms=1180
+UDPVIDEO host conn=5 HELLO from 81.2.3.4:61877 lane=3f2a… at_us=1250312 path=wan4 punches=3
+UDPVIDEO viewer peer=123456789 ready lane=3f2a… after_ms=96 hellos=5
+UDPVIDEO host conn=5 stop lane=3f2a…: internet lane: no HELLO from the viewer 81.2.3.4 in 6 s (offered=true candidate=81.2.3.4:61877 punches=240 refused=0): …
+UDPVIDEO host conn=5 not offered (viewer v5): not a LAN address; internet lane: the viewer's lane v5 has none (…)
+```
+
+Host `offer` line (an internet lane logs it on the lane's receive thread once the rendezvous
+server's DNS lookup, bounded at 1 s, and the NAT query are done, so it may come up to 2 s after
+the login):
+
+| Field | Meaning |
+|---|---|
+| `addr` | the lane socket: the wildcard of the viewer's family and its local port |
+| `path` | `wan4` (datagrams at most 1024 bytes) or `wan6` (1184); LAN lanes do not print it (1400) |
+| `public_port` | the port the offer names: the rendezvous server's answer (`mapped=true`), else the local port (no answer within 1 s, IPv6, no server, a viewer in 100.64.0.0/10) |
+| `mapped` | the rendezvous server answered the `TestNatRequest` from the lane socket |
+| `nat_ms` | time the query took (up to 1000 when there was no answer; the DNS lookup before it is not counted) |
+| `rendezvous` | the server address asked; `none` for IPv6, an empty server, a viewer in 100.64.0.0/10 (CGNAT or an overlay such as Tailscale: the port the server sees belongs to another path, so the local port is offered) or a DNS lookup with no answer within 1 s |
+
+Viewer `accepted` line: `path` (`lan`, `wan4`, `wan6`) and `max_datagram` (the offer's budget).
+`host` is the host IP this viewer reached the session on, with the offer's port.
+
+Viewer `candidate` line, from the lane thread before the first HELLO: `port` is the lane socket's
+public port (`mapped=true`: the rendezvous server's answer) or its local port (also toward a
+host in 100.64.0.0/10), sent to the host in `UdpVideoControl{KindCandidate}`; `nat_ms` the
+lookup and query time. Host `candidate` line: the address the host punches (the viewer's session
+IP and that port) and `after_ms` since the offer went out (after the host's own lookup and NAT
+query, so it is the candidate's round trip: the offer's trip, the viewer's lookup and query, the
+candidate's trip). The host's `active ... after_ms` and the 6 s handshake timeout count from the
+same moment. Host `HELLO` line: `path` and `punches`, the punch datagrams sent before the viewer's first
+HELLO came in (0: the viewer got through without the host's NAT needing them).
+
+Internet stop reasons (host): `no HELLO ... in 6 s` with `offered` (the offer went out),
+`candidate` (`none`: the viewer never reported one: it refused or its NAT query and HELLOs never
+started), `punches` and `refused` (datagrams from other addresses or failing the crypto). Many
+punches and no HELLO means a NAT on either side that maps or filters per destination (symmetric
+NAT, CGNAT) or a path that drops UDP; the session stays on TCP/KCP and the next offer comes after
+10 s, 30 s and 120 s (`RETRY_BACKOFF_WAN`), then never in that session. A failed handshake is
+retried like a fallback (unlike on the LAN), and so is the viewer's handshake failure or refusal;
+the three retries are one budget. The viewer's `handshake failed` line says the same from its
+side (`no HELLO_ACK in 3000 ms`); a viewer with a SOCKS proxy or WebSocket advertises v5 and
+refuses an internet offer (`internet lane: a proxy or WebSocket is set on the viewer`).
+
+Keepalive: on an internet lane the host's receive thread sends a PING when it has sent nothing
+for 500 ms (the viewer's PINGs every 200 ms are answered with PONGs, so this only fires when
+those are lost). It shows in no line; the viewer takes it as traffic (its silence timer).
+
+Roadmap gate (4a/5): on a phone hotspot and another network, the live window lines (`lost`,
+`fec_rec`, `fec_unrec`, `rtt_ms`, `owd_var_ms`) per 5 s, and at 1-3% loss no multi-frame stall
+(`fix_ms`, the viewer's `kf_req`).
+
+### Per-frame feedback (M23)
+
+Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows
+(`enable-video-feedback` not `N`): the viewer reports every video frame's arrival, size, decode
+and present time and, on a live UDP lane, its losses, at most every 50 ms over the session
+stream; the host turns that into a one-way queueing delay, a GCC trend, jitter and loss rates
+(docs/UDP-VIDEO.md, "Per-frame feedback (M23)"). Works on every transport (TCP, KCP, relay,
+WebRTC, UDP lane). Measurement only unless `video-feedback-qos=Y`.
+
+```
+VFB host conn=5 advertised version=1 qos=false fec_adaptive=false
+VFB viewer host_version=1 sending=true
+VFB host conn=5 secs=5.0 batches=100 rl=0 frames=300 unmatched=0 udp_frames=0 done=299 dropped=0 q_owd=0.4/2.1/9.8 trend_max=3.2 thr=6.0 usage=Normal over=0 under=0 jitter=0.6 viewer=6.1/8.0/14.2 decode=3.2/4.9/9.1 queue_max=1 dgram_loss=- frames_lost=0 lost_ranges=0 fec_rec=0 fec_unrec=0 switches=0 last=[age_ms=12 frames=3 q_owd=0.2/1.1 trend=0.4 thr=6.0 usage=Normal jitter=0.6 kbps=9850 viewer=7.2 decode=3.9 queue=0 udp=false loss=- frame_loss=- fec_rec=0 lost=0] qos=false
+VFB viewer secs=5.0 batches=100 frames=300 done=299 lost=0 dropped=0 bytes=6100
+UDPVIDEO host conn=5 fec 25% (datagram loss 10.2% over 1 s, adaptive)
+```
+
+The `advertised` and `host_version` lines come at each login (always on); the window lines every
+5 s with `enable-latency-log=Y` (each side's own option), only while batches come; the `fec` line
+on each adaptive change (`udp-video-fec-adaptive=Y`, always on).
+
+`VFB host`, per connection:
+
+| Field | Meaning |
+|---|---|
+| `secs` | window length |
+| `batches` / `rl` | batches taken / dropped by the host's rate limit (more than 40 per second) |
+| `frames` | arrivals reported; `unmatched`: of them, not found in the host's send log (a frame sent more than 512 frames ago, or before the log started) |
+| `udp_frames` | matched frames that went over the UDP lane |
+| `done` | decode/present entries; `dropped`: entries the viewer left out of full batches (64 frames, 64 done, 16 loss ranges) |
+| `q_owd` | p50/p95/max of the per-frame queueing one-way delay in ms: (viewer arrival - host send) minus its lowest value over the last 10 s (1 s buckets, dropped by age, so a static screen does not keep an old minimum). TCP and the UDP lane have different fixed delays, so a change of transport between two matched frames starts a new baseline (and the trendline skips that gradient); for the first 1 s of a baseline (session start, each switch) there is no `q_owd` sample. The host stamps a frame when it takes it off the connection's video channel (TCP: right before the write, so a blocked write counts; UDP: before the lane queue and pacer), the viewer when the frame enters its decoder path (TCP: after the parse; UDP: as the lane releases it). Covers host write, network, relay legs and the viewer's io_loop; a large frame's own transmission time counts too, which is why QoS uses each batch's smallest value |
+| `trend_max` | largest GCC modified trend (delay-gradient slope x min(frames, 60) x 4) in the window |
+| `thr` / `usage` | the overuse detector's adaptive threshold and state at the end of the window |
+| `over` / `under` | transitions into overuse / underuse in the window |
+| `jitter` | inter-arrival jitter in ms (RFC 3550 style, gain 1/16) |
+| `viewer` | p50/p95/max of arrival-to-UI-handover in ms of the frames shown (the viewer's own delay: queue, decode, conversion, callback) |
+| `decode` | p50/p95/max of arrival-to-decode-end in ms, shown or not |
+| `queue_max` | largest decoder queue length at an arrival |
+| `dgram_loss` | UDP lane datagram loss in percent over the window (`-`: no lane counters) |
+| `frames_lost` | UDP frames the viewer declared lost (after FEC); `lost_ranges`: loss ranges reported, repaired ones included |
+| `fec_rec` / `fec_unrec` | UDP frames FEC saved / could not save |
+| `switches` | transport changes (TCP to UDP lane or back) between matched frames, each a new `q_owd` baseline |
+| `last=[...]` | the last batch's `FeedbackInput`: `age_ms` since it, matched `frames`, `q_owd` batch min/max, `trend`, `thr`, `usage`, `jitter`, `kbps` (bytes of its frames over their arrival span), `viewer` / `decode` (largest), `queue`, `udp`, `loss` / `frame_loss` (UDP, percent over 1 s), `fec_rec`, `lost` |
+| `fec_pct` | the adaptive FEC percentage, once it took over (`udp-video-fec-adaptive=Y`) |
+| `qos` | `video-feedback-qos` is on: the feedback steers QoS and the lane fallback |
+
+`VFB viewer`: `batches` sent, `frames` / `done` / `lost` entries in them, `dropped` entries left
+out, `bytes` of the batches (protobuf size, before encryption).
+
+With `video-feedback-qos=Y` the `qos_sig` of the `LATENCY server` line is unchanged; the delay
+sample video_qos gets becomes `max(sample, q_owd)` (largest batch minimum since the last
+TestDelay) plus 150 ms if the UDP datagram loss over 1 s went above 10%, unless the live lane's
+sample already carries its own 150 ms frame-loss penalty (one penalty per sample). A live lane
+that loses more than 10% of its frames after FEC over 3 s (at least 30 frames) goes back to TCP
+with the `UDPVIDEO host ... stop` reason `feedback: N of M frames lost after FEC in 3 s (P% >
+10%; Q host queue drops left out), datagram loss D%`. Frames the host's own tap dropped on a full
+lane queue (`qdrop`) leave a gap the viewer counts as lost; the Q of them in the window are taken
+off N, so the rule blames only the network.
+
+The UDP lane's host window line gets `fec_pct=P` once the adaptive FEC changed the lane's
+percentage.
+
+Roadmap gate (M23): with the hbbr-to-viewer leg throttled, `q_owd` (and `usage=Overuse`) shows
+the congestion while the host's TCP meter `rtt` (`LATENCY tcp`) does not.
 
 ### Viewer (Rust)
 

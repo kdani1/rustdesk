@@ -375,6 +375,82 @@ pub const OPTION_ENABLE_PRIMARY_VIEWER_RULE: &str = "enable-primary-viewer-rule"
 // to KCP sessions made after it is set; together with allow-kcp-congestion-control or alone. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_KCP_SNDWND: &str = "kcp-sndwnd";
+// UDP video lane (roadmap M19 shadow probe, M20 live, docs/UDP-VIDEO.md). The same key on both
+// sides:
+// - Windows host, server option (Config), off by default. Offered to a fork viewer that
+//   advertised a lane, after a remote-control login over direct, encrypted TCP with both
+//   addresses on the LAN:
+//   "live": live (M20): video frames go over UDP, everything else stays on TCP; falls back to
+//        TCP video in the same session on loss, socket errors or silence. Needs a viewer of
+//        lane v3; an older fork viewer gets no offer.
+//   "shadow" or "Y" (M19's value, still shadow): video stays on TCP; a copy of every Nth frame
+//        also goes over UDP to be measured.
+//   Read at each login; `rustdesk --option enable-udp-video N` turns it off.
+// - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising the lane
+//   (and refuses an offer), so a reconnect gives a plain TCP session without touching the host.
+pub const OPTION_ENABLE_UDP_VIDEO: &str = "enable-udp-video";
+// Windows host, server option: shadow mode copies one frame in this many to UDP (1..=60). Empty
+// or invalid: 2. Read at each offer.
+pub const OPTION_UDP_VIDEO_SHADOW_EVERY: &str = "udp-video-shadow-every";
+// Windows host, server option, live mode: datagrams the sender puts on the wire back to back
+// before it waits for the pacer (1..=64, "0" = unpaced, every frame at once). Empty or invalid:
+// 8 (about 11 KB). Read at each offer.
+pub const OPTION_UDP_VIDEO_BURST: &str = "udp-video-burst";
+// Windows host, server option, live mode: no authenticated datagram from the other end for this
+// many milliseconds ends the lane and video goes back to TCP (200..=10000). Empty or invalid:
+// 1000. Sent to the viewer in the offer, which uses it the same way. Read at each offer.
+pub const OPTION_UDP_VIDEO_TIMEOUT_MS: &str = "udp-video-timeout-ms";
+// Windows host, server option (roadmap M21): Reed-Solomon FEC parity of the UDP video lane, in
+// percent of each block's data shards (Sunshine style: at least 2 parity shards per block, at
+// most 4 blocks of at most 200 data shards per frame). "0" sends no parity; empty or invalid
+// (above 100): 20. Applies to live and shadow lanes, only for a viewer of lane v4 (older fork
+// viewers get lanes without parity). Read at each offer. See docs/UDP-VIDEO.md, "FEC".
+pub const OPTION_UDP_VIDEO_FEC_PERCENT: &str = "udp-video-fec-percent";
+// UDP video lane over the internet (roadmap M24, docs/UDP-VIDEO.md "Internet lane"). The same
+// key on both sides:
+// - Windows host, server option (Config), off by default: "Y" also offers the lane (in the mode
+//   enable-udp-video asks for) when the session is not on the LAN but on a direct internet path
+//   (TCP punch, direct IP access, KCP over a punched UDP socket; never relay or WebRTC) and no
+//   proxy is set. The lane punches its own UDP socket to the viewer (public ports learned from
+//   the rendezvous server), sends datagrams of at most 1024 (IPv4) / 1184 (IPv6) bytes and
+//   marks no DSCP. Any failure leaves the video on the session stream. Read at each offer.
+// - Windows viewer, local option (LocalConfig), on by default: "N" stops advertising internet
+//   lanes (lane v5 instead of v6), so a reconnect keeps a WAN session's video on TCP/KCP. LAN
+//   lanes are unaffected (enable-udp-video governs them).
+pub const OPTION_ENABLE_UDP_VIDEO_WAN: &str = "enable-udp-video-wan";
+// Per-frame video feedback (roadmap M23, docs/UDP-VIDEO.md "Per-frame feedback"). The same key
+// on both sides:
+// - Windows host, server option (Config), off by default: "Y" advertises
+//   Features.video_feedback to remote-control viewers, records each video frame's send time
+//   and size, and takes the viewer's feedback batches: one-way queueing delay (`q_owd`), GCC
+//   trendline, jitter, the viewer's own delay, UDP loss. Measurement only unless
+//   video-feedback-qos is "Y". Read at each login.
+// - Windows viewer, local option (LocalConfig), on by default: "N" sends no feedback even to a
+//   host that asks for it. Read at each login.
+pub const OPTION_ENABLE_VIDEO_FEEDBACK: &str = "enable-video-feedback";
+// Windows host, server option, off by default (M23): "Y" lets the viewer's feedback steer the
+// host: the queueing delay and UDP datagram loss it reports go into video_qos's delay sample,
+// and a live UDP lane whose frames keep getting lost after FEC goes back to TCP. Needs
+// enable-video-feedback=Y. Read every second.
+pub const OPTION_VIDEO_FEEDBACK_QOS: &str = "video-feedback-qos";
+// Windows host, server option, off by default (M23): "Y" adapts the FEC parity of a live UDP
+// lane to the datagram loss the viewer's feedback reports: clamp(10, 50, 2 x loss% + 5),
+// raised at once, lowered after 2 s. Needs enable-video-feedback=Y and a lane with parity
+// (viewer lane v4, udp-video-fec-percent not "0"). Read every second.
+pub const OPTION_UDP_VIDEO_FEC_ADAPTIVE: &str = "udp-video-fec-adaptive";
+// Windows host, server option, off by default (roadmap M22, docs/UDP-VIDEO.md "RFI"): "Y" repairs
+// a live UDP lane's frame loss by reference frame invalidation instead of a key frame. The
+// viewer's loss report then invalidates the lost frames on the encoder and the next frame,
+// flagged RECOVERY_POINT on that lane only, references only frames the viewer has; when that is
+// not possible (more than 4 frames since the loss, H.264, no NVENC support) a key frame repairs
+// it as before. Needs an NVIDIA GPU with the HEVC codec and a viewer of lane v5: while such a
+// lane is offered, HEVC on NVIDIA is encoded by the NV SDK driver of hwcodec (DPB 5, one
+// reference, forced IDRs and encode_last) instead of FFmpeg nvenc (an NV SDK driver encoder that
+// hwcodec picked itself gets the same settings), switched at the next encoder start or by a
+// capture restart; a failing NV SDK driver with RFI goes back to the encoder as before for the
+// process. Without such a lane every encoder opens as upstream. Read at each offer and when an
+// encoder is created.
+pub const OPTION_ENABLE_NVENC_RFI: &str = "enable-nvenc-rfi";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -450,6 +526,9 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
     OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
+    OPTION_ENABLE_UDP_VIDEO,
+    OPTION_ENABLE_UDP_VIDEO_WAN,
+    OPTION_ENABLE_VIDEO_FEEDBACK,
     OPTION_DISABLE_GROUP_PANEL,
     OPTION_DISABLE_DISCOVERY_PANEL,
     OPTION_PRE_ELEVATE_SERVICE,

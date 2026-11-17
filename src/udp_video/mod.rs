@@ -1,20 +1,46 @@
-//! UDP video lane, M19 first half: the parts that need no live session. Nothing calls this yet;
-//! the offer/HELLO negotiation, the sender and receive threads and the hooks into
-//! `server/connection.rs` and `client/io_loop.rs` come with the M19 second half (shadow mode)
-//! and M20. See docs/UDP-VIDEO.md.
+//! UDP video lane. M19 first half: the parts that need no live session; M19 second half: the
+//! shadow probe (negotiation over the session stream, sockets and threads on both ends, the
+//! host's copy of every Nth frame, the viewer's pairing with the TCP copy). M20: live mode,
+//! video frames over UDP with paced bursts, a send window, key frames on loss and a fallback
+//! to TCP video in the same session. M21: Reed-Solomon FEC per frame. M22: loss repaired by
+//! reference frame invalidation. M24: the same lane over the internet on direct sessions (own
+//! punched socket per end, public ports from the rendezvous server, WAN datagram sizes, no
+//! DSCP). See docs/UDP-VIDEO.md.
 //!
-//! - `packet`: wire format (frame id, fragment index/count, FEC placeholders, epoch, flags).
+//! - `packet`: wire format (frame id, fragment index/count, FEC block fields and parity
+//!   datagrams, epoch, flags).
 //! - `crypto`: per-direction keys derived from the lane secret, seq nonces, replay window.
 //! - `fragment`: fragmentation to MTU-safe sizes and reassembly with timeouts, a loss gate and
-//!   loss statistics.
-//! - `pacing`: token-bucket pacing and the target rate.
+//!   loss statistics; parity shards rebuild lost fragments at once (M21).
+//! - `fec`: Reed-Solomon erasure code over GF(256) (in-tree, SIMD on x86-64) and the frame's
+//!   block layout (M21).
+//! - `pacing`: token-bucket pacing, the target rate and a high-resolution waiter (live mode).
 //! - `lane`: sender and receiver ends without sockets.
+//! - `net`: LAN and internet address gates, socket setup, the NAT query, lane clock.
+//! - `host`: offer gate, `UdpVideoHost` (socket, receive and sender threads), `VideoTap`.
+//! - `viewer`: offer check, `UdpVideoClient` (socket, receive thread), `ViewerLane`.
+//! - `shadow`: UDP/TCP pairing and window statistics.
+//! - `rfi`: reference frame invalidation requests and recovery frames between the connections
+//!   and the capture loops (M22).
 //!
-//! Platform-neutral on purpose: other platforms compile it and never use it.
-#![allow(dead_code)] // Staged: wired in the M19 second half.
+//! Platform-neutral code; only socket options are Windows-specific. Hosts offer and viewers
+//! advertise only on Windows, so other platforms compile it and never use it.
 
+// Parts of these are staged for M21-M24 (WAN path classes, FEC fields, accessors); the shadow
+// probe and the live lane use the rest.
+#[allow(dead_code)]
 pub mod crypto;
+pub mod fec;
+#[allow(dead_code)]
 pub mod fragment;
+pub mod host;
+#[allow(dead_code)]
 pub mod lane;
+pub mod net;
+#[allow(dead_code)]
 pub mod pacing;
+#[allow(dead_code)]
 pub mod packet;
+pub mod rfi;
+pub mod shadow;
+pub mod viewer;
