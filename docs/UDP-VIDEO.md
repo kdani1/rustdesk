@@ -792,16 +792,22 @@ lane, unchanged) and all of these hold:
 - host option `enable-udp-video-wan=Y` (off by default) and `enable-udp-video` = `live` or
   `shadow`, as for a LAN lane;
 - the viewer advertised lane **v6**: a Windows viewer with `enable-udp-video-wan` not `N` whose
-  session is direct (`connect` won with TCP punch, direct IP access, or KCP over a punched UDP
-  socket, IPv4 or IPv6) and which knows the host's address there, off the LAN
-  (`LoginConfigHandler::udp_video_host`, set by `Client::connect`; None on relay and WebRTC). A
-  viewer that cannot address the host never advertises v6, so the host never offers a lane it
-  could not use;
-- the host's transport (`TransportInfo`) is direct: intranet, TCP punch, direct, KCP-UDP or
-  KCP-IPv6 (never relay or WebRTC: the address the connection keys on would not be the viewer's);
+  session is direct (`connect` won with TCP punch, direct IP access, or KCP over a punched IPv4
+  UDP socket) and which knows the host's address there, off the LAN
+  (`LoginConfigHandler::udp_video_host`, set by `Client::connect`; None on relay, WebRTC and KCP
+  over IPv6), and with no SOCKS proxy or WebSocket set on the viewer (`viewer::wan_allowed`: the
+  lane's UDP would bypass the proxy and show the viewer's own address, and the host sees the
+  proxy's address as the peer). A viewer that cannot address the host never advertises v6, so
+  the host never offers a lane it could not use;
+- the host's transport (`TransportInfo`) is direct: intranet, TCP punch, direct or KCP-UDP
+  (never relay or WebRTC: the address the connection keys on would not be the viewer's). Not
+  KCP-IPv6 either: `udp_nat_listen` keys that connection on the viewer's IPv4 address as hbbs saw
+  it, not on the IPv6 peer the KCP stream runs on, so the two ends would never meet
+  (`connection::udp_video_gate`);
 - the session stream is encrypted (the lane secret travels in it);
 - the viewer's address (the session peer, normalized) is a unicast address off the LAN
-  (`net::wan_ip`: not loopback, unspecified, link-local, multicast; CGNAT counts as internet);
+  (`net::wan_ip`: not loopback, unspecified, link-local, multicast; CGNAT and overlay addresses
+  in 100.64.0.0/10 count as internet, but skip the NAT query, see the handshake);
 - no SOCKS proxy or WebSocket is set on the host (no UDP to the rendezvous server).
 
 The viewer takes an internet offer only with `enable-udp-video-wan` not `N`, on a round whose
@@ -813,12 +819,15 @@ session is direct, encrypted, not WebRTC, with a known host address off the LAN
 1. **Host:** binds the wildcard of the viewer's family (port 0), and on the lane's receive
    thread asks the rendezvous server (`Config::get_rendezvous_server()`, UDP port 21116) for the
    socket's public port with the `TestNatRequest` the session's own UDP punch uses (every
-   150 ms, up to 1 s; only the server's reply counts). The offer (`wan=true`, no `ip`, `port` =
-   that public port, or the local port without an answer or on IPv6, `max_datagram` 1024 or
-   1184) then goes to the connection's message channel. The connection never waits for the
-   query: it runs the session.
+   150 ms, up to 1 s; only the server's reply counts). The server's DNS lookup is bounded at 1 s
+   (`net::DNS_FOR`, on a helper thread). No query when the viewer's address is in
+   100.64.0.0/10 (Tailscale and other overlays, an in-carrier CGNAT path): the port the
+   rendezvous server sees belongs to another path, the local port is the one this path reaches.
+   The offer (`wan=true`, no `ip`, `port` = that public port, or the local port without an
+   answer, on IPv6 or toward 100.64/10, `max_datagram` 1024 or 1184) then goes to the
+   connection's message channel. The connection never waits for the query: it runs the session.
 2. **Viewer:** binds the wildcard of the host's family, asks its own rendezvous server the same
-   way on the lane thread, and reports its public port (or local port) as
+   way on the lane thread (same DNS bound, no query toward a host in 100.64/10), and reports its public port (or local port) as
    `UdpVideoControl{KindCandidate, port}` over the session stream. Then it `connect()`s to the
    host IP it reached the session on, at the offer's port, and sends HELLO every 20 ms for up to
    3 s (LAN: 1 s).
@@ -827,8 +836,9 @@ session is direct, encrypted, not WebRTC, with a known host address off the LAN
    through). It opens the host side's NAT mapping and filter toward the viewer. The first HELLO
    from the viewer's IP that opens with the lane keys ends the punch; the host `connect()`s to
    its source (which may differ from the candidate) and answers HELLO_ACK, as on the LAN.
-4. READY, ACTIVE, video, ACKs and the rest as on the LAN. The host's handshake timeout is 6 s
-   (the two queries, the candidate's trip and the HELLOs).
+4. READY, ACTIVE, video, ACKs and the rest as on the LAN. The host's handshake timeout is 6 s,
+   counted from the moment the offer went out (after the host's lookup and query): the viewer's
+   lookup and query, the candidate's trip and the HELLOs.
 
 Both ends send first, so a port-preserving or endpoint-independent NAT on either side, and an
 address-dependent filter on either side, are crossed. A NAT that maps per destination (symmetric
@@ -852,7 +862,10 @@ offered, which works only behind a port-preserving NAT.
   ends), send errors, sustained loss or the viewer's request end the lane, the video goes back
   to the session stream with a key frame per display and the in-band STOP. The next offers come
   after **10 s, 30 s and 120 s** (`RETRY_BACKOFF_WAN`; LAN 30 s and 120 s), each with a fresh
-  socket, NAT query, secret and lane id, then never again in that session.
+  socket, NAT query, secret and lane id, then never again in that session. Unlike a LAN lane, an
+  internet lane is also retried when its handshake failed (host timeout, the viewer's handshake
+  failure or refusal: `StopInfo::wan_handshake`): a lost punch or NAT reply is often transient.
+  The retries share the one budget of three.
 - Encryption, replay window, FEC, RFI and the per-frame feedback are the LAN lane's.
 
 ### Compatibility
@@ -877,8 +890,12 @@ offered, which works only behind a port-preserving NAT.
   channel outside the `Stream` enum in hbb_common; relay sessions (most of them caused by a
   symmetric NAT, where a re-punch fails by construction) and WebRTC sessions keep their video on
   the session stream. "Relay via TURN only if configured" therefore means: never, in this build.
-- **Several candidates** (LAN addresses next to the public one, both families): one candidate
-  per side; the session's own family decides.
+- **Several candidates** (LAN addresses next to the public one, both families, local and mapped
+  port): one candidate per side; the session's own family decides, and a 100.64/10 peer gets the
+  local port only.
+- **KCP over IPv6:** the host's connection would need the KCP stream's IPv6 peer (for example in
+  `TransportInfo`) as the gate's peer; until then such a session gets no internet lane (the
+  viewer advertises v5, the host's gate refuses).
 - **A host-key-derived lane key** (HKDF over the session key through a new `FramedStream` API):
   the lane keeps its fresh secret sent over the encrypted session stream (see Encryption).
 - **Moving the session itself** between paths (relay to direct): out of scope.

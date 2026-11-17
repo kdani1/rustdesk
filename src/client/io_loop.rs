@@ -316,7 +316,8 @@ impl<T: InvokeUiSession> Remote<T> {
                 let udp_wan = (conn_type == ConnType::DEFAULT_CONN
                     && direct
                     && is_secured
-                    && !peer.is_webrtc())
+                    && !peer.is_webrtc()
+                    && crate::udp_video::viewer::wan_allowed())
                 .then(|| self.handler.lc.read().unwrap().udp_video_host)
                 .flatten()
                 .map(|host| crate::udp_video::viewer::WanRound {

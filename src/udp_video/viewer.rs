@@ -106,7 +106,7 @@ pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 pub fn advertised_version(conn_type: ConnType, host_ip: Option<IpAddr>) -> u32 {
     if !(cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled()) {
         0
-    } else if wan_enabled() && host_ip.map_or(false, |ip| net::wan_ip(ip).is_ok()) {
+    } else if wan_allowed() && host_ip.map_or(false, |ip| net::wan_ip(ip).is_ok()) {
         VIEWER_WAN_VERSION
     } else {
         VIEWER_RFI_VERSION
@@ -122,6 +122,16 @@ pub fn enabled() -> bool {
 /// lanes (and refuses an offer of one); the host decides.
 pub fn wan_enabled() -> bool {
     LocalConfig::get_option(keys::OPTION_ENABLE_UDP_VIDEO_WAN) != "N"
+}
+
+/// An internet lane may be advertised and run: `enable-udp-video-wan` not N and no SOCKS proxy or
+/// WebSocket set on this viewer. The lane's UDP (NAT query, HELLOs) would bypass the proxy and
+/// show this machine's own address, and the host sees the proxy's address as the session peer,
+/// so the handshake could never succeed anyway (the host's gate has the same rule).
+pub fn wan_allowed() -> bool {
+    wan_enabled()
+        && hbb_common::config::Config::get_socks().is_none()
+        && !hbb_common::config::use_ws()
 }
 
 /// What an io_loop round knows for an internet lane (M24).
@@ -955,6 +965,11 @@ impl ViewerLane {
         let checked = if offer.wan {
             if !wan_enabled() {
                 return refuse("enable-udp-video-wan is N".to_owned());
+            }
+            if !wan_allowed() {
+                return refuse(
+                    "internet lane: a proxy or WebSocket is set on the viewer".to_owned(),
+                );
             }
             let Some(wan) = &round.wan else {
                 return refuse(

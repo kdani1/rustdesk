@@ -541,8 +541,9 @@ worse than with the option off, and `rfi_max` well below the `keymax` of the IDR
 
 Host server option `enable-udp-video-wan=Y` (off by default) on top of `enable-udp-video`
 (`live` or `shadow`), a viewer of lane v6 (`enable-udp-video-wan` not `N` on it, a direct
-session whose host address it knows), and a session on a direct internet path: TCP punch,
-direct IP access or KCP over a punched UDP socket, never relay or WebRTC (docs/UDP-VIDEO.md,
+session whose host address it knows, no proxy or WebSocket on it), and a session on a direct
+internet path: TCP punch, direct IP access or KCP over a punched IPv4 UDP socket, never relay,
+WebRTC or KCP over IPv6 (docs/UDP-VIDEO.md,
 "Internet lane (M24)"). Every line of the sections above applies; the window lines are the
 same. The handshake adds:
 
@@ -557,26 +558,30 @@ UDPVIDEO host conn=5 stop lane=3f2a…: internet lane: no HELLO from the viewer 
 UDPVIDEO host conn=5 not offered (viewer v5): not a LAN address; internet lane: the viewer's lane v5 has none (…)
 ```
 
-Host `offer` line (an internet lane logs it on the lane's receive thread once the NAT query is
-done, so it may come up to 1 s after the login):
+Host `offer` line (an internet lane logs it on the lane's receive thread once the rendezvous
+server's DNS lookup, bounded at 1 s, and the NAT query are done, so it may come up to 2 s after
+the login):
 
 | Field | Meaning |
 |---|---|
 | `addr` | the lane socket: the wildcard of the viewer's family and its local port |
 | `path` | `wan4` (datagrams at most 1024 bytes) or `wan6` (1184); LAN lanes do not print it (1400) |
-| `public_port` | the port the offer names: the rendezvous server's answer (`mapped=true`), else the local port (no answer within 1 s, IPv6, no server) |
+| `public_port` | the port the offer names: the rendezvous server's answer (`mapped=true`), else the local port (no answer within 1 s, IPv6, no server, a viewer in 100.64.0.0/10) |
 | `mapped` | the rendezvous server answered the `TestNatRequest` from the lane socket |
-| `nat_ms` | time the query took (up to 1000 when there was no answer) |
-| `rendezvous` | the server address asked, `none` for IPv6 or an empty server |
+| `nat_ms` | time the query took (up to 1000 when there was no answer; the DNS lookup before it is not counted) |
+| `rendezvous` | the server address asked; `none` for IPv6, an empty server, a viewer in 100.64.0.0/10 (CGNAT or an overlay such as Tailscale: the port the server sees belongs to another path, so the local port is offered) or a DNS lookup with no answer within 1 s |
 
 Viewer `accepted` line: `path` (`lan`, `wan4`, `wan6`) and `max_datagram` (the offer's budget).
 `host` is the host IP this viewer reached the session on, with the offer's port.
 
 Viewer `candidate` line, from the lane thread before the first HELLO: `port` is the lane socket's
-public port (`mapped=true`: the rendezvous server's answer) or its local port, sent to the host
-in `UdpVideoControl{KindCandidate}`; `nat_ms` the query time. Host `candidate` line: the address
-the host punches (the viewer's session IP and that port) and `after_ms` since the offer was
-made. Host `HELLO` line: `path` and `punches`, the punch datagrams sent before the viewer's first
+public port (`mapped=true`: the rendezvous server's answer) or its local port (also toward a
+host in 100.64.0.0/10), sent to the host in `UdpVideoControl{KindCandidate}`; `nat_ms` the
+lookup and query time. Host `candidate` line: the address the host punches (the viewer's session
+IP and that port) and `after_ms` since the offer went out (after the host's own lookup and NAT
+query, so it is the candidate's round trip: the offer's trip, the viewer's lookup and query, the
+candidate's trip). The host's `active ... after_ms` and the 6 s handshake timeout count from the
+same moment. Host `HELLO` line: `path` and `punches`, the punch datagrams sent before the viewer's first
 HELLO came in (0: the viewer got through without the host's NAT needing them).
 
 Internet stop reasons (host): `no HELLO ... in 6 s` with `offered` (the offer went out),
@@ -584,8 +589,11 @@ Internet stop reasons (host): `no HELLO ... in 6 s` with `offered` (the offer we
 started), `punches` and `refused` (datagrams from other addresses or failing the crypto). Many
 punches and no HELLO means a NAT on either side that maps or filters per destination (symmetric
 NAT, CGNAT) or a path that drops UDP; the session stays on TCP/KCP and the next offer comes after
-10 s, 30 s and 120 s (`RETRY_BACKOFF_WAN`), then never in that session. The viewer's
-`handshake failed` line says the same from its side (`no HELLO_ACK in 3000 ms`).
+10 s, 30 s and 120 s (`RETRY_BACKOFF_WAN`), then never in that session. A failed handshake is
+retried like a fallback (unlike on the LAN), and so is the viewer's handshake failure or refusal;
+the three retries are one budget. The viewer's `handshake failed` line says the same from its
+side (`no HELLO_ACK in 3000 ms`); a viewer with a SOCKS proxy or WebSocket advertises v5 and
+refuses an internet offer (`internet lane: a proxy or WebSocket is set on the viewer`).
 
 Keepalive: on an internet lane the host's receive thread sends a PING when it has sent nothing
 for 500 ms (the viewer's PINGs every 200 ms are answered with PONGs, so this only fires when

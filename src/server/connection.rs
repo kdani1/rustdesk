@@ -676,25 +676,7 @@ impl Connection {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tx_cloned = tx.clone();
-        let udp_gate = crate::udp_video::host::Gate {
-            direct_tcp: matches!(
-                transport,
-                super::TransportKind::Intranet
-                    | super::TransportKind::TcpPunch
-                    | super::TransportKind::Direct
-            ),
-            direct_any: matches!(
-                transport,
-                super::TransportKind::Intranet
-                    | super::TransportKind::TcpPunch
-                    | super::TransportKind::Direct
-                    | super::TransportKind::KcpUdp
-                    | super::TransportKind::KcpIpv6
-            ),
-            secured: stream.is_secured(),
-            local: stream.local_addr(),
-            peer: addr,
-        };
+        let udp_gate = udp_video_gate(transport, stream.is_secured(), stream.local_addr(), addr);
         let mut conn = Self {
             inner: ConnInner {
                 id,
@@ -6359,7 +6341,9 @@ impl Connection {
                 self.refresh_video_display(Some(*display as usize));
             }
         }
-        if info.was_live {
+        // A live lane that fell back, or an internet lane whose handshake failed (a lost punch
+        // or NAT reply is often transient): the next offer comes after the backoff.
+        if info.was_live || info.wan_handshake {
             self.udp_backoff = backoff;
             if let Some(after) = backoff.get(self.udp_retries) {
                 self.udp_retries += 1;
@@ -8034,10 +8018,50 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+/// The UDP video lane's offer gate for a session on `transport` (docs/UDP-VIDEO.md). KCP over
+/// IPv6 gets no internet lane: `udp_nat_listen` keys that connection on the viewer's IPv4
+/// address as the rendezvous server saw it, not on the IPv6 peer the KCP stream runs on, so the
+/// host would punch an address the viewer's HELLOs never come from.
+fn udp_video_gate(
+    transport: super::TransportKind,
+    secured: bool,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> crate::udp_video::host::Gate {
+    use super::TransportKind as T;
+    crate::udp_video::host::Gate {
+        direct_tcp: matches!(transport, T::Intranet | T::TcpPunch | T::Direct),
+        direct_any: matches!(transport, T::Intranet | T::TcpPunch | T::Direct | T::KcpUdp),
+        secured,
+        local,
+        peer,
+    }
+}
+
 #[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[test]
+    fn latency_udp_gate_kcp_ipv6_gets_no_internet_lane() {
+        use crate::udp_video::host as udp;
+        let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        // The viewer's IPv4 as hbbs saw it: the address a KCP-IPv6 connection keys on.
+        let v4: SocketAddr = "81.2.3.4:50000".parse().unwrap();
+        let g = udp_video_gate(super::super::TransportKind::KcpIpv6, true, local, v4);
+        assert!(!g.direct_tcp && !g.direct_any);
+        assert!(udp::wan_gate(&g).is_err());
+        let g = udp_video_gate(super::super::TransportKind::KcpUdp, true, local, v4);
+        assert!(!g.direct_tcp && g.direct_any);
+        assert_eq!(udp::wan_gate(&g), Ok(v4.ip()));
+        for t in [
+            super::super::TransportKind::Relay,
+            super::super::TransportKind::WebRtc,
+        ] {
+            assert!(udp::wan_gate(&udp_video_gate(t, true, local, v4)).is_err());
+        }
+    }
 
     // The registry is process-global and the harness runs tests in parallel threads, so every
     // test that admits connections holds this first; a poisoned lock is still a lock.

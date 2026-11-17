@@ -465,6 +465,9 @@ struct Shared {
     punches: AtomicU64,
     /// Internet lane: the offer is out (after the NAT query).
     offered: AtomicBool,
+    /// Internet lane: when the offer went to the connection (after the DNS lookup and NAT
+    /// query); the handshake timeout and `after_ms` count from it.
+    offer_sent: Mutex<Option<Instant>>,
 }
 
 /// `Shared::fec_now` before any adaptive change.
@@ -495,6 +498,7 @@ impl Shared {
             punch_to: Mutex::new(None),
             punches: AtomicU64::new(0),
             offered: AtomicBool::new(false),
+            offer_sent: Mutex::new(None),
         }
     }
 
@@ -728,6 +732,9 @@ pub struct StopInfo {
     pub in_band: bool,
     /// The lane was live and active (worth a retry later).
     pub was_live: bool,
+    /// An internet lane that ended in its handshake (timeout, the viewer's handshake failure
+    /// or refusal): also worth a retry, a lost punch or NAT reply is often transient.
+    pub wan_handshake: bool,
 }
 
 /// The connection's hook in front of every TCP video send (whole or split session).
@@ -1247,9 +1254,20 @@ impl UdpVideoHost {
             "UDPVIDEO host conn={} candidate lane={:016x} viewer={to} after_ms={}",
             self.conn_id,
             self.lane_id,
-            self.offered_at.elapsed().as_millis()
+            self.offer_out_at().elapsed().as_millis()
         );
         Ok(())
+    }
+
+    /// When the offer went out: at the start for a LAN lane, after the NAT query for an
+    /// internet lane (the start until then). The handshake timeout and `after_ms` count from it.
+    fn offer_out_at(&self) -> Instant {
+        self.shared
+            .offer_sent
+            .lock()
+            .ok()
+            .and_then(|at| *at)
+            .unwrap_or(self.offered_at)
     }
 
     fn handshake_timeout(&self) -> Duration {
@@ -1320,7 +1338,7 @@ impl UdpVideoHost {
             self.params.mode.label(),
             peer,
             self.params.every,
-            self.offered_at.elapsed().as_millis()
+            self.offer_out_at().elapsed().as_millis()
         );
         Ok(())
     }
@@ -1329,7 +1347,7 @@ impl UdpVideoHost {
     /// viewer silent for `timeout`, the socket failing, sustained tail losses).
     pub fn check(&mut self) -> Result<(), String> {
         match self.state {
-            State::Offered if self.offered_at.elapsed() >= self.handshake_timeout() => {}
+            State::Offered if self.offer_out_at().elapsed() >= self.handshake_timeout() => {}
             State::Active if self.params.mode == Mode::Live => {
                 if let Some(e) = self.shared.fatal.lock().ok().and_then(|f| f.clone()) {
                     return Err(e);
@@ -1485,12 +1503,14 @@ impl UdpVideoHost {
             return StopInfo::default();
         }
         let active = self.state == State::Active;
+        let wan_handshake = self.state == State::Offered && self.is_wan();
         self.state = State::Stopped;
-        let info = if active {
+        let mut info = if active {
             self.tap.stop(why)
         } else {
             StopInfo::default()
         };
+        info.wan_handshake = wan_handshake;
         if self.live_counted {
             self.live_counted = false;
             LIVE_LANES.fetch_sub(1, Ordering::Relaxed);
@@ -1591,6 +1611,9 @@ fn wan_offer(
         ),
     );
     shared.offered.store(true, Ordering::Relaxed);
+    if let Ok(mut at) = shared.offer_sent.lock() {
+        *at = Some(Instant::now());
+    }
     (w.deliver)(offer);
     true
 }
@@ -2440,6 +2463,10 @@ pub(crate) mod latency_tests {
         assert!(offer.ip.is_empty());
         assert_eq!(offer.max_datagram as usize, PathClass::WanV4.max_datagram());
         assert_ne!(offer.port, 0);
+        // The handshake clock and after_ms count from the offer's delivery, not the lane start.
+        let sent = host.shared.offer_sent.lock().unwrap().expect("offer time");
+        assert!(sent >= host.offered_at);
+        assert_eq!(host.offer_out_at(), sent);
         let secret: [u8; SECRET_LEN] = offer.secret.as_ref().try_into().unwrap();
         // The viewer's lane socket; its port is the candidate.
         let viewer = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -2488,7 +2515,9 @@ pub(crate) mod latency_tests {
             }
         }
         assert!(ping, "no keepalive");
-        host.shutdown("test");
+        let info = host.shutdown("test");
+        // Active (no video went through, so not announced): no handshake failure.
+        assert!(!info.wan_handshake);
         let lan = Params::from_options(Mode::Shadow, "", "", "", "");
         let (mut lan_host, lan_offer) =
             UdpVideoHost::start(4, Arc::new(VideoTap::default()), lo, lo, lan, None).unwrap();
@@ -2496,6 +2525,29 @@ pub(crate) mod latency_tests {
         assert!(!lan_host.is_wan());
         assert_eq!(lan_host.retry_backoff(), &RETRY_BACKOFF);
         assert!(lan_host.on_candidate(lan_offer.lane_id, 5).is_err());
+        // A LAN handshake failure is final; an internet one is retried (StopInfo::wan_handshake).
+        assert!(!lan_host.shutdown("no HELLO").wan_handshake);
+    }
+
+    #[test]
+    fn latency_wan_handshake_failure_is_retried() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let params = Params::from_options(Mode::Shadow, "", "", "", "");
+        let mut host = UdpVideoHost::start_wan(
+            5,
+            Arc::new(VideoTap::default()),
+            lo,
+            params,
+            None,
+            String::new(),
+            Box::new(|_| {}),
+        )
+        .unwrap();
+        let info = host.shutdown("internet lane: no HELLO");
+        assert!(info.wan_handshake && !info.was_live);
+        assert_eq!(host.retry_backoff(), &RETRY_BACKOFF_WAN);
+        // A second stop says nothing more.
+        assert_eq!(host.shutdown("again"), StopInfo::default());
     }
 
     #[test]

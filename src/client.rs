@@ -1761,9 +1761,8 @@ impl Client {
         let mut direct_futures = Vec::new();
         let race_log = RaceLog::new("connect");
         // The host's address on each direct path, for an internet UDP video lane (M24): the
-        // TCP target, or the punched UDP sockets' peers (connected before this call).
+        // TCP target, or the punched IPv4 UDP socket's peer (connected before this call).
         let udp_peer = udp_socket_nat.as_ref().and_then(|s| s.peer_addr().ok());
-        let v6_peer = udp_socket_v6.as_ref().and_then(|s| s.peer_addr().ok());
         if allow_tcp_punch {
             let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
             direct_futures.push(race_log.track(
@@ -1886,7 +1885,8 @@ impl Client {
         interface.get_lch().write().unwrap().udp_video_host = match typ {
             "TCP" => Some(peer.ip()),
             "UDP" => udp_peer.map(|a| a.ip()),
-            "IPv6" => v6_peer.map(|a| a.ip()),
+            // The host keys a KCP-over-IPv6 session on this viewer's IPv4 address as the
+            // rendezvous server saw it, not the IPv6 peer: no internet lane there (yet).
             _ => None,
         };
         log::info!(
@@ -3431,8 +3431,8 @@ pub struct LoginConfigHandler {
     pub peer_relay: bool,
     pub direct: Option<bool>,
     /// The host's address as the last connect reached it on a direct path (TCP punch, direct
-    /// IP, KCP over a punched UDP socket); None on relay and WebRTC. The UDP video lane's
-    /// internet path (M24) sends to it.
+    /// IP, KCP over a punched IPv4 UDP socket); None on relay, WebRTC and KCP over IPv6. The
+    /// UDP video lane's internet path (M24) sends to it.
     pub udp_video_host: Option<std::net::IpAddr>,
     pub received: bool,
     switch_uuid: Option<String>,

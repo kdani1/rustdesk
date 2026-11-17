@@ -96,18 +96,42 @@ pub fn any_of_family(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The rendezvous server's UDP address in `ip`'s family (blocking DNS; called on a lane thread),
-/// for the NAT mapping query. None for an empty server or IPv6 (no NAT to learn there: the lane
-/// socket's local port is its public port).
-pub fn rendezvous_udp(server: &str, family: IpAddr) -> Option<SocketAddr> {
+/// 100.64.0.0/10 (RFC 6598): carrier-grade NAT and overlay networks (Tailscale).
+pub fn is_shared_v4(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+}
+
+/// How long a lane end waits for the rendezvous server's DNS lookup.
+pub const DNS_FOR: Duration = Duration::from_millis(1000);
+
+/// The rendezvous server's UDP address in `peer`'s family, for the NAT mapping query; `peer` is
+/// the other end's session address. Blocking DNS, called on a lane thread and bounded by
+/// `DNS_FOR` (the lookup runs on a helper thread; a late answer is dropped). None for an empty
+/// server, IPv6 (no NAT to learn there: the lane socket's local port is its public port), a peer
+/// in 100.64.0.0/10 (an overlay or in-carrier path: the port the rendezvous server sees is that
+/// of another path, the local port is the one this path reaches), or no answer in time.
+pub fn rendezvous_udp(server: &str, peer: IpAddr) -> Option<SocketAddr> {
     use std::net::ToSocketAddrs;
-    if server.is_empty() || family.is_ipv6() {
+    if server.is_empty() || peer.is_ipv6() || is_shared_v4(peer) {
         return None;
     }
     let host = hbb_common::socket_client::check_port(server, hbb_common::config::RENDEZVOUS_PORT);
-    host.to_socket_addrs()
-        .ok()?
-        .find(|a| a.is_ipv4() == family.is_ipv4())
+    let v4 = peer.is_ipv4();
+    if let Ok(a) = host.parse::<SocketAddr>() {
+        return (a.is_ipv4() == v4).then_some(a);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("udp-video-dns".to_owned())
+        .spawn(move || {
+            let found = host
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.find(|a| a.is_ipv4() == v4));
+            let _ = tx.send(found);
+        })
+        .ok()?;
+    rx.recv_timeout(DNS_FOR).ok().flatten()
 }
 
 /// How long a lane end asks the rendezvous server for its public port.
@@ -453,6 +477,24 @@ mod latency_tests {
                     .unwrap()
             )
         );
+        // Through the lookup thread.
+        assert_eq!(
+            rendezvous_udp("localhost:21116", "1.2.3.4".parse().unwrap()),
+            Some("127.0.0.1:21116".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn latency_wan_overlay_peer_skips_nat_query() {
+        for ip in ["100.64.0.1", "100.101.2.3", "100.127.255.254"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_shared_v4(ip), "{ip}");
+            assert!(wan_ip(ip).is_ok(), "{ip} is still an internet lane peer");
+            assert_eq!(rendezvous_udp("127.0.0.1", ip), None, "{ip}");
+        }
+        for ip in ["100.63.255.255", "100.128.0.1", "81.2.3.4"] {
+            assert!(!is_shared_v4(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]
