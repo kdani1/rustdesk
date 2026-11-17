@@ -466,7 +466,7 @@ and the false-cut rate, not the depth.
 ```
 FASTABR shadow conn=5 ack=0
 FASTABR shadow conn=5 kind=cut from_kbps=11755 to_kbps=5877 would_set_kbps=5877 k=1.00 q_ms=148.5 t_hi_ms=30 r_send=8000 r_acked=6104 react_ms=100 fc=0 meter=1 skipped=0
-LATENCY fast conn=5 mode=shadow live=- elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 stream_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0 applied=0 refused=0 resync=0 fps_cap=60/-
+LATENCY fast conn=5 mode=shadow live=- elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 stream_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0 applied=0 refused=0 resync=0 fps_cap=60/- fb=0 loss_cuts=0
 ```
 
 The `mode`, `live`, `stream_kbps`, `applied`, `refused`, `resync` and `fps_cap` fields, and
@@ -475,7 +475,7 @@ the live-mode lines, are described under "Host: fast bitrate adaptation live" be
 | Line / field | Meaning |
 |---|---|
 | `FASTABR shadow conn= ack=` | once when the estimator starts (`FASTABR live ...` with `enable-fast-abr=Y`); `... on` / `... off` when the options turn it on or off |
-| `FASTABR shadow kind=` | always (not gated by `enable-latency-log`), at most one line per connection per 2 s (`skipped`: decisions not logged since the last line). `cut`, `severe`, `rto`; increases are only counted |
+| `FASTABR shadow kind=` | always (not gated by `enable-latency-log`), at most one line per connection per 2 s (`skipped`: decisions not logged since the last line). `cut`, `severe`, `rto`, `loss` (per-frame feedback, below); increases are only counted |
 | `from_kbps` / `to_kbps` | target before and after, measured kbps |
 | `would_set_kbps` | `to_kbps / k`: the encoder bitrate it would set |
 | `k` | measured / configured bitrate |
@@ -499,6 +499,7 @@ the live-mode lines, are described under "Host: fast bitrate adaptation live" be
 | `stalls` | capture-loop stall reports for this connection |
 | `k_rej` | full-rate seconds whose `k` sample was content-limited (under 0.8 x `k`): not learned from |
 | `react_max_ms` | largest `react_ms` in the window |
+| `fb` / `loss_cuts` | per-frame feedback batches this estimator took in the window (0 without `enable-video-feedback=Y` or a viewer that sends it), and the `loss` cuts they made; see "Fast estimator input from per-frame feedback" below |
 
 Tests (`cargo test latency_fast`): replays of recorded `LATENCY server` windows
 (`src/server/video_qos/tests/fast_traces.txt`: 10 min Wi-Fi at 60 fps, 12 min Wi-Fi at 15-30
@@ -516,6 +517,35 @@ queue until it is full). The meter's `unsent` is still unverified on the real li
 meter above); the metered backlog term depends on it.
 
 Rollback: `enable-fast-abr-shadow N`.
+
+#### Fast estimator input from per-frame feedback (M15/M16 x M23, the merge seam)
+
+With host `enable-video-feedback=Y` (off by default) and a viewer that sends feedback, each
+connection that has an estimator also gets the viewer's batches (`FastAbrSink` in
+`ConnFeedback::sinks`, from the connection task, at most 40 per second). Without the option
+nothing changes. What each batch adds (it counts for 300 ms after it came):
+
+- **Queue:** `Q` = max(the terms above, the batch's `q_owd`). This sees a queue past the
+  host's socket (an hbbr leg, the viewer's own Wi-Fi) and the queue of a live UDP lane, which
+  no TCP term sees (the lane takes the frames off TCP, so the estimator gets no writes then).
+- **Unmetered transports** (no TCP meter: relay, KCP, WebRTC, a live UDP lane): the batches'
+  mean `recv_kbps` over 500 ms is `r_acked`, and GCC's `overuse` verdict counts as a growing
+  queue for OVERUSE. Metered connections keep the meter's rates and growth test.
+- **Loss** (UDP lane): datagram loss over 10 % over the viewer's last second cuts by
+  (1 - 0.5 x loss), kind `loss`, at most once per second (the loss is over the viewer's last
+  second); loss at or above 2 % allows no increase. The cut does not move `C`.
+- **The viewer's limit:** an arrival-to-shown delay of 100 ms or more with a `q_owd` under
+  `T_lo` is state `R` (RECEIVER), never a cut.
+- **LegacyQos steps aside** while this connection's estimator is on and live
+  (`enable-fast-abr=Y`): `video-feedback-qos` then no longer adds `q_owd` or the loss penalty to
+  the TestDelay sample, so `video_qos` is not fed the same delay twice. In shadow mode
+  `video-feedback-qos=Y` keeps working as M23 describes.
+
+`FASTABR ... kind=loss` is a new decision kind (same line and 2 s limit as the others).
+Tests: `latency_fast_feedback_queue_cuts_without_tcp_writes`,
+`latency_fast_feedback_loss_cuts_once_per_second_and_blocks_increase`,
+`latency_fast_feedback_slow_viewer_is_receiver_limited`,
+`latency_feedback_fast_abr_sink_replaces_legacy_qos`.
 
 ### Host: fast bitrate adaptation live (roadmap M16)
 

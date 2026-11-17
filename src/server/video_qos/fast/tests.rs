@@ -974,3 +974,111 @@ fn latency_fast_live_app_limited_increase_bounded_by_ceiling() {
     }
     assert_eq!(est.counters.app_incs, 0);
 }
+
+// Per-frame feedback (M23) on a transport the estimator has no other signal for: a live UDP
+// lane takes the frames off TCP, so only the viewer's batches (every 50 ms) and the 1 s
+// context reach the estimator.
+fn fb_run(
+    est: &mut FastEstimator,
+    t: &mut u64,
+    secs: f64,
+    c: Context,
+    mut sample: impl FnMut(u64) -> FeedbackSample,
+) -> Vec<Decision> {
+    let mut out = Vec::new();
+    let end = *t + (secs * 1e6) as u64;
+    while *t < end {
+        *t += 50_000;
+        let mut s = sample(*t);
+        s.at_us = *t;
+        out.extend(est.on_feedback(s));
+        if *t % 1_000_000 == 0 {
+            out.extend(est.on_second(*t, c));
+        }
+    }
+    out
+}
+
+fn calm(_: u64) -> FeedbackSample {
+    FeedbackSample {
+        q_owd_ms: Some(2.0),
+        recv_kbps: Some(8000.0),
+        viewer_ms: Some(20.0),
+        loss: Some(0.0),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn latency_fast_feedback_queue_cuts_without_tcp_writes() {
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    let c = live_ctx(8000.0, 8000.0);
+    assert!(fb_run(&mut est, &mut t, 4.0, c, calm).is_empty());
+    assert_eq!(est.target(), Some(8000.0));
+    // The viewer's link congests: queueing delay 120 ms and growing, GCC overuse, 5 Mbps
+    // arriving.
+    let step = t;
+    let cuts = fb_run(&mut est, &mut t, 0.5, c, |at| FeedbackSample {
+        q_owd_ms: Some(120.0 + (at - step) as f64 / 10_000.0),
+        overuse: true,
+        recv_kbps: Some(5000.0),
+        viewer_ms: Some(150.0),
+        loss: Some(0.0),
+        ..Default::default()
+    });
+    let first = cuts.iter().find(|d| d.kind == Kind::Cut).expect("no cut");
+    assert!(first.at_us - step <= 200_000, "react {}", first.at_us - step);
+    // min(0.9 x 8000, 0.85 x the delivered rate), which the viewer's batches give: the 500 ms
+    // window still holds some 8 Mbps batches at the first cut, so between 0.85 x 5000 and 7200.
+    assert!(
+        first.to_kbps <= 7200.0 + 1.0 && first.to_kbps >= 4250.0 - 1.0,
+        "{}",
+        first.to_kbps
+    );
+    assert!(first.r_acked < 8000.0, "{}", first.r_acked);
+    assert!(est.counters.feedback > 0);
+}
+
+#[test]
+fn latency_fast_feedback_loss_cuts_once_per_second_and_blocks_increase() {
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    let c = live_ctx(8000.0, 8000.0);
+    let _ = fb_run(&mut est, &mut t, 4.0, c, calm);
+    let lossy = |_| FeedbackSample {
+        loss: Some(0.2),
+        ..calm(0)
+    };
+    let d = fb_run(&mut est, &mut t, 1.5, c, lossy);
+    let loss: Vec<_> = d.iter().filter(|d| d.kind == Kind::Loss).collect();
+    assert_eq!(loss.len(), 2, "{:?}", loss);
+    assert!(loss[1].at_us - loss[0].at_us >= 1_000_000);
+    // (1 - 0.5 x 0.2) x 8000.
+    assert!((loss[0].to_kbps - 7200.0).abs() < 1.0, "{}", loss[0].to_kbps);
+    assert_eq!(est.counters.loss_cuts, 2);
+    // Some loss left (2 %..10 %): no cut, no increase.
+    let some = |_| FeedbackSample {
+        loss: Some(0.05),
+        ..calm(0)
+    };
+    let before = est.target();
+    let d = fb_run(&mut est, &mut t, 5.0, c, some);
+    assert!(d.is_empty(), "{:?}", d);
+    assert_eq!(est.target(), before);
+}
+
+#[test]
+fn latency_fast_feedback_slow_viewer_is_receiver_limited() {
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    let c = live_ctx(8000.0, 8000.0);
+    let _ = fb_run(&mut est, &mut t, 4.0, c, calm);
+    let slow = |_| FeedbackSample {
+        viewer_ms: Some(400.0),
+        ..calm(0)
+    };
+    let d = fb_run(&mut est, &mut t, 2.0, c, slow);
+    assert!(d.iter().all(|d| d.kind == Kind::Increase), "{:?}", d);
+    assert_eq!(est.state(), State::Receiver);
+}

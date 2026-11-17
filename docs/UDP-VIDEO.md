@@ -613,11 +613,10 @@ Uses in this build, each behind its own host option (all off by default):
   names it. The existing rules (4 key frames in 5 s, silence, socket
   errors) stay.
 
-### Seam to the fast ABR (M15/M16, the `rate` stream)
+### Seam to the fast ABR (M15/M16, the `rate` stream): wired at the merge
 
-The fast estimator (`src/server/video_qos/fast.rs` on `feature/b3-rate`) takes TCP meter samples
-through `FastEstimator::on_tcp(TcpInput)`. The feedback is its second input, defined here so
-the merge only has to connect them:
+The fast estimator (`src/server/video_qos/fast.rs`) takes TCP meter samples through
+`FastEstimator::on_tcp(TcpInput)`; the feedback is its second input:
 
 ```rust
 // src/video_feedback/host.rs
@@ -626,25 +625,38 @@ pub struct FeedbackInput { pub at: Instant, pub frames: u32, pub q_owd_ms: Optio
     pub jitter_ms: f64, pub recv_kbps: Option<f64>, pub viewer_ms: Option<f64>,
     pub decode_ms: Option<f64>, pub queue_len: u32, pub udp: bool, pub loss: Option<f64>,
     pub frame_loss: Option<f64>, pub fec_recovered: u64, pub lost_frames: u64 }
-pub trait FeedbackSink { fn on_feedback(&mut self, input: &FeedbackInput); }
+pub trait FeedbackSink { fn on_feedback(&mut self, input: &FeedbackInput);
+    fn replaces_legacy_qos(&self) -> bool { false } }
 // ConnFeedback::sinks: Vec<Box<dyn FeedbackSink + Send>>, called for every batch.
 ```
 
-At the merge:
+What the merge connected:
 
-1. `impl FeedbackSink` for a small adapter holding the connection's `Arc<ConnFastAbr>`; its
-   `on_feedback` forwards to a new `FastEstimator::on_feedback(&FeedbackInput)` under the
-   estimator's lock (the Connection task calls it, as it calls `on_dequeue` and `on_sent`).
-2. In `Connection`, right after `video_feedback` is created at PeerInfo, push that adapter into
-   `ConnFeedback::sinks`.
-3. In the estimator: `Q = max(existing terms, q_owd_ms)`; `usage == Overuse` counts as the
-   delay-based overuse signal on transports without a meter (relay, KCP, WebRTC); `recv_kbps` is
-   a delivered-rate sample (`R_acked`) where the meter has none; `loss > 0.10` cuts by
-   `(1 - 0.5 x loss)` and `loss < 0.02` allows the increase (GCC's loss controller); a large
-   `viewer_ms` with a small `q_owd` is the RECEIVER_LIMITED case (the viewer, not the network:
-   no bitrate cut).
-4. With `enable-fast-abr` live, `LegacyQos` steps aside (`ConnFeedback::qos_delay` only while the
-   fast loop is off), so video_qos is not fed the same delay twice.
+1. `video_qos::fast::FastAbrSink(Arc<ConnFastAbr>)` implements `FeedbackSink`; its
+   `on_feedback` calls `ConnFastAbr::on_feedback`, which turns the input into a
+   `FeedbackSample` (host-clock µs, `q_owd_ms`, `usage == Overuse`, `recv_kbps`, `viewer_ms`,
+   `loss`) and hands it to `FastEstimator::on_feedback` under the estimator's lock, from the
+   Connection task (as `on_dequeue` and `on_sent`).
+2. `Connection`: when the estimator is created after authorization, the adapter is pushed into
+   `ConnFeedback::sinks` if the connection has feedback (`video_feedback` is created at PeerInfo,
+   in the same logon step, so it already exists then).
+3. In the estimator: `Q = max(existing terms, q_owd_ms)`; on unmetered transports
+   (relay, KCP, WebRTC, a live UDP lane) `usage == Overuse` counts as a growing queue and the
+   mean `recv_kbps` over 500 ms is `R_acked`; `loss > 0.10` cuts by `(1 - 0.5 x loss)` (kind
+   `loss`, at most once per second) and `loss >= 0.02` blocks increases (GCC's loss
+   controller); `viewer_ms >= 100` with `q_owd < T_lo` is RECEIVER (the viewer, not the network:
+   no cut). Values count for 300 ms after their batch.
+4. `FastAbrSink::replaces_legacy_qos` is true while the estimator is on and live
+   (`enable-fast-abr=Y`): `ConnFeedback` then skips `LegacyQos` (`qos_delay` returns the sample
+   unchanged), so `video_qos` is not fed the same delay twice.
+
+A frame a live lane takes off TCP has no TCP write, so the estimator gets no `on_dequeue` /
+`on_sent` for it (the TCP write terms stay empty, and the feedback carries the queue); the
+primary-viewer gate (M18) counts it as written when the lane takes it. Log fields: `fb`,
+`loss_cuts` and `kind=loss` (docs/LATENCY-METRICS.md, "Fast estimator input from per-frame
+feedback"). Not done: the trendline's slope itself is not a separate estimator term (`usage`
+is), and an app-limited estimator on a live lane only undoes cuts (no TCP writes, so no frames
+to call the stream full).
 
 ### Left out of M23
 
@@ -652,7 +664,7 @@ At the merge:
   answers that same request with RFI where it can.
 - **Per-frame NACK with retransmission**: a lost UDP frame is repaired by FEC or a key frame,
   never resent (a resend arrives too late for a 60 fps stream on the LAN).
-- **The fast ABR itself on this stream**: only the seam; `LegacyQos` is what this build uses.
+- **The fast ABR itself on this stream**: only the seam; it was connected at the merge (above).
 - **Feedback over the UDP lane**: the batches ride the session stream, so they still arrive
   when the lane fails, which is what the fallback needs.
 - **Pacing or bitrate decisions from `trend` in this build**: `usage` is logged and handed to

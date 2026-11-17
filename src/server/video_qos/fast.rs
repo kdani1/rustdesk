@@ -17,6 +17,13 @@
 //! (`would_set_kbps`), so a 30-fps nvenc at 60 fps or a virtual framerate (M7) do not skew the
 //! thresholds.
 //!
+//! A third input, with per-frame feedback (M23, `enable-video-feedback=Y`), is the viewer's
+//! feedback batch (`on_feedback`, through `FastAbrSink`): its queueing one-way delay is a queue
+//! term, its GCC overuse verdict and its delivered rate stand in for the meter on unmetered
+//! transports (relay, KCP, WebRTC, a live UDP lane), UDP datagram loss cuts (GCC's loss
+//! controller), and a large viewer delay with a small network queue is the viewer's limit, not
+//! the network's (docs/UDP-VIDEO.md, "Seam to the fast ABR").
+//!
 //! What each log field means: docs/LATENCY-METRICS.md, "Host: fast bitrate estimator, shadow
 //! mode" and "Host: fast bitrate adaptation live".
 
@@ -125,6 +132,19 @@ const FRAME_KEEP_US: u64 = 2_000_000;
 const TCP_KEEP_US: u64 = 2_000_000;
 /// Frames larger than this many times the average have their excess serialization discounted.
 const LARGE_FRAME: f64 = 2.0;
+/// Per-frame feedback (M23): a batch's values count for this long (batches come every 50 ms).
+const FB_FRESH_US: u64 = 300_000;
+const FB_KEEP_US: u64 = 2_000_000;
+const MAX_FB: usize = 128;
+/// GCC's loss controller: datagram loss above this cuts by (1 - 0.5 x loss), at most once per
+/// `FB_LOSS_SPACING_US` (the viewer's loss is over its last second); at or above `FB_LOSS_LOW`
+/// no increase.
+const FB_LOSS_HIGH: f64 = 0.10;
+const FB_LOSS_LOW: f64 = 0.02;
+const FB_LOSS_SPACING_US: u64 = 1_000_000;
+/// The viewer's arrival-to-shown delay this large while the network queue is under `T_lo`: the
+/// viewer (decode, present) is the limit, not the network; no cut.
+const FB_RECEIVER_MS: f64 = 100.0;
 
 // ---------------------------------------------------------------------------------------------
 // The estimator: pure, clock passed in, so recorded traces replay deterministically.
@@ -201,6 +221,22 @@ pub struct TcpInput {
     pub lim_rwin_ms: Option<u32>,
 }
 
+/// One per-frame feedback batch of the viewer (roadmap M23), host clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FeedbackSample {
+    pub at_us: u64,
+    /// Queueing one-way delay above the path's minimum, ms.
+    pub q_owd_ms: Option<f64>,
+    /// GCC's trendline detector says overuse.
+    pub overuse: bool,
+    /// What the viewer received over the batch's span, kbps.
+    pub recv_kbps: Option<f64>,
+    /// The viewer's largest arrival-to-shown delay of the batch, ms.
+    pub viewer_ms: Option<f64>,
+    /// UDP lane: datagrams lost per expected over the viewer's last second.
+    pub loss: Option<f64>,
+}
+
 impl TcpInput {
     fn acked(&self) -> u64 {
         self.unique_out.saturating_sub(self.in_flight as u64)
@@ -249,6 +285,8 @@ pub enum Kind {
     Cut,
     Severe,
     Rto,
+    /// Per-frame feedback: UDP datagram loss over `FB_LOSS_HIGH` (M23).
+    Loss,
     Increase,
 }
 
@@ -258,6 +296,7 @@ impl Kind {
             Kind::Cut => "cut",
             Kind::Severe => "severe",
             Kind::Rto => "rto",
+            Kind::Loss => "loss",
             Kind::Increase => "inc",
         }
     }
@@ -309,6 +348,9 @@ pub struct Counters {
     /// Live: seconds the target came down to the stream's bitrate (another viewer's lower
     /// target, the TestDelay backstop, a refused increase).
     pub resync: u32,
+    /// Per-frame feedback batches taken (M23), and the cuts their UDP loss made.
+    pub feedback: u32,
+    pub loss_cuts: u32,
     /// Live: decisions `VideoQoS::on_fast` applied, and refused.
     pub applied: u32,
     pub refused: u32,
@@ -357,6 +399,9 @@ pub struct FastEstimator {
     c_reached_at: Option<u64>,
     frames: VecDeque<FrameRec>,
     tcp: VecDeque<TcpInput>,
+    // Per-frame feedback batches (M23), last 2 s.
+    fb: VecDeque<FeedbackSample>,
+    last_loss_cut_at: Option<u64>,
     // Queue samples (time, ms, taken while NORMAL).
     qs: VecDeque<(u64, f32, bool)>,
     pending: Option<Pending>,
@@ -406,6 +451,8 @@ impl FastEstimator {
             c_reached_at: None,
             frames: VecDeque::new(),
             tcp: VecDeque::new(),
+            fb: VecDeque::new(),
+            last_loss_cut_at: None,
             qs: VecDeque::new(),
             pending: None,
             base_bucket_at: 0,
@@ -601,6 +648,44 @@ impl FastEstimator {
         {
             self.tcp.pop_front();
         }
+    }
+
+    /// One per-frame feedback batch of the viewer (M23).
+    pub fn on_feedback(&mut self, s: FeedbackSample) -> Option<Decision> {
+        if self.fb.back().is_some_and(|b| b.at_us > s.at_us) {
+            return None;
+        }
+        self.first_us.get_or_insert(s.at_us);
+        self.counters.feedback += 1;
+        self.fb.push_back(s);
+        while self.fb.len() > MAX_FB
+            || self
+                .fb
+                .front()
+                .is_some_and(|f| f.at_us + FB_KEEP_US < s.at_us)
+        {
+            self.fb.pop_front();
+        }
+        self.maybe_eval(s.at_us)
+    }
+
+    fn fresh_fb(&self, now: u64) -> Option<&FeedbackSample> {
+        self.fb
+            .back()
+            .filter(|f| now.saturating_sub(f.at_us) <= FB_FRESH_US)
+    }
+
+    // The viewer's delivered rate over the rate window (kbps): the mean of the batches' rates.
+    fn fb_rate(&self, now: u64) -> Option<f64> {
+        let from = now.saturating_sub(RATE_WINDOW_US);
+        let (sum, n) = self
+            .fb
+            .iter()
+            .rev()
+            .take_while(|f| f.at_us > from)
+            .filter_map(|f| f.recv_kbps)
+            .fold((0.0, 0u32), |(s, n), r| (s + r, n + 1));
+        (n > 0 && now.saturating_sub(self.fb.back()?.at_us) <= FB_FRESH_US).then(|| sum / n as f64)
     }
 
     /// The capture loop has waited `waited` for this connection to take its frame.
@@ -827,10 +912,14 @@ impl FastEstimator {
                 .frames
                 .back()
                 .map_or(true, |f| f.end + PAUSE_WINDOW_US <= now);
+        // Without a meter the viewer's feedback says what arrived (M23), and its overuse
+        // verdict that a queue builds up.
+        let fb_rate = self.fb_rate(now);
+        let fb_overuse = self.fresh_fb(now).is_some_and(|f| f.overuse);
         Rates {
             r_send: sent as f64 * 8.0 / w_ms,
-            r_acked: done as f64 * 8.0 / w_ms,
-            growing: self.writer_saturated(now) || self.delays_rising(now),
+            r_acked: fb_rate.unwrap_or(done as f64 * 8.0 / w_ms),
+            growing: self.writer_saturated(now) || self.delays_rising(now) || fb_overuse,
             paused,
             metered: false,
         }
@@ -882,6 +971,11 @@ impl FastEstimator {
         }
         if let Some(p) = self.pending {
             q = q.max(now.saturating_sub(p.enq).saturating_sub(self.base()) as f64 / 1000.0);
+        }
+        // The viewer's queueing one-way delay (M23): sees a queue past the socket (hbbr, the
+        // viewer's own link) and a live UDP lane's, which no TCP term does.
+        if let Some(q_owd) = self.fresh_fb(now).and_then(|f| f.q_owd_ms) {
+            q = q.max(q_owd);
         }
         q.max(self.tcp_q(now, rates.r_acked))
     }
@@ -1037,7 +1131,11 @@ impl FastEstimator {
         if severe {
             self.severe_episode = true;
         }
-        let receiver = self.receiver_limited(now, t_lo);
+        let receiver = self.receiver_limited(now, t_lo)
+            || self.fresh_fb(now).is_some_and(|f| {
+                f.viewer_ms.is_some_and(|v| v >= FB_RECEIVER_MS)
+                    && f.q_owd_ms.is_some_and(|q| q < t_lo)
+            });
         // OVERUSE: the queue stayed above T_hi for 100 ms, the link is not paused, and the queue
         // grows now or has stood above T_hi for 500 ms (a pause drains faster than that) and
         // is not draining (metered: delivery over 1.05 x send).
@@ -1097,12 +1195,19 @@ impl FastEstimator {
                 _ => false,
             },
         };
+        let fb_loss = self.fresh_fb(now).and_then(|f| f.loss).unwrap_or(0.0);
+        let loss_cut = fb_loss > FB_LOSS_HIGH
+            && self
+                .last_loss_cut_at
+                .map_or(true, |t| now >= t + FB_LOSS_SPACING_US);
         let kind = if severe {
             Some(Kind::Severe)
         } else if overuse && !receiver {
             Some(Kind::Cut)
         } else if rto_cut && !receiver {
             Some(Kind::Rto)
+        } else if loss_cut {
+            Some(Kind::Loss)
         } else {
             None
         };
@@ -1115,6 +1220,7 @@ impl FastEstimator {
             let to = match kind {
                 Kind::Severe => 0.5 * target,
                 Kind::Rto => (BETA * rto_acked).max(0.5 * target),
+                Kind::Loss => (1.0 - 0.5 * fb_loss.min(1.0)) * target,
                 _ => (OVERUSE_STEP * target)
                     .min(BETA * rates.r_acked)
                     .max(0.5 * target),
@@ -1124,7 +1230,10 @@ impl FastEstimator {
                 self.counters.floor += 1;
                 return None;
             }
-            if kind != Kind::Severe && rates.r_acked > 0.0 {
+            if kind == Kind::Loss {
+                self.last_loss_cut_at = Some(now);
+            }
+            if !matches!(kind, Kind::Severe | Kind::Loss) && rates.r_acked > 0.0 {
                 let mut c = self.ceiling_c.map_or(rates.r_acked, |c| {
                     (1.0 - CEILING_EWMA) * c + CEILING_EWMA * rates.r_acked
                 });
@@ -1156,6 +1265,7 @@ impl FastEstimator {
             match kind {
                 Kind::Severe => self.counters.severe += 1,
                 Kind::Rto => self.counters.rto_cuts += 1,
+                Kind::Loss => self.counters.loss_cuts += 1,
                 _ => self.counters.cuts += 1,
             }
             if false_cut == Some(true) {
@@ -1174,6 +1284,7 @@ impl FastEstimator {
             (INCREASE_AFTER_US, ceil)
         };
         if state == State::Normal
+            && fb_loss < FB_LOSS_LOW
             && now >= self.hold_until
             && self
                 .normal_since
@@ -1419,6 +1530,34 @@ impl ConnFastAbr {
         self.after_eval(&mut inner, d);
     }
 
+    /// One per-frame feedback batch of the viewer (M23), from the connection task.
+    pub fn on_feedback(&self, input: &crate::video_feedback::host::FeedbackInput) {
+        if !self.on.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        #[cfg(windows)]
+        self.feed_tcp(&mut inner);
+        let sample = FeedbackSample {
+            at_us: self.us(input.at),
+            q_owd_ms: input.q_owd_ms,
+            overuse: input.usage == crate::video_feedback::host::Usage::Overuse,
+            recv_kbps: input.recv_kbps,
+            viewer_ms: input.viewer_ms,
+            loss: input.loss,
+        };
+        let d = inner.est.on_feedback(sample);
+        self.after_eval(&mut inner, d);
+    }
+
+    /// Live and on: this estimator sets the stream's bitrate, so the feedback's `LegacyQos`
+    /// path steps aside (no double count of the same delay in `video_qos`).
+    pub fn drives(&self) -> bool {
+        self.on.load(Ordering::Relaxed) && self.live.load(Ordering::Relaxed)
+    }
+
     fn on_stall(&self, waited: Duration) {
         if !self.on.load(Ordering::Relaxed) {
             return;
@@ -1604,7 +1743,7 @@ impl ConnFastAbr {
         let (r_send, r_acked) = e.last_rates();
         let target = e.target();
         log::info!(
-            "LATENCY fast conn={} mode={} live={} elig={} state={} meter={} ack={} k={:.2} set_kbps={} stream_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} app_incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={} applied={} refused={} resync={} fps_cap={}/{}",
+            "LATENCY fast conn={} mode={} live={} elig={} state={} meter={} ack={} k={:.2} set_kbps={} stream_kbps={} target_kbps={} would_set_kbps={} floor_kbps={} ceil_kbps={} c_kbps={} r_send_1s={:.0} r_send={:.0} r_acked={:.0} app_lim={} q={} t_hi_ms={:.0} st={}/{}/{}/{}/{} cuts={} severe={} rto={} rto_ign={} incs={} app_incs={} held={} floor={} fc={} stalls={} react_max_ms={:.0} k_rej={} applied={} refused={} resync={} fps_cap={}/{} fb={} loss_cuts={}",
             self.id,
             self.mode(),
             inner.log.live_state,
@@ -1648,7 +1787,23 @@ impl ConnFastAbr {
             c.resync,
             fmt_fps(ctx.custom_fps),
             fmt_fps(ctx.auto_fps),
+            c.feedback,
+            c.loss_cuts,
         );
+    }
+}
+
+/// The seam from per-frame feedback (M23) to this estimator: pushed into the connection's
+/// `ConnFeedback::sinks` when both exist (docs/UDP-VIDEO.md, "Seam to the fast ABR").
+pub struct FastAbrSink(pub Arc<ConnFastAbr>);
+
+impl crate::video_feedback::host::FeedbackSink for FastAbrSink {
+    fn on_feedback(&mut self, input: &crate::video_feedback::host::FeedbackInput) {
+        self.0.on_feedback(input);
+    }
+
+    fn replaces_legacy_qos(&self) -> bool {
+        self.0.drives()
     }
 }
 

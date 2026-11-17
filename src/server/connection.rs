@@ -983,6 +983,12 @@ impl Connection {
                         if let Some(s) = host_socket.as_ref().filter(|s| s.is_metered()) {
                             f.set_tcp(s.clone());
                         }
+                        // The seam from per-frame feedback (M23): the viewer's batches also
+                        // feed this estimator (queueing delay, delivered rate, UDP loss).
+                        if let Some(fb) = conn.video_feedback.as_mut() {
+                            fb.sinks
+                                .push(Box::new(super::video_qos::fast::FastAbrSink(f.clone())));
+                        }
                         fast_abr = Some(f);
                     }
                     if conn.port_forward_socket.is_none() && crate::session_io::split_allowed() {

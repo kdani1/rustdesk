@@ -210,10 +210,16 @@ pub struct FeedbackInput {
     pub lost_frames: u64,
 }
 
-/// The receiving end of `FeedbackInput`. `LegacyQos` in this build; the fast ABR (M15/M16) at
-/// the merge, next to its `on_tcp(TcpInput)`.
+/// The receiving end of `FeedbackInput`: `LegacyQos`, and the fast ABR (M15/M16,
+/// `video_qos::fast::FastAbrSink`, next to its `on_tcp(TcpInput)`).
 pub trait FeedbackSink {
     fn on_feedback(&mut self, input: &FeedbackInput);
+
+    /// This sink sets the bitrate itself now (the fast ABR live): `LegacyQos` steps aside, so
+    /// `video_qos` is not fed the same delay twice.
+    fn replaces_legacy_qos(&self) -> bool {
+        false
+    }
 }
 
 /// The feedback as a `video_qos` delay sample (`video-feedback-qos=Y`): the TestDelay sample
@@ -858,7 +864,8 @@ pub struct ConnFeedback {
     estimator: Estimator,
     legacy: LegacyQos,
     fec: Option<FecAdapt>,
-    /// Further consumers of every `FeedbackInput`, in order. Empty in this build.
+    /// Further consumers of every `FeedbackInput`, in order: the connection's fast ABR
+    /// estimator when it has one (`video_qos::fast::FastAbrSink`).
     pub sinks: Vec<Box<dyn FeedbackSink + Send>>,
     qos: bool,
     fec_adaptive: bool,
@@ -891,7 +898,7 @@ impl ConnFeedback {
         now: Instant,
     ) -> Option<FeedbackInput> {
         let input = self.estimator.on_batch(fb, log, now)?;
-        if self.qos {
+        if self.qos && !self.legacy_replaced() {
             self.legacy.on_feedback(&input);
         }
         for s in self.sinks.iter_mut() {
@@ -902,12 +909,21 @@ impl ConnFeedback {
 
     /// The `video_qos` delay sample: `sample_ms` itself unless `video-feedback-qos=Y`.
     /// `penalised`: the UDP lane already added its loss penalty to it.
+    /// While a sink (the fast ABR live) replaces it, `sample_ms` itself too, and what
+    /// `LegacyQos` gathered before is dropped.
     pub fn qos_delay(&mut self, sample_ms: u32, penalised: bool) -> u32 {
-        if self.qos {
-            self.legacy.delay(sample_ms, penalised)
-        } else {
+        if !self.qos {
             sample_ms
+        } else if self.legacy_replaced() {
+            self.legacy = LegacyQos::default();
+            sample_ms
+        } else {
+            self.legacy.delay(sample_ms, penalised)
         }
+    }
+
+    fn legacy_replaced(&self) -> bool {
+        self.sinks.iter().any(|s| s.replaces_legacy_qos())
     }
 
     /// Adaptive FEC of a live lane that started with `configured` percent parity: Some(new
@@ -1273,5 +1289,30 @@ mod latency_tests {
         assert!(est
             .take_window(t0 + Duration::from_secs(10), Duration::from_secs(5))
             .is_some());
+    }
+
+    struct Replacing(bool);
+    impl FeedbackSink for Replacing {
+        fn on_feedback(&mut self, _: &FeedbackInput) {}
+        fn replaces_legacy_qos(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn latency_feedback_fast_abr_sink_replaces_legacy_qos() {
+        let now = Instant::now();
+        let mut fb = ConnFeedback::new(now);
+        fb.qos = true;
+        fb.legacy.q_owd_ms = 200.0;
+        fb.sinks.push(Box::new(Replacing(false)));
+        assert_eq!(fb.qos_delay(50, false), 200);
+        // The fast ABR live: the sample goes through as it is, gathered state is dropped.
+        fb.legacy.q_owd_ms = 200.0;
+        fb.legacy.loss_high = true;
+        fb.sinks.push(Box::new(Replacing(true)));
+        assert_eq!(fb.qos_delay(50, false), 50);
+        fb.sinks.pop();
+        assert_eq!(fb.qos_delay(50, false), 50);
     }
 }
