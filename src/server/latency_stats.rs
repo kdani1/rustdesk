@@ -215,6 +215,14 @@ pub(super) struct LatencyStats {
     rmerge: usize,
     // Static refine: re-encodes of the kept last image on a static screen.
     refine: usize,
+    // Virtual framerate (nvenc-nominal-fps): the frame rate the encoder's bitrate is scaled for
+    // (0: off), kept always like `set_kbps`, and how often it changed in the window.
+    vfps: u32,
+    vfchg: usize,
+    // GPU scheduling priority of this capture loop (enable-host-gpu-priority /
+    // enable-host-dwm-mmcss, Windows): what was applied ("off", "gpu", "dwm", "gpu+dwm", with
+    // "-failed" parts), set once at capture start.
+    gpuprio: &'static str,
 }
 
 impl LatencyStats {
@@ -250,7 +258,16 @@ impl LatencyStats {
             rkept: 0,
             rmerge: 0,
             refine: 0,
+            vfps: 0,
+            vfchg: 0,
+            gpuprio: "off",
         }
+    }
+
+    /// `gpuprio=` of the line: the capture loop's GPU priority guard (Windows, roadmap M17).
+    #[cfg(windows)]
+    pub(super) fn set_gpu_priority(&mut self, label: &'static str) {
+        self.gpuprio = label;
     }
 
     /// `grab`: capturer call until it returned the frame.
@@ -350,6 +367,14 @@ impl LatencyStats {
         }
     }
 
+    /// Virtual framerate: the encoder's bitrate is now scaled for `fps` (0: turned off).
+    pub(super) fn on_virtual_fps(&mut self, fps: u32) {
+        self.vfps = fps;
+        if self.enabled {
+            self.vfchg += 1;
+        }
+    }
+
     /// The encoder's bitrate was changed by `set_quality` (QoS ratio change).
     pub(super) fn on_quality(&mut self, kbps: u32) {
         self.set_kbps = kbps;
@@ -397,7 +422,7 @@ impl LatencyStats {
         if self.enabled && self.sent + self.skipped + self.idle > 0 {
             let secs = elapsed.as_secs_f64();
             log::info!(
-                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={}",
+                "LATENCY server display={} fps={:.1} spf={}ms grab={} encode={} wait={} send={} sleep={} sent={} skipped={} idle={} send_slow={} age={} kbps={:.0} set_kbps={} maxf={} key={} keymax={} qchg={} qchg_key={} gap={} pacing={} reanchor={} rkey={} rkept={} rmerge={} refine={} vfps={} vfchg={} gpuprio={}",
                 self.display,
                 self.sent as f64 / secs,
                 spf.as_millis(),
@@ -425,6 +450,9 @@ impl LatencyStats {
                 self.rkept,
                 self.rmerge,
                 self.refine,
+                self.vfps,
+                self.vfchg,
+                self.gpuprio,
             );
         }
         self.window_start = Instant::now();
@@ -448,6 +476,7 @@ impl LatencyStats {
         self.rkept = 0;
         self.rmerge = 0;
         self.refine = 0;
+        self.vfchg = 0;
         self.enabled = is_enabled();
         SEND_ENABLED.store(self.enabled, Ordering::Relaxed);
     }

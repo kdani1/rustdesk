@@ -20,6 +20,9 @@ pub mod windows_wlan;
 #[cfg(windows)]
 pub mod windows_qos;
 
+#[cfg(windows)]
+pub mod windows_gpu_priority;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 

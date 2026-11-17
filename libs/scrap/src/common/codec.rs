@@ -99,6 +99,21 @@ pub trait EncoderApi {
     fn small_vbv(&self) -> bool {
         false
     }
+
+    /// Virtual framerate (roadmap M7, option `nvenc-nominal-fps` > 0): this nvenc encoder was
+    /// opened at that nominal frame rate and `set_fps` rescales its bitrate to the frame rate the
+    /// loop runs at. False for every other encoder and with the option at 0.
+    fn virtual_fps(&self) -> bool {
+        false
+    }
+
+    /// Virtual framerate: the loop runs at `fps` from now on. FFmpeg nvenc rescales its bitrate
+    /// to bitrate × clamp(nominal / fps, 0.5, 4), so its per-frame budget is bitrate / fps, with
+    /// the IDR-free reconfigure of patch 0009; the NVENC SDK driver reconfigures its frame rate.
+    /// No restart. False: not applied (no virtual framerate, or the encoder refused it).
+    fn set_fps(&mut self, _fps: u32) -> bool {
+        false
+    }
 }
 
 pub struct Encoder {
@@ -1032,6 +1047,28 @@ pub fn nvenc_vbv_frames() -> i32 {
             .parse::<i32>()
             .unwrap_or(0)
             .clamp(0, 60)
+    }
+    #[cfg(not(windows))]
+    0
+}
+
+/// Host option `nvenc-nominal-fps` (Windows): the frame rate nvenc encoders (FFmpeg VRAM/RAM and
+/// the NVENC SDK driver) are opened at, with their bitrate rescaled to the running frame rate
+/// (`EncoderApi::set_fps`, roadmap M7). 0 (default, also for anything unparsable) keeps today's
+/// open at 30 fps without rescaling; other values are clamped to 10-120. Read when an encoder is
+/// created.
+pub fn nvenc_nominal_fps() -> u32 {
+    #[cfg(windows)]
+    {
+        use base::config::keys::OPTION_NVENC_NOMINAL_FPS;
+        match Config::get_option(OPTION_NVENC_NOMINAL_FPS)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0)
+        {
+            0 => 0,
+            v => v.clamp(10, 120),
+        }
     }
     #[cfg(not(windows))]
     0

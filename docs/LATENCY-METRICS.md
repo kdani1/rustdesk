@@ -47,7 +47,7 @@ percentiles). `n/a` means no sample in the window.
 ### Host
 
 ```
-LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0
+LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=… sleep=… sent=149 skipped=0 idle=12 send_slow=0 age=… kbps=8130 set_kbps=4096 maxf=61234 key=1 keymax=61234 qchg=1 qchg_key=0 gap=n/a pacing=deadline reanchor=0 rkey=0 rkept=0 rmerge=0 refine=0 vfps=0 vfchg=0 gpuprio=off
 ```
 
 | Field | Meaning |
@@ -64,7 +64,7 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `idle` | iterations where the capturer had no new image within its wait (`spf`, or for DXGI with `pacing=deadline` ceil(`spf`) + 2 ms): static screen. On moving content it must stay about 0. |
 | `age` | Windows DXGI capture only: how old the image was when `AcquireNextFrame` returned it, QPC now minus the frame's `LastPresentTime` (the time DWM presented it), p50/p95/max ms over the frames in `sent`/`skipped`. A sawtooth (p50 low, p95/max close to `spf`) means the loop samples the desktop out of phase with presents. `n/a` with GDI, magnifier, portable-service and camera capture, and on other platforms (no present time). |
 | `kbps` | encoder output: bytes of all encoded frames of the window × 8 / window length. Repeat encodes and frames no connection took (`skipped`) are counted too: it is what the encoder produced, compare it with `set_kbps`. |
-| `set_kbps` | the bitrate the encoder was last set to (`encoder.bitrate()`, kbps; at capture start and after each `set_quality`). With NVENC opened at 30 fps and run at 60 fps, `kbps` ≈ 2 × `set_kbps` is expected (`vram.rs`, framerate 30). |
+| `set_kbps` | the bitrate the encoder was last set to (`encoder.bitrate()`, kbps; at capture start and after each `set_quality`): the QoS bitrate. With NVENC opened at 30 fps and run at 60 fps, `kbps` ≈ 2 × `set_kbps` is expected (`vram.rs`, framerate 30). With the virtual framerate (`vfps` > 0) NVENC itself runs at `set_kbps` × clamp(nominal / `vfps`, 0.5, 4), and `kbps` ≈ `set_kbps` is expected under full motion. |
 | `maxf` | largest encoded frame of the window, bytes |
 | `key` | key frames encoded in the window |
 | `keymax` | largest key frame of the window, bytes (0 when none) |
@@ -77,10 +77,13 @@ LATENCY server display=0 fps=29.8 spf=33ms grab=… encode=… wait=… send=…
 | `rkept` | how many of `rkey` were encoded from the kept last image because the screen was static (no new capture within min(2 × `spf`, 100 ms) of the request): VRAM re-encodes its NV12 surface (`encode_last`), YUV encoders the kept YUV buffer |
 | `rmerge` | refreshes that did not get a key frame of their own: merged into a key frame that was already requested, or deferred because a key frame went out less than 200 ms before (they get the next one; never dropped) |
 | `refine` | static refine (on with `nvenc-vbv-frames` > 0 when the running encoder is FFmpeg nvenc, the one that gets the VBV): re-encodes of the kept last image after a key frame or a large frame (> 2 × the running average size) once the screen stayed unchanged for 150 ms, at most 3 per such frame, one per loop iteration. They are in `kbps`, `maxf` and `key`, not in `sent`, and they give no `wait` sample (neither do `rkept` key frames), so `wait` compares the same captured frames whether refine is on or off. |
+| `vfps` | Windows host, virtual framerate (`nvenc-nominal-fps` > 0, nvenc encoders only): the frame rate the encoder's bitrate is scaled for at the end of the window, the QoS fps cap, or with `nvenc-fps-from-send-rate=Y` the encoded frames per second kept between half the cap and the cap. 0: off (option 0, another encoder, or the encoder refused a rate and was reset to `nvenc-nominal-fps`). When the encoder refuses a rate and also the reset to nominal (in practice only the NVENC SDK driver, whose Reconfigure can fail), it keeps the last applied value, the rate the encoder is stuck at, until the capture restarts; a warning `virtual fps: ... stays at N fps until restart` marks this. Either way later cap changes are not applied until the capture restarts. |
+| `vfchg` | how often `vfps` changed in the window (each one is an IDR-free nvenc reconfigure with the next frame) |
+| `gpuprio` | Windows host (roadmap M17): what this capture loop's start applied. `off`: neither `enable-host-gpu-priority` nor `enable-host-dwm-mmcss` was `Y` (also on other platforms). `gpu`: GPU priority on and in effect (process class `high`/`above_normal`/`held`/`kept:…`, or `SetGPUThreadPriority` on the capture device returned success); `gpu-failed`: the option is on but neither took effect. `dwm`: `DwmEnableMMCSS(TRUE)` succeeded (or was already on); `dwm-failed`: the option is on but the call failed or is unavailable. Both options on: the parts joined by `+` (`gpu+dwm`, `gpu-failed+dwm`, `gpu+dwm-failed`, `gpu-failed+dwm-failed`). Labels A/B windows; the return codes are in the `LATENCY server gpu_priority` line of the same capture start (below). |
 
 `age`, `kbps`, `maxf`, `key`, `keymax`, `qchg`, `qchg_key`, `reanchor`, `rkey`, `rkept`,
-`rmerge` and `refine` are only counted while logging is on, like the other fields; `set_kbps` is
-kept always.
+`rmerge`, `refine` and `vfchg` are only counted while logging is on, like the other fields;
+`set_kbps` and `vfps` are kept always.
 
 Not covered: the re-encode of the last image that non-latency-free encoders
 (mediacodec, videotoolbox) do on idle iterations.
@@ -121,8 +124,10 @@ three are off by default in this build.
   created). nvenc `rc_buffer_size` = N × bitrate / encoder frame rate, at open and after every
   bitrate change (FFmpeg's nvenc reconfigure re-applies it; patch 0009 keeps that free of an
   IDR). The encoder frame rate is the one NVENC was opened with: 30 on the VRAM and RAM paths
-  today, while the loop runs at up to 60, so N = 1 is one NVENC frame budget, about two real
-  frames at 60 fps (until the encoder is opened at the real frame rate). `ldkfs` is left at
+  with `nvenc-nominal-fps` at 0, while the loop runs at up to 60, so N = 1 is one NVENC frame
+  budget, about two real frames at 60 fps. With the virtual framerate (`nvenc-nominal-fps` > 0)
+  the bitrate in that formula is the rescaled one and the frame rate the nominal one, so N = 1
+  is one real frame of the QoS bitrate at `vfps` (inside the 0.5-4 clamp). `ldkfs` is left at
   NVENC's default (1 with `tune=ull`). Turns static refine on for FFmpeg nvenc encoders: the two
   only go on together (roadmap M14); another encoder (VP9/AV1, AMF, QSV, the NVENC SDK driver)
   gets neither.
@@ -130,6 +135,39 @@ three are off by default in this build.
   `nvenc-vbv-frames` is then ignored; any other value changes nothing, refine is on exactly when
   the running encoder got the VBV of `nvenc-vbv-frames` > 0; read when an encoder is created):
   see `refine` above.
+
+### Host: virtual framerate (roadmap M7)
+
+Windows host, server options, off by default in this build.
+
+- **`nvenc-nominal-fps`** (number; empty or `0` = today: nvenc opens at 30 fps and its bitrate
+  is not rescaled; other values are clamped to 10-120, `60` is the intended one; read when an
+  encoder is created). FFmpeg nvenc (VRAM and RAM paths) and the NVENC SDK driver open at this
+  frame rate. NVENC's CBR budgets bitrate / frame rate per frame, so the capture loop tells the
+  encoder the frame rate it runs at (`vfps`) and FFmpeg nvenc sets its bitrate to the QoS
+  bitrate × clamp(nominal / `vfps`, 0.5, 4): the per-frame budget is QoS bitrate / `vfps` and
+  the real bitrate follows the QoS bitrate. FFmpeg's nvenc reconfigure applies it with the next
+  frame, free of an IDR with patch 0009 (so an fps change needs no restart; `vfchg` counts them).
+  The NVENC SDK driver reconfigures its real frame rate instead. The 4× clamp bounds the scale
+  relative to the current QoS bitrate, which itself moves with every QoS ratio change after open;
+  so the result is also capped at the larger of 4× the opened bitrate and the QoS bitrate (HEVC
+  level limits: the virtual framerate never asks for more than 4× the opened bitrate unless QoS
+  alone already does). Below nominal / 4 fps, or when that cap applies, the stream stays under
+  the QoS bitrate. AMF, QSV, VP8/VP9/AV1 are unchanged. The price: at 60 fps a frame gets
+  half the bits it gets today at the same quality setting, so text after typing or scrolling is
+  softer (check `maxf` and the picture).
+- **`nvenc-fps-from-send-rate`** (`Y`; read when the capture loop starts; only with
+  `nvenc-nominal-fps` > 0). `vfps` is the number of frames encoded in the last second (the
+  `check_qos` window, refines and kept-image key frames included) instead of the QoS fps cap,
+  kept between half the cap and the cap. It rises with the next window, falls only after two
+  windows in a row, and changes under 10 % or of 1 fps are ignored; a cap change applies at once.
+  A sparse desktop (typing) then keeps today's bits per frame at a 60 fps cap (`vfps` 30), full
+  motion gets the QoS bitrate, and the first second of motion after an idle screen is at most 2×
+  the QoS bitrate (today's steady state at 60 fps).
+
+Gate for turning it on (roadmap M7): `kbps` / `set_kbps` about 1.0 at 60 fps under motion, no
+`LATENCY switch` on an fps change, text sharpness and `maxf` while typing and scrolling, Wi-Fi
+`wait` p95 compared with option 0, and `new encoder:` still showing the VRAM encoder.
 
 Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL]`, `[FFMPEG_VRAM_ENC]` or `[FFMPEG_RAM_ENC]`):
 
@@ -140,6 +178,9 @@ Log lines (always, not gated by `enable-latency-log`; hwcodec lines carry `[UTIL
 | `forced IDR gave no key frame, forced keyframes off` | a forced key frame came out without the key flag (`refresh_no_key` follows): forced key frames are reported unsupported for encoders of that name until the host process restarts, so this line comes at most once per process and name, and later refreshes restart at once (`refresh_unsupported`) |
 | `[FFMPEG] avg bitrate change: a -> b` / `[FFMPEG] vbv buffer size change: a -> b` | with `nvenc-vbv-frames` > 0, FFmpeg's own nvenc reconfigure lines for the first 8 such messages in the process: the proof that a bitrate change re-applies the VBV |
 | `static refine on` | the capture loop starts with static refine |
+| `[FFMPEG_VRAM_ENC] hevc_nvenc virtual framerate: opened at 60 fps, runs at 30, bit_rate … for … kbps` (or `[FFMPEG_RAM_ENC]`) | once per nvenc encoder, the first virtual-framerate rescale: the opened frame rate, the running one, the bitrate set in bit/s and the QoS bitrate. Also turns on FFmpeg's `avg bitrate change` lines (above) for the next 8 reconfigures |
+| `virtual fps: <service> encoder runs at N fps (cap C)` | the capture loop applied the virtual framerate the first time after an encoder was created |
+| `virtual fps: <service> encoder refused N fps, off until restart` | `set_fps` failed (should not happen with FFmpeg nvenc; the NVENC SDK driver's reconfigure can fail); the encoder keeps the bitrate it had, `vfps` becomes 0 |
 | `refresh: this encoder has no forced key frame, switch` | `refresh_unsupported` |
 
 ### Host: capture restarts, connection loop, transport
@@ -294,6 +335,457 @@ so a forced refresh key frame always reaches the socket; its `gap` (`refresh_key
 when the capture loop hands the frame to the connections, before the writer's queue, as the
 whole stream's gap ends before the loop's video branch.
 
+### Host: fast bitrate estimator, shadow mode (roadmap M15)
+
+Server option `enable-fast-abr-shadow`: on Windows **on** unless `N` (it only logs); on other
+platforms off unless `Y`, so they behave as before by default. Each
+authorized remote-control or camera connection runs a delay-based congestion estimator
+(`src/server/video_qos/fast.rs`) and logs the bitrate it would give the shared encoder. It
+changes nothing the host sends: the existing TestDelay controller still sets the bitrate and
+the fps. Created when a connection is authorized while the option is on; `N` stops it within
+a second (back on: within a second for a connection that has one, else from the next one),
+and once no connection has it on the capture loop's wait is the old one again (300 ms slices,
+no stall reports).
+Cost while on: per video write two clock reads and two short, uncontended locks (the estimator's),
+an evaluation at most every 50 ms over at most 2 s of frames, and with the meter one
+`SIO_TCP_INFO` call per 50 ms.
+
+Inputs, per connection:
+
+- every video frame write: when the capture loop queued it, when its write began and ended,
+  its encoded bytes, its display. From the connection's video branch, or from the writer
+  task when the session is split (`enable-split-session-io`);
+- the TCP meter of the session socket, when `enable-tcp-meter` gives one (M11): a reading
+  (`SIO_TCP_INFO`) at most every 50 ms, taken after a write, a stall report or the 1 s timer.
+  With the estimator on, the meter samples even with `enable-latency-log` off;
+- the capture loop: while any connection runs an estimator, the loop waits for slow
+  connections in slices of 2 frame periods (20-300 ms) instead of 300 ms, and once it has
+  waited max(3 frame periods, 50 ms) it reports the connections that have not taken the
+  frame (`on_send_stall`) after every slice. With no estimator the wait is as before;
+- once per second: the encoder's configured bitrate, fps, the floor and ceiling QoS allows
+  (`min_ratio`, the latest quality), whether ABR is on (`in_vbr_state`).
+
+What it computes, every 50 ms (on those events; a stall report always evaluates):
+
+- **Units.** Rates are measured: `r_send` (bytes written into the socket per second, from the
+  meter; unmetered: bytes the capture loop queued) and `r_acked` (bytes TCP delivered:
+  `BytesOut - BytesRetrans - BytesInFlight` deltas; unmetered: bytes whose write ended), over
+  500 ms. `k` is an EWMA of measured / configured bitrate over seconds in which the encoder
+  ran at 80 % of its fps or more and used its budget: a sample above `k` comes in with weight
+  0.5, one between 0.8 x `k` and `k` with 0.2; one under 0.8 x `k` is content-limited (typing,
+  a static screen: the encoder undershoots) and is not learned from (`k_rej`); it only lets
+  `k` drift down 1 % (never below the sample), so a real change of the coupling is followed
+  slowly. While `k` drifts so the target is not clamped to the ceiling. A second in which the
+  configured bitrate changed (a fast cut, another viewer's, the backstop) gives no sample at
+  all: its rate belongs to two settings. The target is kept in
+  measured kbps and
+  `would_set_kbps = target / k` is the configured bitrate it would set. So nvenc's frame-rate
+  coupling (30-fps budget at 60 fps) and the virtual framerate (M7) do not skew it.
+- **Queue `Q`** (ms), the largest of: the newest frame's delay from queue to write end above
+  its 10 s minimum (held for 200 ms; a frame over 2x the average size is allowed its excess
+  bytes at the best delivery rate seen), the age of a write in progress, and with the meter
+  `RTT - MinRTT` and the unsent backlog beyond one average frame at the delivery rate.
+- **Threshold.** `T_hi` = clamp(2.5 x p95 of `Q` seen in NORMAL over 10 s, 30, 150) ms
+  (60 until 20 samples), recomputed once per second; `T_lo` = `T_hi` / 3.
+- **States** (`st=N/H/O/S/R` counts evaluations):
+  - `S` SEVERE: a stall report of 200 ms or more (never for `ack=1` connections), once per
+    stall episode: the capture loop reports the same unfetched frame after every slice, and
+    the reports until this connection's next write ends are one episode (an outage of any
+    length is halved once). When that write ends a HOLD starts, so the queue the episode left
+    is not cut again; only fresh frames showing a shortfall after it cut. Only the capture
+    loop's report triggers it, because a connection's own task is blocked in the write.
+  - `R` RECEIVER: meter v1, the sender was receive-window limited more than half of the last
+    100 ms while `RTT - MinRTT` < `T_lo`: the viewer does not read; never a cut.
+  - `O` OVERUSE: the link is not paused, `Q` stayed above `T_hi` all through the last 100 ms
+    (minimum of the step function; a write pending since before the window counts with its
+    age), and the queue grows now or has stood above `T_hi` for 500 ms without draining
+    (metered: `r_acked` over 1.05 x `r_send` drains it, a cut took effect, so a standing
+    queue is not cut again on every hold while it goes; unmetered rates are equal by
+    construction, unchanged). Grows: metered, TCP
+    delivered under 0.95 x what was written over the last 100 ms; unmetered, a write was in
+    progress for 80 % of the last 250 ms or more over at least 3 writes, or the last 3 or more
+    frames' delays rose by 5 ms and ended above `T_lo`. Paused: metered, under 1500 bytes
+    delivered in the last 100 ms; unmetered, one write blocked for 100 ms with no other one
+    ending. A Wi-Fi airtime pause thus never cuts (a long one is SEVERE through the capture
+    loop); a capacity drop does.
+  - `N` NORMAL: p90 of `Q` over 500 ms below `T_lo`, no write older than `T_lo`.
+  - `H` between the thresholds.
+- **Decisions** (only with `elig=yes`):
+  - cut on OVERUSE: max(floor, 0.5 x target, min(0.9 x target, 0.85 x `r_acked`));
+  - severe: max(floor, 0.5 x target);
+  - rto: after an RTO episode (meter), judged once on delivery and send from the meter
+    reading that showed it on (never on the outage that caused it), over at least 300 ms and
+    not while the link is paused: if delivery stayed under 0.85 x send, max(floor, 0.5 x
+    target, 0.85 x that delivery). Otherwise, not judged within 1 s, seen within 500 ms after
+    a cut (the same episode), or covered by a cut while watched, it is ignored (`rto_ign`);
+  - after any cut a HOLD of max(250 ms, 2 x srtt) in which no other cut is made (`held`), so
+    a stall report and the write's own end do not cut one queue twice. A cut of under 3 % (at
+    the floor) is not made (`floor`);
+  - increase: after 1 s in NORMAL, not app-limited (frames under 0.7 x fps, or `r_send` over
+    1 s under 0.7 x target), at most every 500 ms: x1.08 per second below 0.9 x `C`, else
+    +max(150 kbps, 2 %) per second, never above the ceiling. `C` (`c_kbps`) is the EWMA (0.3)
+    of `r_acked` at cuts; OVERUSE within 10 s of reaching 0.9 x `C` lowers it by 10 %, and a
+    target 15 % above `C` forgets it (the link got better). App-limited (light content, the
+    link is not probed): increases only undo cuts, after 3 s in NORMAL and with frames in the
+    last second, at most back to the target before the cuts and not past `C`, without
+    reaching or forgetting `C` (`app_incs`). So a cut does not stay for as long as the content
+    stays light (the TestDelay loop raised then too), and the target never climbs past what
+    was in place before on unused budget. A quality change forgets the level to restore;
+  - a user quality change sets the target to the new ceiling and forgets `C`.
+- **Eligible** (`elig`): `yes`, or why not: `ctx` (no encoder context yet), `vbr` (ABR off or
+  an encoder that cannot change bitrate), `ack` (the viewer acks frames, `video_ack_required`:
+  the capture loop's wait includes the network round trip; its stall reports are counted but
+  never SEVERE), `multi` (frames from more than one display in the last 2 s: one shared ratio,
+  several encoders), `br` (no bitrate stored yet), `init` (target not set yet: after 1 s at
+  full frame rate, or 3 s).
+
+In shadow mode the encoder keeps the old controller's bitrate, so after a cut the estimator
+does not see the effect of its own decision: under a lasting shortfall it keeps cutting every
+HOLD down to the floor, and recovers from there. Read the first cut of an episode (`react_ms`)
+and the false-cut rate, not the depth.
+
+```
+FASTABR shadow conn=5 ack=0
+FASTABR shadow conn=5 kind=cut from_kbps=11755 to_kbps=5877 would_set_kbps=5877 k=1.00 q_ms=148.5 t_hi_ms=30 r_send=8000 r_acked=6104 react_ms=100 fc=0 meter=1 skipped=0
+LATENCY fast conn=5 mode=shadow live=- elig=yes state=N meter=1 ack=0 k=0.97 set_kbps=4804 stream_kbps=4804 target_kbps=5120 would_set_kbps=5278 floor_kbps=1442 ceil_kbps=4804 c_kbps=- r_send_1s=4650 r_send=4700 r_acked=4690 app_lim=0 q=0.1/0.4/3.2 t_hi_ms=30 st=95/3/0/0/0 cuts=0 severe=0 rto=0 rto_ign=0 incs=4 held=0 floor=0 fc=0 stalls=0 react_max_ms=0 k_rej=0 applied=0 refused=0 resync=0 fps_cap=60/-
+```
+
+The `mode`, `live`, `stream_kbps`, `applied`, `refused`, `resync` and `fps_cap` fields, and
+the live-mode lines, are described under "Host: fast bitrate adaptation live" below.
+
+| Line / field | Meaning |
+|---|---|
+| `FASTABR shadow conn= ack=` | once when the estimator starts (`FASTABR live ...` with `enable-fast-abr=Y`); `... on` / `... off` when the options turn it on or off |
+| `FASTABR shadow kind=` | always (not gated by `enable-latency-log`), at most one line per connection per 2 s (`skipped`: decisions not logged since the last line). `cut`, `severe`, `rto`; increases are only counted |
+| `from_kbps` / `to_kbps` | target before and after, measured kbps |
+| `would_set_kbps` | `to_kbps / k`: the encoder bitrate it would set |
+| `k` | measured / configured bitrate |
+| `q_ms` / `t_hi_ms` | queue at the decision, threshold |
+| `r_send` / `r_acked` | over 500 ms, kbps (see Units) |
+| `react_ms` | from the queue first passing `T_hi` (for a blocked write: its start + `T_hi`) to the decision. The roadmap's reaction-time gate: under 200 ms |
+| `fc` | metered only: `1` when `r_acked` >= 0.95 x `r_send` at the cut, the roadmap's false-cut test (gate: at most 1 per 10 min). `-` unmetered: the lock-stepped capture loop makes both rates equal there, so the test says nothing |
+| `meter` | the decision used the TCP meter's rates |
+| `LATENCY fast` | every 5 s per connection with the estimator, with `enable-latency-log=Y` |
+| `elig` / `state` | see above; `state` is the newest one. Live only, `displays`: more than one video service (display or camera) shares the ratio |
+| `set_kbps` | the encoder's configured bitrate now (what the old controller set) |
+| `target_kbps` / `would_set_kbps` | the estimator's target (measured) and what it would configure; `-` before `init` |
+| `floor_kbps` / `ceil_kbps` | the configured range QoS allows |
+| `c_kbps` | learned ceiling `C` (measured), `-` when none |
+| `r_send_1s` | send rate over the last second; `r_send` / `r_acked` the newest 500 ms values |
+| `app_lim` | 1: the stream does not use its target (static screen, encoder undershoot): increases only undo cuts (after 3 s in NORMAL with frames sent, at most to the target before the cuts and `c_kbps`) |
+| `q` | `Q` at every evaluation, p50/p95/max ms |
+| `st` | evaluations per state N/H/O/S/R in the window |
+| `cuts` / `severe` / `rto` / `rto_ign` / `incs` / `held` / `floor` / `fc` | decisions and skipped cuts in the window (see Decisions) |
+| `app_incs` | of `incs`, the ones made while app-limited (they neither reach nor forget `C`) |
+| `stalls` | capture-loop stall reports for this connection |
+| `k_rej` | full-rate seconds whose `k` sample was content-limited (under 0.8 x `k`): not learned from |
+| `react_max_ms` | largest `react_ms` in the window |
+
+Tests (`cargo test latency_fast`): replays of recorded `LATENCY server` windows
+(`src/server/video_qos/tests/fast_traces.txt`: 10 min Wi-Fi at 60 fps, 12 min Wi-Fi at 15-30
+fps, 5 min LAN; each window's frame count and send/wait percentiles become frame writes, so
+these runs are unmetered), and a small fluid model (one sender buffer draining into a link)
+for a capacity step (metered: `react_ms` at most 200, first cut at most 300 ms after the step;
+unmetered: after the send buffer fills), 150 ms airtime pauses every 2 s for 10 min (at most
+1 cut), a 1 s outage (one SEVERE), recovery (at most 8 %/s), receive-window limiting, RTO
+(a 400 ms pause with an RTO in it and full delivery after: no cut), `ack` and multi-display;
+unit tests for one SEVERE per stall episode, the RTO judged on delivery after it, and `k`
+ignoring content-limited seconds. The model is not a TCP model. The thresholds are to be
+calibrated from the `LATENCY fast` / `FASTABR` lines of a week of normal use (roadmap gate),
+with the meter on where possible (`enable-tcp-meter`: without it the send buffer hides the
+queue until it is full). The meter's `unsent` is still unverified on the real link (see TCP
+meter above); the metered backlog term depends on it.
+
+Rollback: `enable-fast-abr-shadow N`.
+
+### Host: fast bitrate adaptation live (roadmap M16)
+
+Server option `enable-fast-abr`: off unless `Y`, on every platform (the estimator works
+without the TCP meter too; the meter only exists on Windows). Read every second by each
+connection that runs an estimator: a connection authorized while `enable-fast-abr=Y` or
+`enable-fast-abr-shadow` is on (on Windows the shadow option is on by default, so every
+connection has one); `N` or empty hands the bitrate back to the TestDelay controller within a
+second. Stock viewers need nothing: the estimator only reads the host's own writes, the TCP
+meter and the capture loop. The viewer part (`enable-fps-cap-split`) is in "Viewer: fps
+control".
+
+What changes with `Y` (`src/server/video_qos.rs` `on_fast`, `src/server/video_qos/fast.rs`):
+
+- **Reports.** After every decision, and once a second without one, a connection's estimator
+  reports to the stream its target in configured kbps (`would_set_kbps`; none while shadow,
+  off or not eligible) and the decision. Kbps and ratio convert through the encoder's own
+  bitrate curve: hwcodec RAM and VRAM encoders (NVENC, AMF, QSV) compute their bitrate
+  non-linearly from the ratio (`HwRamEncoder::calc_bitrate`: x2 for H.264, x1.5 for H.265 up
+  to 2000 kbps of base x ratio, decaying toward x1 above), so the video service hands QoS
+  that curve and a kbps target is inverted on it by bisection. The curve is used only while
+  it reproduces the bitrate the encoder was last set to at its ratio (within 1 %); otherwise,
+  and for vpx/aom (linear), the kbps per unit of ratio come from that last set point.
+  A connection with a target is "fast"; one without, or one the stream cannot take (`vbr`:
+  ABR off or an encoder that cannot change bitrate; `displays`: several video services share
+  the ratio; `br`: no bitrate yet; `epoch`: a quality choice since its last context), drops
+  out of the fast set and is left to the TestDelay loop.
+- **Cut** (`cut`, `severe`, `rto`): the stream's ratio comes down to this connection's target
+  at once (`check_qos` gives it to the encoder before the next frame). A target at or above
+  the stream changes nothing (`lower`); one at the floor neither (`floor`).
+- **Increase**: the ratio rises by the decision's factor (x1.08 per s, or the additive step
+  near the learned ceiling), but never above the lowest target of the fast connections (the
+  "min" policy: one slow viewer holds the stream; refused `min`), at most every 100 ms over
+  all connections (`spacing`), and not while any viewer's TestDelay replies average 150 ms of
+  excess or more (`delay`; as the old loop's own increases. A viewer without an estimator,
+  for example a stock web client acking frames, has no other voice, and a fast one's replies
+  may see a queue past the first hop, as over a relay, that its estimator does not).
+- **Following the stream.** Once a second each estimator lowers its target to what the stream
+  has (`stream_kbps` x `k`) when the stream is more than 3 % lower: another viewer's lower
+  target, a TestDelay backstop cut, or its own refused increase (`resync` counts these). So it
+  raises from the bitrate the encoder really has, not from its own past target.
+- **Quality choice.** Every image-quality message (also a repeated one) bumps an epoch and
+  drops every target: the ratio jumps to the new quality as before, reports made before it
+  are void (`epoch`), and each estimator's next second sets its target to the new ceiling
+  and forgets the learned ceiling `C`.
+- **TestDelay loop beside it**, while any connection is fast: it makes no increase (both
+  call sites, the 3 s periodic adjustment and the reply path); its cuts stay as a backstop but
+  are skipped for 2 s after a fast cut (one queue is not cut twice), with no cooldown started,
+  so a confirmation after that cuts at once (logged `FASTABR backstop cut`).
+- **FPS.** A fast connection's delay replies lower its fps only at the bitrate floor
+  (`min_ratio`, within 2 %) or for a reply with 1 s of excess or more; while the bitrate can
+  still come down, the estimator answers the delay. The probe-timeout brake (a probe
+  outstanding over 2 s) is unchanged, and so are fps increases and the viewers' fps caps
+  (`custom_fps`, `auto_adjust_fps`: the stream runs at the lowest cap, as before; `fps_cap`).
+- **M7 virtual framerate.** With `nvenc-nominal-fps` the encoder's real bitrate follows the
+  configured one at any fps, so `k` is about 1 and an fps change does not move the bitrate.
+  Without it nvenc's real bitrate scales with fps / 30; `k` absorbs it (learned over
+  full-rate seconds), so the estimator still converts in measured units, only slower after an
+  fps change.
+- **Several viewers.** Each connection runs its own estimator; the stream takes the lowest
+  target ("min"). With `enable-primary-viewer-rule=Y` only the primary viewers' targets count
+  (refused `secondary`); see "Host: several viewers, primary viewer rule (roadmap M18)".
+
+Cost: a report locks `VIDEO_QOS` once per decision (at most every 50 ms per connection, in
+practice a few per second) and once per second; nothing per frame.
+
+```
+FASTABR live conn=5 ack=0
+FASTABR live conn=5 kind=cut from_kbps=8120 to_kbps=6730 would_set_kbps=6801 k=0.99 q_ms=61.0 t_hi_ms=30 r_send=7900 r_acked=7918 react_ms=110 fc=1 meter=1 skipped=0 ratio=0.670->0.561
+FASTABR applied conn=5 display=… ratio=0.561 kbps=6801 reaction_ms=126 unlogged=0
+FASTABR backstop cut ratio=0.561->0.393
+LATENCY fast conn=5 mode=live live=on elig=yes state=N … stream_kbps=6801 … applied=3 refused=1 resync=0 fps_cap=60/54
+```
+
+| Line / field | Meaning |
+|---|---|
+| `FASTABR live conn= mode` / `FASTABR shadow conn= mode` | the option changed between shadow and live for this connection |
+| `FASTABR live kind=… ratio=a->b` | the decision line (same fields as in shadow, same 2 s limit) with what the stream did: `ratio=` the ratio before and after, `refused=` why nothing changed (`lower`, `floor`, `min`, `spacing`, `delay`, `epoch`, `displays`, `vbr`, `br`, `user`, `secondary`: not a primary viewer, M18) |
+| `FASTABR applied` | `check_qos` gave a fast cut to the encoder: `ratio`, the encoder's `kbps`, `reaction_ms` from the queue first passing `T_hi` (as `react_ms`) to here, the roadmap's reaction time (gate: 120-200 ms). At most one line per second; `unlogged` counts the cuts since the last line |
+| `FASTABR backstop cut` | the TestDelay loop cut while a connection is fast (outside the 2 s after a fast cut) |
+| `mode` | `live` or `shadow` (in the `LATENCY fast` line) |
+| `live` | what the stream did with the last report: `on` (this connection's target bounds the stream), the reason it does not (`displays`, `vbr`, `br`, `epoch`, `ack`, `multi`, `init`, `ctx`, `off`), `-` in shadow mode |
+| `stream_kbps` | the configured bitrate the stream's ratio stands for now (`set_kbps` is the encoder's, up to a frame behind) |
+| `applied` / `refused` | this connection's decisions the stream applied / did not apply in the window |
+| `resync` | seconds the target came down to the stream's bitrate |
+| `fps_cap` | this viewer's `custom_fps` / `auto_adjust_fps` caps as the host holds them, `-` when not sent. A fork viewer with `enable-fps-cap-split` sends its decode limit as the second one |
+
+Tests (`cargo test latency_fast_live`): `on_fast` (cut at once, increases bounded by the
+lowest target and spaced, no increase while a viewer shows delay, the TestDelay loop as
+backstop with the 2 s suppression and the fps hold, quality epoch, refusals), the estimator's
+report and its following of a lower stream, and a closed loop on the fluid model where the
+encoder follows the estimator (4 Mbps step under 8 Mbps: first cut within 300 ms, at most 4
+cuts, never under 2 Mbps; back at 8 Mbps within 25 s after the step ends).
+
+Gate (roadmap M16): a capacity step with `New-NetQosPolicy -PolicyStore ActiveStore` (at least
+2 Mbps, removed twice; check that it acts on the live connection), shadow vs live in the same
+session: `reaction_ms`, peak `wait`/`send` and recovery time improve; on Wi-Fi, cuts per minute
+no more than in shadow mode.
+
+Rollback: `enable-fast-abr` empty or `N` (shadow again), or also `enable-fast-abr-shadow N`.
+
+### Host: several viewers, primary viewer rule (roadmap M18)
+
+Server option `enable-primary-viewer-rule`: Windows hosts, off unless `Y` (other platforms
+ignore it). Read once per second by the QoS tick (`VideoQoS::tick_primary`, run from each
+capture loop's per-second `update_display_data`); `N` or empty restores the "min over all
+viewers" rule within a second. Stock viewers need nothing: the rule uses only what the host
+already sees (their input, their writes, their TestDelay replies). Code:
+`src/server/video_qos/primary.rs` (gate, policy), `src/server/video_qos.rs` (`apply_primary`
+and the filters below), `src/server/video_service.rs` (wait, key frames),
+`src/server/key_refresh.rs` (`on_lag_key`), `src/server/connection.rs` (gate, input, control).
+
+- **Primary set**, every second: the connections with control (keyboard permission on a
+  remote-control session: not view-only, not camera) whose viewer sent mouse, key or touch
+  input the host took within the last 30 s. When none qualifies, every connection is primary
+  and the rule changes nothing but the fps floor below. A new connection is not primary while
+  another one is primary by input (its first second's start-up guard does not hold the
+  stream at 15 fps).
+- **What only primary viewers steer:** the stream's fps (the minimum of their delay-driven fps,
+  their start-up guard) and fps cap (their `custom_fps` / `auto_adjust_fps`); the TestDelay
+  ratio loop (their delay and confirmed reductions; a secondary viewer's reply never triggers
+  a cut); fast mode (M16) cuts and increases (a secondary viewer's estimator is refused
+  `secondary`, and its target does not bound increases); the quality: the latest image-quality
+  choice among the primary viewers (a secondary viewer's choice applies only when no primary
+  viewer made one; when the primary set changes the quality, the ratio jumps to it as on a
+  quality choice). A secondary viewer's own fps cap is not enforced per connection: it gets
+  the stream's frames, bounded by the LAGGING queue below.
+- **Fps floor for viewer requests** (roadmap open question 5; the same floor as the viewer's
+  gentle fps control, M5): while the rule is on, a `custom_fps` lower than the one the viewer
+  logged in with (stock viewers halve it under decode load) counts as at least min(login
+  value, 24). Only the login options' `custom_fps` is the reference (a viewer sends one there
+  only at "custom" image quality); without one it is 30, so a Balanced-quality stock viewer's
+  first reduction (15) counts as 24. This protects the other viewers from a loaded stock viewer even when it is
+  primary, at the cost of sending that viewer more frames than it decodes. A user who lowers
+  the fps on a stock viewer mid-session gets the same floor. `auto_adjust_fps` (a fork
+  viewer's decode limit with `enable-fps-cap-split`) is taken as it is.
+- **LAGGING**, only while someone is primary by input, only for secondary connections: a
+  second counts as behind when the connection's video queue reached 3 unwritten frames of a
+  display at some enqueue, it dropped frames, its TestDelay probe has been out past 2 s, its
+  replies confirm a queue (the same confirmation that cuts the bitrate for a primary viewer),
+  or its fast estimator's target is below 0.6 x the stream's. 2 behind seconds in a row make
+  it LAGGING; 5 clean seconds in a row end it.
+- **Left behind.** The capture loop waits for a LAGGING connection's fetch of a frame at most
+  one frame period (`wait_done`: it waits as before for everyone else, then gives the LAGGING
+  ones the rest of `spf`), so one slow viewer no longer holds capture for up to 3 s.
+- **Bounded queue, drop to key frame** (`VideoGate::on_enqueue`, on the capture thread): when a
+  frame of a display is enqueued for a LAGGING connection that still has 3 unwritten frames of
+  that display, that frame and every following delta frame of the display are dropped for
+  this connection until a key frame, which passes and ends the run. A dropped frame counts as
+  fetched at once. Works with and without split session I/O (M12): the count drops when the
+  frame is written, by the connection loop or the writer task.
+- **Key frames.** While any connection drops to a key frame of a display, its capture loop
+  forces one (M13 forced key frame, kept image on a static screen) at most once per 3 s
+  (`LAG_KEY_INTERVAL`), and not within 200 ms after another key frame or while one is
+  requested. This works without `enable-refresh-keyframe` (which governs viewer refreshes
+  only); these key frames do not count toward that option's escalation to `SWITCH`, nor as
+  refresh key frames in the `LATENCY` counters. An encoder that refuses a forced key frame is
+  restarted once (`SWITCH` reason `lag_key_unsupported`; its first frame is a key frame) and
+  that display stops dropping and leaving LAGGING connections behind, and is never asked for
+  a lag key frame again, until a viewer refresh's forced key frame (`enable-refresh-keyframe`)
+  is accepted on it, else until the host process restarts. The shared encoder means every
+  viewer of the display gets these key frames. Only a connection the loop still sends to
+  counts: one that switched to another display (or closed this one) keeps its drop run until
+  it gets a key frame of the display or goes, but no longer makes the loop force key frames.
+- **Monitors only.** View-camera connections have no gate (their frames carry the camera index
+  as `display`) and camera capture loops neither leave connections behind nor force lag key
+  frames.
+- **Displays.** A gate tracks displays 0-7; frames of higher display indexes are never dropped
+  and their LAGGING connections are waited for as before.
+
+Cost with the rule off: per video frame and connection one atomic flag test plus one atomic
+add and max (queue count) on the capture thread and one atomic subtract after the write; per
+input event one `Instant::now` and an atomic store; once a second a `Config` read. With the
+rule on, also once a second a lock of the gate registry; per frame a check of the LAGGING set
+(a copy is refreshed only when it changes); while some connection drops to a key frame of a
+display, once the 3 s interval is over, a lock of the gate registry per frame of that display
+until the key frame is requested. The key flag of a frame is only looked at for a
+LAGGING or dropping connection.
+
+```
+PRIMARY rule=on primary=[5] secondary=[7] lagging=[] fps=60 ratio=0.670 quality=Balanced
+PRIMARY rule=on primary=[5] secondary=[7] lagging=[7] fps=60 ratio=0.670 quality=Balanced
+PRIMARY key display=0 dropping=1
+PRIMARY drops conn=7 frames=212 runs=4 peak_queue=3 lagging=true
+PRIMARY rule=off fps=30 ratio=0.670 quality=Balanced
+PRIMARY display=0 encoder has no forced key frame: lagging viewers are no longer dropped to key frames
+PRIMARY display=0 encoder takes forced key frames again
+```
+
+| Line / field | Meaning |
+|---|---|
+| `PRIMARY rule=` | logged when the rule, the primary set or the LAGGING set changes (always, not gated by `enable-latency-log`) |
+| `primary=` / `secondary=` | connection ids that steer the stream / that do not |
+| `lagging=` | the LAGGING connections (left behind by the capture loop, dropped to key frames) |
+| `fps` / `ratio` / `quality` | the stream's fps, bitrate ratio and quality after the change |
+| `PRIMARY key display= dropping=` | the capture loop forced a key frame for connections dropping to one; `dropping` how many of the connections it sends to wait for it (at most one line per 3 s per display) |
+| `PRIMARY drops conn=` | at most every 10 s, per secondary connection that dropped frames since the last line: `frames` dropped, `runs` drop-to-key runs started, `peak_queue` the highest number of unwritten frames seen at an enqueue, `lagging` its state now |
+| `PRIMARY display= encoder has no forced key frame` | warning, once per display: no drop-to-key there any more (until the next line) |
+| `PRIMARY display= encoder takes forced key frames again` | a viewer refresh's forced key frame was accepted on a display marked above: drop-to-key is back on there |
+
+Tests (`cargo test latency_primary`): the gate (drop run to the next key frame, key frames pass
+a full queue, no drop unless LAGGING, counts released when a connection goes, no underflow),
+the primary set, the wait's one-frame grace, LAGGING hysteresis, the fps floor; `VideoQoS`
+with a primary and a secondary viewer (the secondary's delay and cap do not lower the fps, its
+delay does not cut the ratio, its quality choice waits, its fast cut is refused, a new viewer
+is not primary, rule off keeps the minimum); lag key frames never escalate a refresh.
+
+Gate (roadmap M18): Dell (fork, controlling) and Quest (stock) at the same time, only the
+Quest's path throttled (`New-NetQosPolicy ... -IPDstPrefixMatchCondition <Quest IP>`): the
+Dell's fps and `total_to_ui` must not change with the rule on; the Quest's key frames at most
+one per 3 s (`PRIMARY key` lines, Quest `LATENCY` key counts).
+
+Rollback: `enable-primary-viewer-rule` empty or `N`.
+
+### Host: GPU scheduling priority (roadmap M17)
+
+Server options, Windows hosts only, both off unless `Y`, read when a capture loop starts (a
+change applies from the next capture restart, e.g. a reconnect or a codec/display change):
+
+- `enable-host-gpu-priority`: while a capture runs, the server process enables
+  `SeIncreaseBasePriorityPrivilege` on its token and sets its GPU scheduling class with
+  `D3DKMTSetProcessSchedulingPriorityClass` to HIGH (all of its GPU contexts: capture copies,
+  the VRAM conversion, CUDA/NVENC), falling back to ABOVE_NORMAL when HIGH is refused; never
+  REALTIME. The first capture loop raises it, the last one to end restores the class it found.
+  It also calls `IDXGIDevice::SetGPUThreadPriority(7)` on the capture device (the VRAM encoders
+  share it) and tells hwcodec to do the same on D3D11 devices encoders open themselves (FFmpeg's
+  D3D11VA upload device of a RAM nvenc encoder; fork API, `docs/patches/README.md`).
+  Independent of `enable-host-priority-boost` (CPU side: process class, MMCSS "Capture").
+- `enable-host-dwm-mmcss`: `DwmEnableMMCSS(TRUE)` while a capture runs, `FALSE` when the last
+  one ends. Separate so it can be A/B tested alone; the roadmap keeps it only if it measurably
+  helps (it may be a no-op on Windows 11).
+
+Code: `src/platform/windows_gpu_priority.rs`, `libs/scrap/src/dxgi/mod.rs`
+(`set_gpu_thread_priority`), `src/server/video_service.rs` (guard before the encoder opens),
+hwcodec `cpp/common/platform/win/win.cpp` (`ApplyGpuThreadPriority`).
+
+```
+LATENCY server gpu_priority display=0 process=high privilege=ok capture=7:0x00000000 encoder=7 hags=on dwm_mmcss=off
+LATENCY server gpu_priority display=0 off
+LATENCY server gpu_priority released process=restored:normal dwm_mmcss=-
+gpu_priority encoder=hevc_nvenc thread=7 hr=0x00000000
+```
+
+| Field | Meaning |
+|---|---|
+| `display` | the capture loop's display index |
+| `off` | both options off: nothing changed (hwcodec is told 0, its own devices stay at their default). Logged only with `enable-latency-log=Y`, so a host with every option at its default logs as before; the other `gpu_priority` lines are always logged |
+| `process` | the D3DKMT class: `high` (raised), `above_normal(high:<NTSTATUS>)` (HIGH refused, e.g. `0xc0000061` privilege not held; ABOVE_NORMAL set), `failed(...)` (both refused, class unchanged), `kept:<class>` (already HIGH or more, unchanged and not restored), `held` (an earlier capture loop of this process already raised it), `unavailable` (gdi32 lacks the D3DKMT exports), `off` (only `enable-host-dwm-mmcss` is on) |
+| `privilege` | `SeIncreaseBasePriorityPrivilege`: `ok`, `not_held` (the token lacks it: a portable instance under a normal user), `failed(<HRESULT>)`, `-` (not tried: `held` or `off`) |
+| `capture` | `7:<HRESULT>` from `SetGPUThreadPriority(7)` on the capture device, `n/a` for capturers that do not capture through a D3D device in this process (GDI fallback, also after DXGI recovery ran out or with DirectX capture turned off by option; magnifier, portable service, camera), `off` |
+| `encoder` | the GPU thread priority hwcodec gives encoder-owned D3D11 devices opened from now on (7 or 0). Each such device logs its own `gpu_priority encoder=<name> thread=7 hr=<HRESULT>` line (hwcodec log, no `LATENCY` prefix); none when the encoder uses the capture device (VRAM path) |
+| `hags` | hardware-accelerated GPU scheduling from `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` `HwSchMode`: `on` (2), `off` (1), `default` (no value: the system and driver default applies; check Settings > Display > Graphics), `?` |
+| `dwm_mmcss` | `DwmEnableMMCSS(TRUE)` HRESULT, `held` (already on in this process), `unavailable`, `off` |
+| `released` | the last capture loop with the guard ended: `process=restored:<class>` / `restore_failed(<NTSTATUS>)` / `-` (nothing was raised), `dwm_mmcss=<HRESULT of FALSE>` / `-` |
+
+Cost: a few system calls and one registry read per capture start; nothing per frame.
+
+Gate (roadmap M17), on Alza with a GPU-bound game at about 99% GPU (the game's own frame
+counter visible), a 60 fps session from the Dell over LAN, 2-3 minutes per run, the same scene:
+
+1. `enable-host-gpu-priority` empty (baseline), reconnect, play; then `Y`, reconnect, play.
+   Compare from the `LATENCY server` lines (filter by `gpuprio=`: `off` against `gpu`): `encode` p95/max, `grab`
+   p95, `age` p95 and `fps`. Target: encode p95 from the measured 10-16 ms toward ~3 ms
+   (estimate). The game's fps must not drop materially (more than about 5%).
+2. Check the `gpu_priority` line: `process=high` and `capture=7:0x00000000`. With
+   `above_normal(...)` or `privilege=not_held` the run measures less than intended; with
+   `gpuprio=gpu-failed` nothing took effect, so the run is not a GPU-priority run. `capture=n/a`
+   means the capture ran through GDI (the `gdi: true` line): that run measures a different
+   capture path, repeat it with DXGI capture.
+3. Only then `enable-host-dwm-mmcss=Y` on top (same comparison, `gpu` against `gpu+dwm`).
+   Without a measurable gain, leave it off. A DWM-only run is labelled `dwm`.
+4. Note `hags=`: with HAGS on, Sunshine uses REALTIME for NVENC; this build never does. If HIGH
+   shows no effect with HAGS on, a run with HAGS off (owner's setting, reboot) tells whether
+   HAGS is the reason.
+
+Rollback: `enable-host-gpu-priority` (and `enable-host-dwm-mmcss`) empty or `N`, then
+reconnect; the last capture loop restores the process class.
+
+### Host and viewer: KCP send window (roadmap M15)
+
+Server option `kcp-sndwnd`, empty by default: a number of segments, clamped to 32-1024, for
+KCP sessions made after it is set (each end reads its own option; it is sender-side and needs
+no negotiation). KCP's turbo profile uses 1024, and its endpoint stops taking data while
+more than 2 x the window is waiting, so up to about 2048 segments (about 2.4 MB) plus the
+endpoint's 128-entry send channel can queue in front of the link. A smaller window bounds that
+queue (64: about 180 KB), and also caps KCP's throughput at window x MTU per RTT (64 at 50 ms:
+about 14 Mbps). Works with `allow-kcp-congestion-control` or alone. Not done: the bound of the
+128-entry channel and a `kcp_backlog` field need a kcp-sys change (fork). Rollback: empty.
+
 ### Viewer (Rust)
 
 ```
@@ -373,7 +865,7 @@ RACE site=start rule=relay_hold preferred=ok@640 tcp_punch_round=ok@95 winner=UD
 
 ```
 FPSCTL tick_ms=1001 direct=true custom=60 last_auto=54 limited=54 min_decode_fps=60 max_queue_len=0 decision=keep sent=- | d0 rx=60 dec=60 shown=60 skip=0 discard=0 fail=0 queue_len=0 queue_max=1 decode_fps=62 dec_ms=8.1 present_ms=4.2 other_ms=3.8 idle=4 inactive=0 trend=- net+server=3.1/9.0;
-Set fps to 27 (reason=decrease last_auto=Some(54) custom=60 limited=27 min_decode_fps=30 max_queue_len=3 direct=true | d0 …;)
+Set fps to 27 (field=auto reason=decrease last_auto=Some(54) custom=60 limited=27 min_decode_fps=30 max_queue_len=3 direct=true | d0 …;)
 ```
 
 `FPSCTL` is logged every 1 s status tick while `enable-latency-log` = `Y` (not for the
@@ -406,6 +898,20 @@ the default controller):
 
 A refresh request from the controller logs `Refresh display N to reduce delay
 (queue_len=… tolerable=… refresh_times=…)`.
+
+`field` in `Set fps to` (both controllers): how the fps went to the host (roadmap M16). With
+local option `enable-fps-cap-split` (off by default on every platform, `Y` turns it on,
+until the stock host versions in use are checked to cap on tag 28; read when a connection
+starts) and a host of version 1.2.2 or later, `auto`: as `Misc.auto_adjust_fps` (upstream
+tag 28). Hosts since 1.2.2 cap the stream at min(`custom_fps`, `auto_adjust_fps`), so the
+effect is the same as before, but `custom_fps` stays the user's setting and the host can tell
+a decode limit from a user choice (the `fps_cap` field of `LATENCY fast`). Otherwise
+`custom`: as `OptionMessage.custom_fps`, as before (older hosts, which may not handle tag 28,
+always get this). Before the split a user `custom_fps` replaced the controller's limit on the
+host; with it the host would keep the lower auto cap, so a user `custom_fps` above the last
+auto cap sent on the connection is followed by `auto_adjust_fps` = that custom fps, logged
+`Set fps to N (field=auto reason=user-custom)`, and both controllers start again from the
+user's fps as before.
 
 #### Gentle fps control
 
@@ -460,7 +966,7 @@ thread's load, not from the queue peak, which Wi-Fi bursts make large:
 
 ```
 FPSCTL mode=gentle tick_ms=1000 direct=true custom=60 target=43 floor=24 cap=47.9 overload=1/2 calm=0/5 below_floor=0/10 present_low=0/10 since_change_ms=1000 decision=keep sent=- | d0 rx=43 dec=43 shown=41 … net+server=3.1/9.0;| d0 ready=1 busy=0.93 cap=47.9 queue_p50=0 grow=0 big_queue=0 overload=1 present_low=0;
-Set fps to 37 (gentle custom=60 target=43 floor=24 cap=46.0 overload=2/2 … decision=decrease sent=37 direct=true | d0 …;| d0 ready=1 …;)
+Set fps to 37 (field=auto gentle custom=60 target=43 floor=24 cap=46.0 overload=2/2 … decision=decrease sent=37 direct=true | d0 …;| d0 ready=1 …;)
 Refresh display 0 to reduce delay (gentle: queue_max above 30 for 3 ticks, queue_len=41 refresh_times=0)
 Refresh display 0 after queue overflow (refresh_times=1)
 ```

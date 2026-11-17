@@ -692,6 +692,13 @@ fn run(vs: VideoService) -> ResultType<()> {
         log::info!("disable dxgi with option, fall back to gdi");
         c.set_gdi();
     }
+    // GPU scheduling priority for capture and encode (enable-host-gpu-priority, roadmap M17).
+    // Before the encoder is opened: hwcodec reads the priority for devices it creates itself.
+    #[cfg(windows)]
+    let gpu_priority = crate::platform::windows_gpu_priority::HostGpuPriority::acquire(
+        display_idx,
+        |priority| c.set_gpu_thread_priority(priority),
+    );
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     let mut spf = video_qos.spf();
     let mut quality = video_qos.ratio();
@@ -748,7 +755,11 @@ fn run(vs: VideoService) -> ResultType<()> {
             bail!(e);
         }
     }
-    VIDEO_QOS.lock().unwrap().store_bitrate(encoder.bitrate());
+    {
+        let mut qos = VIDEO_QOS.lock().unwrap();
+        qos.store_bitrate_at(encoder.bitrate(), quality);
+        qos.set_bitrate_curve(bitrate_curve(&encoder_cfg));
+    }
     VIDEO_QOS
         .lock()
         .unwrap()
@@ -793,6 +804,8 @@ fn run(vs: VideoService) -> ResultType<()> {
     let (mut second_instant, mut send_counter) = (Instant::now(), 0);
     let mut latency_stats =
         super::latency_stats::LatencyStats::new(vs.source, display_idx, encoder.bitrate());
+    #[cfg(windows)]
+    latency_stats.set_gpu_priority(gpu_priority.label());
     // M13: refreshes served by a forced key frame (enable-refresh-keyframe, read per refresh).
     #[cfg(windows)]
     let mut key_refresh = super::key_refresh::KeyRefresh::default();
@@ -805,6 +818,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     if static_refine.enabled() {
         log::info!("static refine on");
     }
+    // M7: an nvenc encoder opened at `nvenc-nominal-fps` gets its bitrate rescaled to the frame
+    // rate the loop runs at (check_qos).
+    #[cfg(windows)]
+    let mut virtual_fps = encoder.virtual_fps().then(|| {
+        super::virtual_fps::VirtualFps::new(
+            Config::get_option(base::config::keys::OPTION_NVENC_FPS_FROM_SEND_RATE) == "Y",
+        )
+    });
     // Absolute frame deadlines instead of sleeping for the rest of each period (Windows only).
     #[cfg(windows)]
     let deadline_pacing =
@@ -816,6 +837,12 @@ fn run(vs: VideoService) -> ResultType<()> {
     let dxgi_wait_margin =
         deadline_pacing && vs.source.is_monitor() && !last_portable_service_running;
     let mut next_tick = Instant::now();
+    // Primary viewer rule (roadmap M18): the LAGGING connections, and when this run last forced a
+    // key frame for connections dropping to one (the run's first frame is a key frame).
+    let mut lag_cache = super::video_qos::primary::LagCache::default();
+    let no_lagging = HashSet::new();
+    #[cfg(windows)]
+    let mut lag_key_at = Instant::now();
 
     while sp.ok() {
         #[cfg(windows)]
@@ -829,6 +856,9 @@ fn run(vs: VideoService) -> ResultType<()> {
             &mut send_counter,
             &mut second_instant,
             &sp.name(),
+            #[cfg(windows)]
+            &mut virtual_fps,
+            &mut latency_stats,
         )?;
         if quality != quality_before && encoder.support_changing_quality() {
             latency_stats.on_quality(encoder.bitrate());
@@ -880,6 +910,36 @@ fn run(vs: VideoService) -> ResultType<()> {
             let now = Instant::now();
             if key_refresh.take_due(now) {
                 request_refresh_key(&mut encoder, &mut key_refresh)?;
+                if vs.source.is_monitor() {
+                    super::video_qos::primary::set_key_supported(display_idx);
+                }
+            }
+            // Primary viewer rule: connections this loop sends to that drop to a key frame get
+            // one, at most once per LAG_KEY_INTERVAL; never counted as a viewer's refresh.
+            // Monitors only, and never again on an encoder that refused one.
+            let lag_dropping = if vs.source.is_monitor()
+                && super::video_qos::primary::key_on_demand(display_idx)
+                && super::video_qos::primary::key_wanted(display_idx)
+                && now.saturating_duration_since(lag_key_at)
+                    >= super::video_qos::primary::LAG_KEY_INTERVAL
+                && key_refresh.on_lag_key(now)
+            {
+                super::video_qos::primary::dropping_among(
+                    display_idx,
+                    &frame_controller.send_conn_ids,
+                )
+            } else {
+                0
+            };
+            if lag_dropping > 0 {
+                lag_key_at = now;
+                if encoder.request_keyframe() {
+                    key_refresh.on_lag_requested(now);
+                    log::info!("PRIMARY key display={display_idx} dropping={lag_dropping}");
+                } else {
+                    super::video_qos::primary::set_key_unsupported(display_idx);
+                    bail_switch!("lag_key_unsupported");
+                }
             }
             if key_refresh.timed_out(now) {
                 log::warn!(
@@ -1144,9 +1204,9 @@ fn run(vs: VideoService) -> ResultType<()> {
                             }
                         };
                         match key_refresh.on_encoded(encoded, now, true) {
-                            Ok(_) => {
+                            Ok(served) => {
                                 static_refine.on_kept_key();
-                                if !send_conn_ids.is_empty() {
+                                if served && !send_conn_ids.is_empty() {
                                     latency_stats.on_refresh_key_sent(true);
                                 }
                             }
@@ -1255,15 +1315,53 @@ fn run(vs: VideoService) -> ResultType<()> {
 
         let mut fetched_conn_ids = HashSet::new();
         let timeout_millis = 3_000u64;
+        // A fast bitrate estimator runs (enable-fast-abr-shadow): shorter slices, and the
+        // connections that keep the frame waiting are reported to it.
+        let stall_slice = super::video_qos::fast::stall_slice(spf);
+        let stall_after = super::video_qos::fast::stall_threshold(spf);
+        let slice_millis = stall_slice.map_or(300, |d| d.as_millis() as u64);
+        // Primary viewer rule: LAGGING connections are waited for one frame period at most,
+        // where their frames can be dropped to a key frame.
+        let lagging = if vs.source.is_monitor()
+            && super::video_qos::primary::key_on_demand(display_idx)
+        {
+            lag_cache.get()
+        } else {
+            &no_lagging
+        };
+        let mut next_slice = slice_millis;
         let wait_begin = Instant::now();
         while wait_begin.elapsed().as_millis() < timeout_millis as _ {
             if vs.source.is_monitor() {
                 check_privacy_mode_changed(&sp, display_idx, &c)?;
             }
-            frame_controller.try_wait_next(&mut fetched_conn_ids, 300);
+            frame_controller.try_wait_next(&mut fetched_conn_ids, next_slice);
             // break if all connections have received current frame
-            if fetched_conn_ids.len() >= frame_controller.send_conn_ids.len() {
+            let (done, grace_left) = super::video_qos::primary::wait_done(
+                &frame_controller.send_conn_ids,
+                &fetched_conn_ids,
+                lagging,
+                wait_begin.elapsed(),
+                spf,
+            );
+            if done {
                 break;
+            }
+            next_slice = grace_left.map_or(slice_millis, |d| {
+                (d.as_millis() as u64).clamp(1, slice_millis)
+            });
+            if stall_slice.is_some() {
+                let waited = wait_begin.elapsed();
+                if waited >= stall_after {
+                    super::video_qos::fast::on_send_stall(
+                        frame_controller
+                            .send_conn_ids
+                            .iter()
+                            .filter(|id| !fetched_conn_ids.contains(id))
+                            .copied(),
+                        waited,
+                    );
+                }
             }
         }
         latency_stats.on_wait(
@@ -1389,6 +1487,26 @@ fn setup_encoder(
     let use_i444 = Encoder::use_i444(&encoder_cfg);
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
+}
+
+// The encoder's configured kbps for a ratio, as its `set_quality` computes it, for the fast
+// bitrate estimators' conversions (roadmap M16): hwcodec RAM and VRAM encoders are not linear
+// in the ratio. None (vpx, aom): linear. QoS checks the curve against the stored bitrate, so a
+// fallback encoder with another curve is not misread.
+fn bitrate_curve(cfg: &EncoderCfg) -> Option<super::video_qos::BitrateCurve> {
+    match cfg {
+        #[cfg(feature = "hwcodec")]
+        EncoderCfg::HWRAM(c) => {
+            let (name, width, height) = (c.name.clone(), c.width, c.height);
+            Some(Box::new(move |r| HwRamEncoder::bitrate(&name, width, height, r)))
+        }
+        #[cfg(feature = "vram")]
+        EncoderCfg::VRAM(c) => {
+            let (format, width, height) = (c.feature.data_format, c.width, c.height);
+            Some(Box::new(move |r| VRamEncoder::bitrate(format, width, height, r)))
+        }
+        _ => None,
+    }
 }
 
 fn get_encoder_config(
@@ -1839,14 +1957,21 @@ fn check_qos(
     send_counter: &mut usize,
     second_instant: &mut Instant,
     name: &str,
+    #[cfg(windows)] virtual_fps: &mut Option<super::virtual_fps::VirtualFps>,
+    latency_stats: &mut super::latency_stats::LatencyStats,
 ) -> ResultType<()> {
     let mut video_qos = VIDEO_QOS.lock().unwrap();
     *spf = video_qos.spf();
+    let fps_cap = video_qos.fps();
+    let mut measured_fps = None;
+    // Fast mode (roadmap M16): a cut the encoder takes now, for its reaction time.
+    let mut fast_cut = None;
     if *ratio != video_qos.ratio() {
         *ratio = video_qos.ratio();
         if encoder.support_changing_quality() {
             allow_err!(encoder.set_quality(*ratio));
-            video_qos.store_bitrate(encoder.bitrate());
+            video_qos.store_bitrate_at(encoder.bitrate(), *ratio);
+            fast_cut = video_qos.take_fast_cut();
         } else {
             // Now only vaapi doesn't support changing quality
             if !video_qos.in_vbr_state() && !video_qos.latest_quality().is_custom() {
@@ -1859,12 +1984,56 @@ fn check_qos(
         log::info!("switch due to record changed");
         bail_switch!("record");
     }
-    if second_instant.elapsed() > Duration::from_secs(1) {
+    let window = second_instant.elapsed();
+    if window > Duration::from_secs(1) {
+        measured_fps = Some(*send_counter as f64 / window.as_secs_f64());
         *second_instant = Instant::now();
         video_qos.update_display_data(&name, *send_counter);
         *send_counter = 0;
     }
     drop(video_qos);
+    if let Some((conn, onset, unlogged)) = fast_cut {
+        log::info!(
+            "FASTABR applied conn={} display={} ratio={:.3} kbps={} reaction_ms={} unlogged={}",
+            conn,
+            name,
+            *ratio,
+            encoder.bitrate(),
+            onset.elapsed().as_millis(),
+            unlogged
+        );
+    }
+    // Virtual framerate, after the lock: the NVENC SDK driver reconfigures the encoder here.
+    #[cfg(windows)]
+    if let Some(vf) = virtual_fps.as_mut() {
+        if let Some(fps) = vf.next(fps_cap, measured_fps) {
+            let first = vf.applied() == 0;
+            if encoder.set_fps(fps) {
+                vf.on_applied(fps);
+                latency_stats.on_virtual_fps(fps);
+                if first {
+                    log::info!("virtual fps: {name} encoder runs at {fps} fps (cap {fps_cap})");
+                }
+            } else {
+                // Back to neutral before giving up: at the nominal rate FFmpeg nvenc's scale is 1
+                // and the NVENC SDK driver runs at the rate it was opened with, i.e. "off".
+                let applied = vf.applied();
+                let nominal = scrap::codec::nvenc_nominal_fps();
+                if applied == 0 || applied == nominal || (nominal > 0 && encoder.set_fps(nominal)) {
+                    log::warn!("virtual fps: {name} encoder refused {fps} fps, off until restart");
+                    latency_stats.on_virtual_fps(0);
+                } else {
+                    // `vfps` keeps reporting the rate the encoder is stuck at.
+                    log::warn!(
+                        "virtual fps: {name} encoder refused {fps} fps and the reset to {nominal}, stays at {applied} fps until restart"
+                    );
+                }
+                *virtual_fps = None;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (fps_cap, measured_fps, latency_stats);
     Ok(())
 }
 

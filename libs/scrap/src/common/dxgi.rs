@@ -61,6 +61,10 @@ impl TraitCapturer for Capturer {
         self.inner.last_present_age()
     }
 
+    fn set_gpu_thread_priority(&self, priority: i32) -> Option<i32> {
+        self.inner.set_gpu_thread_priority(priority)
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice {
         self.inner.device()

@@ -52,6 +52,9 @@ pub struct VRamEncoder {
     same_bad_len_counter: usize,
     // Opened as FFmpeg nvenc with `nvenc-vbv-frames` > 0 (`small_vbv`).
     small_vbv: bool,
+    // Virtual framerate: the nominal frame rate this nvenc encoder was opened at
+    // (`nvenc-nominal-fps`), 0 when off.
+    nominal_fps: u32,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -68,6 +71,16 @@ impl EncoderApi for VRamEncoder {
                     config.quality,
                 );
                 let gop = config.keyframe_interval.unwrap_or(MAX_GOP as _) as i32;
+                // Virtual framerate, nvenc only (FFmpeg nvenc or the NVENC SDK driver): opened
+                // at the nominal frame rate, the bitrate follows the running one (`set_fps`).
+                // AMF and QSV keep 30.
+                let nvenc = config.feature.vendor == Driver::NV
+                    && matches!(config.feature.driver, Driver::FFMPEG | Driver::NV);
+                let nominal_fps = if nvenc {
+                    crate::codec::nvenc_nominal_fps()
+                } else {
+                    0
+                };
                 let ctx = EncodeContext {
                     f: config.feature.clone(),
                     d: DynamicContext {
@@ -75,7 +88,7 @@ impl EncoderApi for VRamEncoder {
                         width: config.width as _,
                         height: config.height as _,
                         kbitrate: bitrate as _,
-                        framerate: 30,
+                        framerate: if nominal_fps > 0 { nominal_fps as _ } else { 30 },
                         gop,
                     },
                 };
@@ -94,6 +107,7 @@ impl EncoderApi for VRamEncoder {
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
                         small_vbv,
+                        nominal_fps,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -170,6 +184,14 @@ impl EncoderApi for VRamEncoder {
 
     fn small_vbv(&self) -> bool {
         self.small_vbv
+    }
+
+    fn virtual_fps(&self) -> bool {
+        self.nominal_fps > 0
+    }
+
+    fn set_fps(&mut self, fps: u32) -> bool {
+        self.nominal_fps > 0 && fps > 0 && self.encoder.set_framerate(fps as _).is_ok()
     }
 
     fn encode_last(&mut self, ms: i64) -> ResultType<VideoFrame> {

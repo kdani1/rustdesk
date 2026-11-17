@@ -755,6 +755,29 @@ impl Capturer {
         }
     }
 
+    /// `IDXGIDevice::SetGPUThreadPriority(priority)` (-7..7) on the capture device (roadmap
+    /// M17): the duplication copy, rotation and HDR conversion, and with VRAM encoding the
+    /// encoder's conversion on the same device, get ahead of normal-priority GPU work such as a
+    /// game. None without a D3D device or while capturing through GDI (the device is then
+    /// unused), otherwise the HRESULT.
+    pub fn set_gpu_thread_priority(&self, priority: i32) -> Option<HRESULT> {
+        if self.device.is_null() || self.is_gdi() {
+            return None;
+        }
+        unsafe {
+            let mut dxgi_device: *mut IDXGIDevice = ptr::null_mut();
+            let hr = (*self.device.0).QueryInterface(
+                &IID_IDXGIDevice,
+                &mut dxgi_device as *mut *mut _ as *mut *mut _,
+            );
+            if hr < 0 || dxgi_device.is_null() {
+                return Some(hr);
+            }
+            let dxgi_device = ComPtr(dxgi_device);
+            Some((*dxgi_device.0).SetGPUThreadPriority(priority))
+        }
+    }
+
     pub fn device(&self) -> AdapterDevice {
         AdapterDevice {
             device: self.device.0 as _,

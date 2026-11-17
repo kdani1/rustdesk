@@ -200,6 +200,18 @@ pub const OPTION_ENABLE_AUTO_GAME_MODE: &str = "enable-auto-game-mode";
 // priority (on by default: ABOVE_NORMAL process, MMCSS "Capture" for a hardware-encoder video
 // thread). A change applies from the next capture restart.
 pub const OPTION_ENABLE_HOST_PRIORITY_BOOST: &str = "enable-host-priority-boost";
+// Windows host, server option (Config): GPU scheduling priority for capture and encode (roadmap
+// M17). "Y" turns it on; anything else (default) leaves the GPU scheduler alone. While a capture
+// runs: SeIncreaseBasePriorityPrivilege, D3DKMTSetProcessSchedulingPriorityClass(HIGH, never
+// REALTIME; ABOVE_NORMAL when HIGH is refused) for the server process, restored when the last
+// capture ends, and SetGPUThreadPriority(7) on the capture device and on D3D11 devices hwcodec
+// encoders open themselves. Independent of enable-host-priority-boost. Applies from the next
+// capture restart. See docs/LATENCY-METRICS.md ("gpu_priority").
+pub const OPTION_ENABLE_HOST_GPU_PRIORITY: &str = "enable-host-gpu-priority";
+// Windows host, server option (Config): DwmEnableMMCSS(TRUE) while a capture runs (roadmap M17),
+// so DWM composes on MMCSS time. "Y" turns it on; anything else (default) leaves it. Kept apart
+// from enable-host-gpu-priority to A/B it: the roadmap keeps it only if it measurably helps.
+pub const OPTION_ENABLE_HOST_DWM_MMCSS: &str = "enable-host-dwm-mmcss";
 // Windows, on by default: "N" leaves the Wi-Fi driver out of media streaming mode (fewer background
 // scans and power-save stalls). Server option on the host (while video streams), local option on
 // the viewer (while a remote session is open).
@@ -243,6 +255,18 @@ pub const OPTION_NVENC_VBV_FRAMES: &str = "nvenc-vbv-frames";
 // only go on together); "N" turns both off, other values change nothing. Read when the capture
 // loop starts. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_STATIC_REFINE: &str = "enable-static-refine";
+// Windows host, server option (Config): virtual framerate of the nvenc encoders (roadmap M7). A
+// number N > 0 opens nvenc at N fps (clamped to 10-120; 60 is the intended value) and rescales
+// the bitrate to the frame rate the capture loop runs at, bitrate * clamp(N / fps, 0.5, 4), so
+// the real bitrate matches the QoS bitrate; fps changes need no restart. Empty or "0" (default)
+// keeps today's open at 30 fps without rescaling. AMF, QSV and software encoders are unchanged.
+// Read when an encoder is created. See docs/LATENCY-METRICS.md.
+pub const OPTION_NVENC_NOMINAL_FPS: &str = "nvenc-nominal-fps";
+// Windows host, server option (Config): with nvenc-nominal-fps > 0, "Y" takes the running frame
+// rate from the frames encoded in the last second instead of the QoS fps cap, kept between half
+// the cap and the cap: a sparse desktop (typing) keeps today's bits per frame, full motion gets
+// the QoS bitrate. Other values (default): the QoS fps cap. Read when the capture loop starts.
+pub const OPTION_NVENC_FPS_FROM_SEND_RATE: &str = "nvenc-fps-from-send-rate";
 // Viewer, local option: present pacing, "always show the newest frame". Every frame is still
 // decoded, but a stale one is not handed to the UI while a newer one waits; the soft renderer
 // replaces a buffer Flutter has not fetched yet instead of dropping the newer frame. On by
@@ -257,6 +281,14 @@ pub const OPTION_ENABLE_VIEWER_PRESENT_PACING: &str = "enable-viewer-present-pac
 // default elsewhere ("Y" turns it on). Read when a connection starts. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_GENTLE_FPS_CONTROL: &str = "enable-gentle-fps-control";
+// Viewer, local option: send the decode-capacity fps limit as Misc.auto_adjust_fps (upstream
+// tag 28) instead of OptionMessage.custom_fps (roadmap M16), so custom_fps stays the user's
+// setting and the host can tell the two apart. Only to hosts of version 1.2.2 or later, which
+// cap the stream at min(custom_fps, auto_adjust_fps) exactly as at a lower custom_fps; older
+// hosts get custom_fps as before. Same for the legacy and the gentle controller. Off by default
+// on every platform ("Y" turns it on) until the stock host versions in use are checked to cap
+// on tag 28. Read when a connection starts. See docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_FPS_CAP_SPLIT: &str = "enable-fps-cap-split";
 // Windows viewer, local option: "N" leaves the viewer at normal priority (on by default). While a
 // remote-control or camera session is open, its io_loop thread and each display's decoder thread
 // run at THREAD_PRIORITY_ABOVE_NORMAL, and the process at ABOVE_NORMAL_PRIORITY_CLASS (only raised
@@ -306,6 +338,43 @@ pub const OPTION_VIDEO_SNDBUF_KB: &str = "video-sndbuf-kb";
 // next connection; `rustdesk --option enable-split-session-io N` from a terminal session (never
 // split) turns it off. See docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_SPLIT_SESSION_IO: &str = "enable-split-session-io";
+// Host, server option (Config): fast bitrate estimator in shadow mode (roadmap M15). Windows: on
+// unless "N"; other platforms: off unless "Y". Each authorized remote-control or camera
+// connection runs a delay-based congestion estimator fed by its video writes, the TCP meter (when enable-tcp-meter gives one) and the
+// capture loop's wait, and logs the bitrate it would set (`FASTABR` lines, `LATENCY fast` with
+// enable-latency-log). It changes nothing the host sends; while any connection runs it, the
+// capture loop waits for a slow connection in slices of 2 frame periods instead of 300 ms, to
+// report stalls. Created when a connection is authorized; "N" stops it within a second (also
+// the shorter slices and the stall reports, once no connection has it on). See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_FAST_ABR_SHADOW: &str = "enable-fast-abr-shadow";
+// Host, server option (Config): fast bitrate adaptation live (roadmap M16). "Y" turns it on;
+// anything else (default) leaves the bitrate to the TestDelay controller. With "Y" each
+// connection's estimator (the one enable-fast-abr-shadow runs; "Y" runs it even with the shadow
+// option "N") sets the shared encoder's bitrate within 100-200 ms: the stream takes the lowest
+// target over the connections whose estimator is eligible (one display, ABR on, no frame acks),
+// the TestDelay loop no longer raises the bitrate and does not cut within 2 s of a fast cut,
+// and its fps reductions wait for the bitrate floor or 1 s of probe excess. Stock viewers need
+// nothing. Read every second; "N" or empty hands the bitrate back within a second. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_FAST_ABR: &str = "enable-fast-abr";
+// Windows host, server option (Config): the "primary viewer" rule for several viewers of one
+// stream (roadmap M18). "Y" turns it on; anything else (default) keeps the minimum over all
+// viewers. Primary viewers are those with control (keyboard permission on a remote-control
+// session) and input within the last 30 s, or all viewers when none has. Only they set the
+// stream's fps, bitrate and quality; a lowered custom_fps (stock viewers halve it under load)
+// counts as at least min(the viewer's login custom_fps, 24). A non-primary viewer that keeps
+// falling behind (2 s; 5 s clean to leave) is LAGGING: the capture loop waits at most one frame
+// period for it, and with 3 frames unwritten its frames are dropped up to the next key frame,
+// which is forced at most once per 3 s per display (M13 forced key frames). Stock viewers need
+// nothing. Read every second. See docs/LATENCY-METRICS.md ("PRIMARY").
+pub const OPTION_ENABLE_PRIMARY_VIEWER_RULE: &str = "enable-primary-viewer-rule";
+// Host and viewer, server option (Config), empty by default: KCP send window in segments
+// (32..1024; KCP's turbo profile uses 1024). Bounds the queue KCP keeps in front of the link to
+// about 2 x N segments (the endpoint stops taking data above that) instead of about 2048. Applies
+// to KCP sessions made after it is set; together with allow-kcp-congestion-control or alone. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_KCP_SNDWND: &str = "kcp-sndwnd";
 
 // DEFAULT_DISPLAY_SETTINGS, OVERWRITE_DISPLAY_SETTINGS
 pub const OPTION_AUTO_FORWARD_MICROPHONE: &str = "allow-auto-forward-microphone";
@@ -376,6 +445,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_AUTO_GAME_MODE,
     OPTION_ENABLE_VIEWER_PRESENT_PACING,
     OPTION_ENABLE_GENTLE_FPS_CONTROL,
+    OPTION_ENABLE_FPS_CAP_SPLIT,
     OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
     OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
     OPTION_ENABLE_VIEWER_MMCSS,

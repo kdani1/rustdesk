@@ -146,6 +146,14 @@ pub trait TraitCapturer {
         None
     }
 
+    /// Sets the GPU thread priority (-7..7) of the capturer's own D3D device (roadmap M17) and
+    /// returns the HRESULT. `None` for capturers without one in this process (GDI, magnifier,
+    /// portable service, camera).
+    #[cfg(windows)]
+    fn set_gpu_thread_priority(&self, _priority: i32) -> Option<i32> {
+        None
+    }
+
     #[cfg(feature = "vram")]
     fn device(&self) -> AdapterDevice;
 

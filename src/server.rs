@@ -78,6 +78,8 @@ mod service;
 mod latency_stats;
 #[cfg(windows)]
 mod key_refresh;
+#[cfg(windows)]
+mod virtual_fps;
 mod video_qos;
 pub mod video_service;
 

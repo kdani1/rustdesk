@@ -57,6 +57,9 @@ pub struct HwRamEncoder {
     config: HwRamEncoderConfig,
     // Opened as nvenc with `nvenc-vbv-frames` > 0 (`small_vbv`).
     small_vbv: bool,
+    // Virtual framerate: the nominal frame rate this nvenc encoder was opened at
+    // (`nvenc-nominal-fps`), 0 when off.
+    nominal_fps: u32,
 }
 
 impl EncoderApi for HwRamEncoder {
@@ -71,6 +74,13 @@ impl EncoderApi for HwRamEncoder {
                     Self::bitrate(&config.name, config.width, config.height, config.quality);
                 bitrate = Self::check_bitrate_range(&config, bitrate);
                 let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
+                // Virtual framerate, nvenc only: opened at the nominal frame rate, the bitrate
+                // follows the running one (`set_fps`). 0 on other platforms.
+                let nominal_fps = if config.name.contains("nvenc") {
+                    crate::codec::nvenc_nominal_fps()
+                } else {
+                    0
+                };
                 let ctx = EncodeContext {
                     name: config.name.clone(),
                     mc_name: config.mc_name.clone(),
@@ -79,7 +89,11 @@ impl EncoderApi for HwRamEncoder {
                     pixfmt: DEFAULT_PIXFMT,
                     align: HW_STRIDE_ALIGN as _,
                     kbs: bitrate as i32,
-                    fps: DEFAULT_FPS,
+                    fps: if nominal_fps > 0 {
+                        nominal_fps as _
+                    } else {
+                        DEFAULT_FPS
+                    },
                     gop,
                     quality: DEFAULT_HW_QUALITY,
                     rc,
@@ -107,6 +121,7 @@ impl EncoderApi for HwRamEncoder {
                         bitrate,
                         config,
                         small_vbv,
+                        nominal_fps,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -221,6 +236,14 @@ impl EncoderApi for HwRamEncoder {
 
     fn small_vbv(&self) -> bool {
         self.small_vbv
+    }
+
+    fn virtual_fps(&self) -> bool {
+        self.nominal_fps > 0
+    }
+
+    fn set_fps(&mut self, fps: u32) -> bool {
+        self.nominal_fps > 0 && fps > 0 && self.encoder.set_framerate(fps as _).is_ok()
     }
 }
 
@@ -775,4 +798,12 @@ pub fn start_check_process() {
     ONCE.call_once(|| {
         std::thread::spawn(f);
     });
+}
+
+/// GPU thread priority (-7..7; 0 leaves it) for the D3D11 devices hwcodec encoders opened from
+/// now on create themselves (FFmpeg's D3D11VA upload device of a RAM nvenc encoder); the
+/// capturer's device that VRAM encoders share is set by the capture side (roadmap M17). Fork-only
+/// hwcodec API. Windows only in effect.
+pub fn set_encode_gpu_thread_priority(priority: i32) {
+    hwcodec::ffmpeg::set_encode_gpu_thread_priority(priority);
 }

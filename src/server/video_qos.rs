@@ -1,7 +1,12 @@
 use super::*;
 use scrap::codec::{Quality, BR_BALANCED, BR_BEST, BR_SPEED};
+
+/// Fast delay-based congestion estimator: shadow mode (roadmap M15), live (roadmap M16).
+pub(super) mod fast;
+/// Several viewers: the primary viewer rule (roadmap M18); see primary.rs and tick_primary.
+pub(super) mod primary;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -39,6 +44,23 @@ b. 3 seconds timeout => update ratio according to network delay
     with another user's confirmation.
 c. confirmed congestion => decrease ratio at once, when the 3 seconds cooldown allows
 
+fast (enable-fast-abr=Y, roadmap M16; see fast.rs and on_fast):
+    Each connection's estimator reports its target; a connection whose estimator is eligible
+    is "fast". The stream's ratio comes down at once to a fast connection's cut and goes up
+    only as far as every fast connection's target allows (and no viewer's replies show delay).
+    While any connection is fast the TestDelay loop above makes no increase, makes no cut
+    within FAST_SUPPRESS_CUTS of a fast cut, and a fast connection's delay replies lower its
+    fps only at the bitrate floor or at a second of excess. A quality choice voids every
+    target (fast_epoch).
+
+primary (enable-primary-viewer-rule=Y, roadmap M18; see primary.rs and tick_primary):
+    Once per second the primary set is taken: viewers with control and input within 30 s, or
+    every viewer when none qualifies. Only primary viewers count above: the stream's fps (their
+    minimum, their start-up guard), their fps caps, their delay for the ratio, their fast
+    estimators, the latest quality among them. Every viewer's lowered custom_fps counts as at
+    least min(its login custom_fps, 24). A non-primary viewer that keeps falling behind is
+    LAGGING: left behind by the capture loop and dropped to key frames.
+
 delay:
     TestDelay shares the video stream, so it measures the queue in front of it rather
     than the path RTT. The baseline starts at the first reply and follows lower
@@ -65,6 +87,14 @@ const ADJUST_RATIO_INTERVAL: usize = 3; // Adjust quality ratio every 3 seconds
 const DYNAMIC_SCREEN_THRESHOLD: usize = 2; // Allow increase quality ratio if encode more than 2 times in one second
 const DELAY_THRESHOLD_150MS: u32 = 150; // 150ms is the threshold for good network condition
 const RESTORE_GUARD_SAMPLES: u8 = 5; // A restored level that congests this soon is lowered
+
+// Fast mode (roadmap M16): the TestDelay loop makes no cut this soon after a fast cut.
+const FAST_SUPPRESS_CUTS: Duration = Duration::from_secs(2);
+// Fast mode: increases are applied at most this often over all connections.
+const FAST_MIN_SPACING: Duration = Duration::from_millis(100);
+// Fast mode: a fast connection's delay replies lower its fps at this excess even while the
+// bitrate can still come down.
+const FAST_FPS_BRAKE_MS: u32 = 1000;
 
 #[derive(Default, Debug, Clone)]
 struct UserDelay {
@@ -266,18 +296,36 @@ struct UserData {
     delay: UserDelay,
     record: bool,
     joined_at: Option<Instant>, // set by on_connection_open; the start-up guard's clock
+    // Fast mode: the ratio this connection's estimator target stands for; None when it does
+    // not drive the stream (no estimator, shadow, not eligible).
+    fast_ratio: Option<f32>,
+    // The custom_fps of the login options, for the request floor; None: the login options had
+    // none (the viewer's quality is not "custom"), which counts as FPS.
+    login_custom_fps: Option<u32>,
+    // Primary viewer rule: in force (mirrors VideoQoS::primary_rule), and this viewer's state.
+    rule: bool,
+    policy: primary::ConnPolicy,
 }
 
 impl UserData {
     // The frame rate this viewer asked for, from its custom or auto-adjust limit.
     fn fps_cap(&self) -> u32 {
         let mut fps = self.custom_fps.unwrap_or(FPS);
+        // Primary viewer rule: a lowered request counts as at least the floor.
+        if self.rule && self.custom_fps.is_some() {
+            fps = primary::floored_custom_fps(fps, Some(self.login_custom_fps.unwrap_or(FPS)));
+        }
         if let Some(auto_adjust_fps) = self.auto_adjust_fps {
             if fps == 0 || auto_adjust_fps < fps {
                 fps = auto_adjust_fps;
             }
         }
         fps.clamp(MIN_FPS, MAX_FPS)
+    }
+
+    // Steers the stream: the primary viewer rule is off, or this viewer is primary.
+    fn counts(&self) -> bool {
+        !self.rule || self.policy.primary
     }
 }
 
@@ -287,6 +335,10 @@ struct DisplayData {
     support_changing_quality: bool,
 }
 
+/// An encoder's configured bitrate (kbps) for a ratio, as its `set_quality` computes it
+/// (`video_service::bitrate_curve`). None: linear through the last set point.
+pub type BitrateCurve = Box<dyn Fn(f32) -> u32 + Send>;
+
 // Main QoS controller structure
 pub struct VideoQoS {
     fps: u32,
@@ -294,9 +346,28 @@ pub struct VideoQoS {
     users: HashMap<i32, UserData>,
     displays: HashMap<String, DisplayData>,
     bitrate_store: u32,
+    // The ratio `bitrate_store` was set at: kbps per ratio for the fast estimators.
+    bitrate_ratio: f32,
+    // The encoder's own kbps-for-ratio curve (hwcodec: not linear), for the fast estimators.
+    bitrate_curve: Option<BitrateCurve>,
     adjust_ratio_instant: Instant,
     abr_config: bool,
     first_reply_adjusts_ratio: bool, // false on Linux, where it can create vaapi twice
+    // Fast mode: bumped by every quality choice; reports from before it are void.
+    fast_epoch: u32,
+    fast_cut_at: Option<Instant>,
+    fast_change_at: Option<Instant>,
+    // The last applied fast cut: its connection and when its queue began, for the reaction
+    // time logged once the encoder took it (take_fast_cut).
+    fast_cut_pending: Option<(i32, Instant)>,
+    // At most one such log line per second; the cuts not logged since the last one.
+    fast_cut_logged_at: Option<Instant>,
+    fast_cuts_unlogged: u32,
+    // Primary viewer rule (roadmap M18): in force, last tick, last logged state, last drop log.
+    primary_rule: bool,
+    primary_tick_at: Option<Instant>,
+    primary_logged: String,
+    primary_drops_logged_at: Option<Instant>,
     #[cfg(test)]
     test_now: Option<Instant>,
 }
@@ -309,9 +380,21 @@ impl Default for VideoQoS {
             users: Default::default(),
             displays: Default::default(),
             bitrate_store: 0,
+            bitrate_ratio: 0.0,
+            bitrate_curve: None,
             adjust_ratio_instant: Instant::now(),
             abr_config: true,
             first_reply_adjusts_ratio: !cfg!(target_os = "linux"),
+            fast_epoch: 0,
+            fast_cut_at: None,
+            fast_change_at: None,
+            fast_cut_pending: None,
+            fast_cut_logged_at: None,
+            fast_cuts_unlogged: 0,
+            primary_rule: false,
+            primary_tick_at: None,
+            primary_logged: String::new(),
+            primary_drops_logged_at: None,
             #[cfg(test)]
             test_now: None,
         }
@@ -355,9 +438,21 @@ impl VideoQoS {
         }
     }
 
-    // Store bitrate for later use
+    // Store bitrate for later use (tests: at the current ratio)
+    #[cfg(test)]
     pub fn store_bitrate(&mut self, bitrate: u32) {
+        self.store_bitrate_at(bitrate, self.ratio);
+    }
+
+    // Store bitrate for later use, with the ratio the encoder was set to for it.
+    pub fn store_bitrate_at(&mut self, bitrate: u32, ratio: f32) {
         self.bitrate_store = bitrate;
+        self.bitrate_ratio = ratio;
+    }
+
+    // The encoder's bitrate curve (None: linear), set with each new encoder.
+    pub fn set_bitrate_curve(&mut self, curve: Option<BitrateCurve>) {
+        self.bitrate_curve = curve;
     }
 
     // Get stored bitrate
@@ -388,16 +483,225 @@ impl VideoQoS {
     pub fn in_vbr_state(&self) -> bool {
         self.abr_config && self.displays.iter().all(|e| e.1.support_changing_quality)
     }
+
+    // Configured kbps per unit of ratio, from the bitrate the encoder was last set to.
+    fn kbps_per_ratio(&self) -> Option<f32> {
+        let ratio = self.set_ratio();
+        (ratio > 0.0 && self.bitrate_store > 0).then(|| self.bitrate_store as f32 / ratio)
+    }
+
+    // The ratio `bitrate_store` stands for.
+    fn set_ratio(&self) -> f32 {
+        if self.bitrate_ratio > 0.0 {
+            self.bitrate_ratio
+        } else {
+            self.ratio
+        }
+    }
+
+    // The encoder's curve, while it reproduces the bitrate the encoder was last set to at its
+    // ratio (within 1 %): a curve that does not (a clamped or refused bitrate, another
+    // encoder) is not trusted, the last set point's slope is used instead.
+    fn trusted_curve(&self) -> Option<&BitrateCurve> {
+        let curve = self.bitrate_curve.as_ref()?;
+        let ratio = self.set_ratio();
+        if self.bitrate_store == 0 || ratio <= 0.0 {
+            return None;
+        }
+        let at = curve(ratio) as f32;
+        let stored = self.bitrate_store as f32;
+        ((at - stored).abs() <= 0.01 * stored + 1.0).then_some(curve)
+    }
+
+    // The configured kbps the encoder takes for `ratio`.
+    fn kbps_at(&self, ratio: f32) -> Option<f32> {
+        match self.trusted_curve() {
+            Some(curve) => Some(curve(ratio) as f32),
+            None => self.kbps_per_ratio().map(|k| ratio * k),
+        }
+    }
+
+    // The ratio at which the encoder takes `kbps` configured: the curve inverted by bisection
+    // (it is non-decreasing), else linear through the last set point.
+    fn ratio_for_kbps(&self, kbps: f64) -> Option<f32> {
+        let Some(curve) = self.trusted_curve() else {
+            return self.kbps_per_ratio().map(|k| (kbps / k as f64) as f32);
+        };
+        let kbps = kbps.max(0.0);
+        let (mut lo, mut hi) = (0.0f32, BR_MAX * MAX_BR_MULTIPLE);
+        if curve(hi) as f64 <= kbps {
+            return Some(hi);
+        }
+        for _ in 0..32 {
+            let mid = 0.5 * (lo + hi);
+            if (curve(mid) as f64) < kbps {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(hi)
+    }
+
+    /// What connection `id`'s fast estimator (roadmap M15/M16) needs from the shared encoder,
+    /// read once per second: bitrates in configured kbps (the stream's ratio, the floor and the
+    /// ceiling it may take: `min_ratio`, the latest quality), converted at the rate the encoder
+    /// was last set at; `live`: enable-fast-abr=Y.
+    pub fn fast_context(&self, id: i32, live: bool) -> fast::Context {
+        let to_kbps = |r: f32| -> u32 { self.kbps_at(r).map_or(0, |k| k.round().max(0.0) as u32) };
+        let quality = self.latest_quality().ratio();
+        let user = self.users.get(&id);
+        fast::Context {
+            configured_kbps: self.bitrate_store,
+            fps: self.fps(),
+            floor_kbps: to_kbps(self.min_ratio()),
+            ceil_kbps: to_kbps(quality * MAX_BR_MULTIPLE),
+            quality,
+            vbr: self.in_vbr_state() && !self.displays.is_empty(),
+            stream_kbps: to_kbps(self.ratio),
+            epoch: self.fast_epoch,
+            displays: self.displays.len() as u32,
+            live,
+            custom_fps: user.and_then(|u| u.custom_fps).unwrap_or(0),
+            auto_fps: user.and_then(|u| u.auto_adjust_fps).unwrap_or(0),
+        }
+    }
+
+    // Some connection's estimator drives the stream (fast mode, roadmap M16).
+    fn fast_live(&self) -> bool {
+        self.users
+            .values()
+            .any(|u| u.fast_ratio.is_some() && u.counts())
+    }
+
+    /// Fast mode (roadmap M16): connection `id`'s estimator reports its target, and with
+    /// `report.step` a decision. A cut brings the ratio down to this connection's target at
+    /// once; an increase raises it by the decision's factor, at most to the lowest target of
+    /// the fast connections ("min" over viewers), at most every FAST_MIN_SPACING, and not while
+    /// any viewer's TestDelay replies show delay. Within [min_ratio, latest quality]. A report
+    /// without a target, or one the stream cannot take (ABR off, several video services, no
+    /// bitrate yet, a quality choice since), drops the connection from the fast set.
+    pub fn on_fast(&mut self, id: i32, report: fast::Report) -> fast::Applied {
+        use fast::{Applied, Step};
+        let now = self.now();
+        let unusable = if !self.in_vbr_state() || self.displays.is_empty() {
+            Some("vbr")
+        } else if self.displays.len() > 1 {
+            Some("displays")
+        } else if report.epoch != self.fast_epoch {
+            Some("epoch")
+        } else {
+            None
+        };
+        let own = report.set_kbps.and_then(|kbps| self.ratio_for_kbps(kbps));
+        let Some(user) = self.users.get_mut(&id) else {
+            return Applied::Refused("user");
+        };
+        let (Some(_), Some(own), None) = (report.set_kbps, own, unusable) else {
+            user.fast_ratio = None;
+            return match (unusable, own, report.set_kbps) {
+                (Some(why), _, Some(_)) => Applied::Refused(why),
+                (None, None, Some(_)) => Applied::Refused("br"),
+                _ => Applied::Kept,
+            };
+        };
+        user.fast_ratio = Some(own);
+        let Some(step) = report.step else {
+            return Applied::Kept;
+        };
+        // Primary viewer rule: a viewer that is not primary does not steer the stream.
+        if !user.counts() {
+            return Applied::Refused("secondary");
+        }
+        let min = self.min_ratio();
+        let max = (self.latest_quality().ratio() * MAX_BR_MULTIPLE).max(min);
+        let from = self.ratio;
+        let wanted = match step {
+            Step::Cut { .. } if own >= from => return Applied::Refused("lower"),
+            Step::Cut { .. } => own,
+            Step::Increase { factor } => match self.fast_increase(from, factor) {
+                Ok(v) => v,
+                Err(why) => return Applied::Refused(why),
+            },
+        };
+        let to = wanted.clamp(min, max);
+        let increase = matches!(step, Step::Increase { .. });
+        if (increase && to <= from) || (!increase && to >= from) {
+            return Applied::Refused(if increase { "min" } else { "floor" });
+        }
+        self.ratio = to;
+        self.fast_change_at = Some(now);
+        if let Step::Cut { react_ms } = step {
+            self.fast_cut_at = Some(now);
+            let onset = now
+                .checked_sub(Duration::from_micros((react_ms.max(0.0) * 1000.0) as u64))
+                .unwrap_or(now);
+            self.fast_cut_pending = Some((id, onset));
+        }
+        Applied::Ratio { from, to }
+    }
+
+    // Fast mode: the ratio an increase by `factor` from `from` may reach, or why none.
+    fn fast_increase(&self, from: f32, factor: f64) -> Result<f32, &'static str> {
+        if self
+            .fast_change_at
+            .is_some_and(|t| self.since(t) < FAST_MIN_SPACING)
+        {
+            return Err("spacing");
+        }
+        // As the TestDelay loop's own increases: none while any viewer's replies show delay
+        // (a viewer without an estimator has no other voice; a fast one's may see a queue past
+        // the first hop that its estimator does not).
+        if self
+            .users
+            .values()
+            .any(|u| {
+                u.counts() && u.delay.fps.is_some() && u.delay.avg_delay() >= DELAY_THRESHOLD_150MS
+            })
+        {
+            return Err("delay");
+        }
+        let lowest = self
+            .users
+            .values()
+            .filter(|u| u.counts())
+            .filter_map(|u| u.fast_ratio)
+            .fold(f32::INFINITY, f32::min);
+        Ok((from * factor as f32).min(lowest))
+    }
+
+    /// The fast cut the encoder just took (check_qos), for its log line: its connection, when
+    /// its queue began (the reaction time) and the cuts not logged before it. At most one per
+    /// second; the others are only counted.
+    pub fn take_fast_cut(&mut self) -> Option<(i32, Instant, u32)> {
+        let (id, onset) = self.fast_cut_pending.take()?;
+        if self
+            .fast_cut_logged_at
+            .is_some_and(|t| self.since(t) < Duration::from_secs(1))
+        {
+            self.fast_cuts_unlogged += 1;
+            return None;
+        }
+        self.fast_cut_logged_at = Some(self.now());
+        Some((id, onset, std::mem::take(&mut self.fast_cuts_unlogged)))
+    }
 }
 
 // User session management
 impl VideoQoS {
     // Initialize new user session
     pub fn on_connection_open(&mut self, id: i32) {
-        let user = UserData {
+        // Primary viewer rule: a new viewer has given no input yet, so it is primary only while
+        // no viewer is primary by input (the next tick decides).
+        let primary = !self.primary_rule
+            || !self.users.values().any(|u| u.counts())
+            || self.users.values().all(|u| u.counts());
+        let mut user = UserData {
             joined_at: Some(self.now()),
+            rule: self.primary_rule,
             ..Default::default()
         };
+        user.policy.primary = primary;
         self.users.insert(id, user);
         self.abr_config = Config::get_option("enable-abr") != "N";
     }
@@ -420,6 +724,18 @@ impl VideoQoS {
         }
         if let Some(user) = self.users.get_mut(&id) {
             user.custom_fps = Some(fps);
+        }
+    }
+
+    /// The custom_fps of a viewer's login options (before `user_custom_fps` with the same
+    /// value): the reference of the primary viewer rule's request floor. A later custom_fps,
+    /// such as a stock viewer's first fps reduction, never becomes the reference.
+    pub fn user_login_custom_fps(&mut self, id: i32, fps: u32) {
+        if fps < MIN_FPS || fps > MAX_FPS {
+            return;
+        }
+        if let Some(user) = self.users.get_mut(&id) {
+            user.login_custom_fps = Some(fps);
         }
     }
 
@@ -447,10 +763,20 @@ impl VideoQoS {
         };
 
         let quality = Some((hbb_common::get_time(), convert_quality(image_quality)));
+        let before = self.latest_quality();
         if let Some(user) = self.users.get_mut(&id) {
             user.quality = quality;
+            // Primary viewer rule: a non-primary viewer's choice applies only when it is the
+            // stream's (no primary viewer chose one); otherwise it waits until it is primary.
+            if !user.counts() && self.latest_quality() == before {
+                return;
+            }
             // update ratio directly
             self.ratio = self.latest_quality().ratio();
+            // Fast mode: every estimator target was for the old quality.
+            self.fast_epoch = self.fast_epoch.wrapping_add(1);
+            self.fast_cut_pending = None;
+            self.users.values_mut().for_each(|u| u.fast_ratio = None);
         }
     }
 
@@ -481,6 +807,8 @@ impl VideoQoS {
         let mut adjust_ratio = false;
         let mut reduce_bitrate = false;
         if let Some(user) = self.users.get_mut(&id) {
+            // Fast mode: this connection's bitrate follows its estimator.
+            let fast_user = user.fast_ratio.is_some();
             let delay = delay.max(10);
             // The reply closes the outstanding probe, braked or not.
             user.delay.stall_ticks = 0;
@@ -563,7 +891,15 @@ impl VideoQoS {
             fps = user
                 .delay
                 .accelerate_startup(current_fps, fps, user_cap, delay, braked);
+            // Fast mode: while the bitrate can still come down, the estimator answers delay;
+            // the fps drops only for a second of excess (the probe-timeout brake stays too).
+            let excess =
+                delay.saturating_sub(user.delay.rtt_calculator.get_rtt().unwrap_or_default());
+            if fast_user && bitrate_first && excess < FAST_FPS_BRAKE_MS && fps < current_fps {
+                fps = current_fps;
+            }
             reduce_bitrate = bitrate_first
+                && user.counts()
                 && user.delay.needs_bitrate_reduction()
                 && user.delay.replies_after_bitrate_reduction.is_none();
             fps = fps.clamp(MIN_FPS, user_cap);
@@ -648,6 +984,7 @@ impl VideoQoS {
         if let Some(display) = self.displays.get_mut(video_service_name) {
             display.send_counter += send_counter;
         }
+        self.tick_primary();
         self.adjust_fps();
         let abr_enabled = self.in_vbr_state();
         if abr_enabled {
@@ -667,6 +1004,7 @@ impl VideoQoS {
     fn highest_fps(&self) -> u32 {
         self.users
             .values()
+            .filter(|u| u.counts())
             .map(|u| u.fps_cap())
             .min()
             .unwrap_or(FPS)
@@ -675,12 +1013,16 @@ impl VideoQoS {
 
     // Get latest quality settings from all users
     pub fn latest_quality(&self) -> Quality {
-        self.users
-            .iter()
-            .map(|(_, u)| u.quality)
-            .filter(|q| *q != None)
-            .max_by(|a, b| a.unwrap_or_default().0.cmp(&b.unwrap_or_default().0))
-            .flatten()
+        // Primary viewer rule: the latest choice among the primary viewers, if any made one.
+        let latest = |primary_only: bool| {
+            self.users
+                .values()
+                .filter(|u| !primary_only || u.counts())
+                .filter_map(|u| u.quality)
+                .max_by(|a, b| a.0.cmp(&b.0))
+        };
+        latest(true)
+            .or_else(|| latest(false))
             .unwrap_or((0, Quality::Balanced))
             .1
     }
@@ -733,7 +1075,12 @@ impl VideoQoS {
             return;
         }
         // Get maximum delay from all users
-        let max_delay = self.users.iter().map(|u| u.1.delay.avg_delay()).max();
+        let max_delay = self
+            .users
+            .values()
+            .filter(|u| u.counts())
+            .map(|u| u.delay.avg_delay())
+            .max();
         let Some(max_delay) = max_delay else {
             return;
         };
@@ -742,8 +1089,21 @@ impl VideoQoS {
         let reduction = self
             .users
             .values()
+            .filter(|u| u.counts())
             .filter_map(|u| u.delay.ratio_reduction())
             .reduce(f32::min);
+        // Fast mode: the estimators own increases; this loop stays a backstop for cuts, except
+        // right after a fast cut (one queue is not cut twice).
+        if self.fast_live() {
+            let after_fast_cut = self
+                .fast_cut_at
+                .is_some_and(|t| self.since(t) < FAST_SUPPRESS_CUTS);
+            if reduction.is_none() || after_fast_cut {
+                // No cooldown either: a confirmed reduction later is acted on at once.
+                self.reset_send_counters();
+                return;
+            }
+        }
         if reduction.is_none() && max_delay >= DELAY_THRESHOLD_150MS {
             // Elevated but unconfirmed: no change, and no cooldown either, so a
             // confirmation on the next reply is acted on at once.
@@ -809,6 +1169,13 @@ impl VideoQoS {
                 }
             }
         }
+        if self.fast_live() && v.clamp(min, max) < current_ratio {
+            log::info!(
+                "FASTABR backstop cut ratio={:.3}->{:.3}",
+                current_ratio,
+                v.clamp(min, max)
+            );
+        }
         self.ratio = v.clamp(min, max);
         self.reset_send_counters();
         self.adjust_ratio_instant = self.now();
@@ -820,22 +1187,167 @@ impl VideoQoS {
         // Get minimum fps from all users
         let mut fps = self
             .users
-            .iter()
-            .map(|u| u.1.delay.fps.unwrap_or(INIT_FPS))
+            .values()
+            .filter(|u| u.counts())
+            .map(|u| u.delay.fps.unwrap_or(INIT_FPS))
             .min()
             .unwrap_or(INIT_FPS);
 
         // Every viewer inside its first second keeps the stream at INIT_FPS to
         // ensure stability; each viewer carries its own start-up clock.
         if self.users.values().any(|u| {
-            u.joined_at
-                .is_some_and(|joined| self.since(joined).as_secs() < 1)
+            u.counts()
+                && u.joined_at
+                    .is_some_and(|joined| self.since(joined).as_secs() < 1)
         }) {
             fps = fps.min(INIT_FPS);
         }
 
         // Ensure fps stays within valid range
         self.fps = fps.clamp(MIN_FPS, highest_fps);
+    }
+}
+
+// Primary viewer rule (roadmap M18): see primary.rs.
+impl VideoQoS {
+    /// Once per second (every display's capture loop calls update_display_data each second):
+    /// read the option and the connections' gates, take the primary set and the LAGGING
+    /// connections. With the rule off and not in force before, only the option is read.
+    fn tick_primary(&mut self) {
+        if self
+            .primary_tick_at
+            .is_some_and(|t| self.since(t) < Duration::from_millis(900))
+        {
+            return;
+        }
+        self.primary_tick_at = Some(self.now());
+        // Unit tests drive apply_primary directly; the host's option and gates stay out.
+        if cfg!(test) {
+            return;
+        }
+        let rule = primary::rule_option();
+        if !rule && !self.primary_rule {
+            return;
+        }
+        let mut infos = primary::take_infos();
+        if !self.primary_rule {
+            // Counters from before the rule was on are not evidence.
+            for i in infos.values_mut() {
+                i.peak = 0;
+                i.dropped = 0;
+                i.runs = 0;
+            }
+        }
+        self.apply_primary(rule, &infos);
+    }
+
+    fn apply_primary(&mut self, rule: bool, infos: &HashMap<i32, primary::GateInfo>) {
+        let quality_before = self.latest_quality();
+        let mut lagging = HashSet::new();
+        self.primary_rule = rule;
+        if rule {
+            let set = primary::primary_set(self.users.keys().copied(), infos);
+            // Someone is primary by control and input; the others may lag.
+            let by_input = set.len() < self.users.len();
+            let stream_ratio = self.ratio;
+            for (id, u) in self.users.iter_mut() {
+                u.rule = true;
+                let is_primary = set.contains(id);
+                if is_primary || !by_input {
+                    u.policy.reset(true);
+                    continue;
+                }
+                u.policy.primary = false;
+                let info = infos.get(id).copied().unwrap_or_default();
+                // Behind the stream: its queue reached the drop level or it is dropping, its
+                // delay probe is out or confirms a queue, or its own estimator wants much less.
+                let behind = info.peak >= primary::LAG_QUEUE_FRAMES
+                    || info.dropped > 0
+                    || u.delay.stall_ticks > 0
+                    || u.delay.needs_bitrate_reduction()
+                    || u
+                        .fast_ratio
+                        .is_some_and(|r| r < primary::LAG_TARGET_SHARE * stream_ratio);
+                u.policy.second(behind, &info);
+                if u.policy.lagging {
+                    lagging.insert(*id);
+                }
+            }
+        } else {
+            for u in self.users.values_mut() {
+                u.rule = false;
+                u.policy.reset(true);
+            }
+        }
+        primary::publish_lagging(&lagging);
+        let quality = self.latest_quality();
+        if quality != quality_before {
+            // The primary viewers' quality choice takes over, as a quality choice does.
+            self.ratio = quality.ratio();
+            self.fast_epoch = self.fast_epoch.wrapping_add(1);
+            self.fast_cut_pending = None;
+            self.users.values_mut().for_each(|u| u.fast_ratio = None);
+        }
+        self.adjust_fps();
+        self.log_primary(&lagging);
+    }
+
+    // One line per change of the rule, the primary set or the LAGGING set; drop counts every
+    // 10 s for the connections that dropped frames.
+    fn log_primary(&mut self, lagging: &HashSet<i32>) {
+        let ids = |f: &dyn Fn(&UserData) -> bool| {
+            let mut v: Vec<i32> = self
+                .users
+                .iter()
+                .filter(|(_, u)| f(u))
+                .map(|(id, _)| *id)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let state = if self.primary_rule {
+            let mut lag: Vec<i32> = lagging.iter().copied().collect();
+            lag.sort_unstable();
+            format!(
+                "rule=on primary={:?} secondary={:?} lagging={:?}",
+                ids(&|u| u.policy.primary),
+                ids(&|u| !u.policy.primary),
+                lag
+            )
+        } else {
+            "rule=off".to_owned()
+        };
+        if state != self.primary_logged {
+            log::info!(
+                "PRIMARY {} fps={} ratio={:.3} quality={:?}",
+                state,
+                self.fps,
+                self.ratio,
+                self.latest_quality()
+            );
+            self.primary_logged = state;
+        }
+        if self
+            .primary_drops_logged_at
+            .is_some_and(|t| self.since(t) < Duration::from_secs(10))
+        {
+            return;
+        }
+        self.primary_drops_logged_at = Some(self.now());
+        let mut drops: Vec<(i32, (u32, u32, u32), bool)> = self
+            .users
+            .iter_mut()
+            .filter_map(|(id, u)| {
+                let lagging = u.policy.lagging;
+                u.policy.take_drops().map(|d| (*id, d, lagging))
+            })
+            .collect();
+        drops.sort_unstable_by_key(|d| d.0);
+        for (id, (frames, runs, peak), lagging) in drops {
+            log::info!(
+                "PRIMARY drops conn={id} frames={frames} runs={runs} peak_queue={peak} lagging={lagging}"
+            );
+        }
     }
 }
 
@@ -1013,8 +1525,10 @@ mod tests {
 
     mod adaptation;
     mod baseline;
+    mod fast_live;
     mod invariants;
     mod jitter;
+    mod primary_rule;
     mod recovery;
     mod robustness;
     mod sim;
