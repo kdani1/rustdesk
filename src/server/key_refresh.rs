@@ -1,6 +1,7 @@
 //! Roadmap M13/M14 bookkeeping of the capture loop (video_service.rs), Windows hosts only:
 //! - `KeyRefresh`: a viewer's RefreshVideo is served by a forced key frame on the running encoder
-//!   instead of a capture restart (`SWITCH`), option `enable-refresh-keyframe`.
+//!   instead of a capture restart (`SWITCH`), option `enable-refresh-keyframe`. A live UDP
+//!   lane's loss repair (`on_lane_key`) gets one too, but never counts as a viewer's refresh.
 //! - `StaticRefine`: after a key frame or a large frame, a screen that stays unchanged gets its
 //!   last image encoded again a few times, option `enable-static-refine` / `nvenc-vbv-frames`.
 //! Pure state, no I/O: the capture loop does the encoding and sending. See
@@ -42,6 +43,17 @@ pub(super) enum RefreshAction {
     Switch(&'static str),
 }
 
+/// What the capture loop does with a live UDP lane's key frame request (`on_lane_key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LaneKey {
+    /// Ask the encoder for a key frame now (`on_lane_requested` once it took the request).
+    Request,
+    /// The key frame already requested or deferred serves it.
+    Merged,
+    /// Within the minimum key interval after the last key frame: ask again later.
+    Wait,
+}
+
 #[derive(Default)]
 pub(super) struct KeyRefresh {
     // A key frame was requested from the encoder and has not come out yet.
@@ -61,8 +73,11 @@ pub(super) struct KeyRefresh {
     // how a user recovers a stalled capturer, which the kept image cannot show.
     kept_served: Option<Instant>,
     // The requested key frame is for connections dropping to one (primary viewer rule, roadmap
-    // M18), not for a viewer's refresh: it does not count toward escalation.
+    // M18) or a live UDP lane's loss repair, not for a viewer's refresh: it does not count
+    // toward escalation.
     lag_only: bool,
+    // A lane's loss repair waits for the requested key frame: its refresh gap ends with it.
+    lane: bool,
 }
 
 impl KeyRefresh {
@@ -120,6 +135,35 @@ impl KeyRefresh {
         self.requested = Some(now);
         self.supported = true;
         self.lag_only = false;
+        self.lane = false;
+    }
+
+    /// A live UDP lane lost frames of this display and asks for a key frame. Unlike a viewer's
+    /// refresh it never escalates to a restart and is never counted toward escalation: lane
+    /// repairs on a lossy link are routine (the lane's own `KF_MAX` ends a lane whose losses
+    /// are sustained).
+    pub(super) fn on_lane_key(&mut self, now: Instant) -> LaneKey {
+        if self.requested.is_some() || self.deferred {
+            if self.lag_only {
+                self.lane = true;
+            }
+            return LaneKey::Merged;
+        }
+        if self
+            .last_key
+            .is_some_and(|last| now.saturating_duration_since(last) < MIN_KEY_INTERVAL)
+        {
+            return LaneKey::Wait;
+        }
+        LaneKey::Request
+    }
+
+    /// The encoder accepted the key frame request of `on_lane_key`.
+    pub(super) fn on_lane_requested(&mut self, now: Instant) {
+        self.requested = Some(now);
+        self.supported = true;
+        self.lag_only = true;
+        self.lane = true;
     }
 
     /// Primary viewer rule (roadmap M18): connections drop frames until a key frame. Whether to
@@ -139,6 +183,7 @@ impl KeyRefresh {
         self.requested = Some(now);
         self.supported = true;
         self.lag_only = true;
+        self.lane = false;
     }
 
     pub(super) fn pending(&self) -> bool {
@@ -147,8 +192,8 @@ impl KeyRefresh {
 
     /// An encoded message (`kept`: encoded from the kept image, not from a captured one). While
     /// a key frame is requested it has to be one: Err with the `SWITCH` reason otherwise.
-    /// Ok(true): this message is the requested key frame of a viewer's refresh (Ok(false) for
-    /// one requested only by `on_lag_requested`).
+    /// Ok(true): this message is the requested key frame of a viewer's refresh or of a lane's
+    /// repair (Ok(false) for one requested only by `on_lag_requested`).
     pub(super) fn on_encoded(
         &mut self,
         encoded: Encoded,
@@ -170,8 +215,8 @@ impl KeyRefresh {
         }
         self.requested = None;
         if std::mem::take(&mut self.lag_only) {
-            // Not a refresh: not counted as one served.
-            return Ok(false);
+            // Not a viewer's refresh: not counted as one served.
+            return Ok(std::mem::take(&mut self.lane));
         }
         self.served.push_back(now);
         if kept {
@@ -318,6 +363,31 @@ mod tests {
         let mut r = KeyRefresh::default();
         r.on_lag_requested(t);
         assert_eq!(r.on_refresh(ms(t, 2)), RefreshAction::Merged);
+        assert_eq!(r.on_encoded(KEY, ms(t, 16), false), Ok(true));
+    }
+
+    // A lane's loss repairs: served by key frames, kept image or not, without ever escalating
+    // a later viewer refresh.
+    #[test]
+    fn latency_lane_key_never_escalates() {
+        let t = Instant::now();
+        let mut r = KeyRefresh::default();
+        r.on_requested(t);
+        assert_eq!(r.on_encoded(KEY, ms(t, 16), false), Ok(true));
+        assert_eq!(r.on_lane_key(ms(t, 50)), LaneKey::Wait);
+        for i in 0..(ESCALATE_COUNT as u64 + 2) {
+            let at = ms(t, 300 + i * 300);
+            assert_eq!(r.on_lane_key(at), LaneKey::Request);
+            r.on_lane_requested(at);
+            assert_eq!(r.on_lane_key(ms(at, 5)), LaneKey::Merged);
+            assert_eq!(r.on_encoded(KEY, ms(at, 100), true), Ok(true));
+        }
+        // Served from the kept image and again later: still no restart.
+        assert_eq!(r.on_refresh(ms(t, 2100)), RefreshAction::Request);
+        // A lane repair merged into a lag key closes its refresh gap with it.
+        let mut r = KeyRefresh::default();
+        r.on_lag_requested(t);
+        assert_eq!(r.on_lane_key(ms(t, 2)), LaneKey::Merged);
         assert_eq!(r.on_encoded(KEY, ms(t, 16), false), Ok(true));
     }
 

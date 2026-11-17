@@ -34,6 +34,8 @@ const ANCHOR_WINDOW: Duration =
 const RTT_SAMPLES: usize = 10;
 // Longer gaps between shown frames are an idle (static) screen, not a stutter.
 const MAX_SHOWN_GAP: Duration = Duration::from_secs(1);
+// A shown gap longer than this is a stutter (`gap50`).
+const STUTTER_GAP: Duration = Duration::from_millis(50);
 
 lazy_static::lazy_static! {
     // Keyed by `stream_key()` of a video thread's queue, so concurrent sessions do not mix.
@@ -236,6 +238,11 @@ struct StreamLatency {
     ui_take: Samples,
     total: Samples,
     shown_gap: Samples,
+    // Shown gaps over `STUTTER_GAP` up to `MAX_SHOWN_GAP`, over `MAX_SHOWN_GAP`, and the
+    // longest one (unclipped), this window.
+    gap50: usize,
+    gap_long: usize,
+    gap_max: Duration,
     seq: u64,
     latest: Option<serde_json::Value>,
 }
@@ -274,6 +281,9 @@ impl StreamLatency {
             ui_take: Default::default(),
             total: Default::default(),
             shown_gap: Default::default(),
+            gap50: 0,
+            gap_long: 0,
+            gap_max: Duration::ZERO,
             seq: 0,
             latest: None,
         }
@@ -411,7 +421,13 @@ impl StreamLatency {
             if let Some(gap) = self.pending_gap.take() {
                 if gap <= MAX_SHOWN_GAP {
                     self.shown_gap.push(gap);
+                    if gap > STUTTER_GAP {
+                        self.gap50 += 1;
+                    }
+                } else {
+                    self.gap_long += 1;
                 }
+                self.gap_max = self.gap_max.max(gap);
             }
             self.pending_gap = self
                 .last_shown
@@ -462,7 +478,7 @@ impl StreamLatency {
             let fmt_rate = |n: usize| rate(n).map_or("n/a".to_owned(), |r| format!("{:.1}", r));
             let skipped = c.decoded.saturating_sub(c.shown);
             let line = format!(
-                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} discard={} dec_fail={} via={}",
+                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} gap50={} gap_long={} gap_max_ms={} discard={} dec_fail={} via={}",
                 self.display,
                 self.codec.map_or("-".to_owned(), |c| c.to_string()),
                 self.gpu_texture,
@@ -487,6 +503,9 @@ impl StreamLatency {
                 format_summary(decode_skip_conv),
                 c.no_output,
                 format_summary(shown_gap),
+                self.gap50,
+                self.gap_long,
+                self.gap_max.as_millis(),
                 c.discarded,
                 c.failed,
                 if self.via.is_empty() { "?" } else { self.via },
@@ -526,6 +545,9 @@ impl StreamLatency {
         self.ui_take.clear();
         self.total.clear();
         self.shown_gap.clear();
+        self.gap50 = 0;
+        self.gap_long = 0;
+        self.gap_max = Duration::ZERO;
         report
     }
 }
@@ -1170,5 +1192,29 @@ mod tests {
         s.on_frame_done(frame(ms(34)), ms(34), false, false, 0);
         assert_eq!(s.shown_gap.0, vec![20_000]);
         assert_eq!(s.pending_gap, Some(Duration::from_millis(14)));
+    }
+
+    #[test]
+    fn latency_shown_gap_counts_stutters_and_long_gaps() {
+        let mut s = StreamLatency::new(0);
+        let t0 = s.base + Duration::from_millis(1000);
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let frame = |at: Instant| DecodedFrame {
+            pts: None,
+            dequeued: at,
+            decode_start: at,
+            decode_end: at,
+            format: CodecFormat::H265,
+            gpu_texture: false,
+            paced: true,
+            no_output: false,
+        };
+        for at in [0, 16, 76, 92, 1292, 1308] {
+            s.on_frame_done(frame(ms(at)), ms(at), false, false, 0);
+        }
+        assert_eq!((s.gap50, s.gap_long), (1, 1));
+        assert_eq!(s.gap_max, Duration::from_millis(1200));
+        let line = s.maybe_report(s.window_start + REPORT_INTERVAL).unwrap();
+        assert!(line.contains(" gap50=1 gap_long=1 gap_max_ms=1200 "), "{line}");
     }
 }

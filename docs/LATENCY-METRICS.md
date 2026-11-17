@@ -130,7 +130,13 @@ three are off by default in this build.
   Refreshes while a key frame is pending merge into it; one that comes less than 200 ms after a
   key frame went out waits for the 200 ms (`rmerge`), once the encoder took a key frame request in
   this run (before that the refresh asks at once, so an encoder without forced key frames restarts
-  without the wait). While a key frame is requested or deferred, the capturer's wait and the
+  without the wait). A live UDP lane's loss repair (the viewer's `UdpVideoFeedback`, the host's
+  tail loss, the end of a lane, an RFI the encoder could not do) is not a viewer refresh: it
+  reaches the capture loop as the `lane_key` service option and gets a forced key frame under
+  the same 200 ms spacing and merging, but never counts toward `refresh_escalated` /
+  `refresh_kept_again` and never escalates to a restart itself (the lane's own sustained-loss
+  rule, 4 in 5 s, ends a lossy lane instead). It still opens and closes a refresh gap (`gap`
+  line, `rkey`). Without `enable-refresh-keyframe=Y` it is a refresh (restart) as before. While a key frame is requested or deferred, the capturer's wait and the
   loop's sleep end at its deadline (kept image, end of the 200 ms), so at a low frame rate the
   kept-image key frame still comes about 100 ms after the request, not after a whole frame
   period. Forced key frame and kept-image encode
@@ -455,8 +461,11 @@ What it computes, every 50 ms (on those events; a stall report always evaluates)
   an encoder that cannot change bitrate), `ack` (the viewer acks frames, `video_ack_required`:
   the capture loop's wait includes the network round trip; its stall reports are counted but
   never SEVERE), `multi` (frames from more than one display in the last 2 s: one shared ratio,
-  several encoders), `br` (no bitrate stored yet), `init` (target not set yet: after 1 s at
-  full frame rate, or 3 s).
+  several encoders), `udp` (the last second's frames went over a live UDP lane and no
+  per-frame feedback is fresh: no congestion signal at all, so the TestDelay loop owns the
+  bitrate; with feedback the lane's frames count in the 1 s rate and frame count, so a cut is
+  undone again), `br` (no bitrate stored yet), `init` (target not set yet: after 1 s at full
+  frame rate, or 3 s).
 
 In shadow mode the encoder keeps the old controller's bitrate, so after a cut the estimator
 does not see the effect of its own decision: under a lasting shortfall it keeps cutting every
@@ -627,7 +636,7 @@ LATENCY fast conn=5 mode=live live=on elig=yes state=N … stream_kbps=6801 … 
 | `FASTABR applied` | `check_qos` gave a fast cut to the encoder: `ratio`, the encoder's `kbps`, `reaction_ms` from the queue first passing `T_hi` (as `react_ms`) to here, the roadmap's reaction time (gate: 120-200 ms). At most one line per second; `unlogged` counts the cuts since the last line |
 | `FASTABR backstop cut` | the TestDelay loop cut while a connection is fast (outside the 2 s after a fast cut) |
 | `mode` | `live` or `shadow` (in the `LATENCY fast` line) |
-| `live` | what the stream did with the last report: `on` (this connection's target bounds the stream), the reason it does not (`displays`, `vbr`, `br`, `epoch`, `ack`, `multi`, `init`, `ctx`, `off`), `-` in shadow mode |
+| `live` | what the stream did with the last report: `on` (this connection's target bounds the stream), the reason it does not (`displays`, `vbr`, `br`, `epoch`, `ack`, `multi`, `udp`, `init`, `ctx`, `off`), `-` in shadow mode |
 | `stream_kbps` | the configured bitrate the stream's ratio stands for now (`set_kbps` is the encoder's, up to a frame behind) |
 | `applied` / `refused` | this connection's decisions the stream applied / did not apply in the window |
 | `resync` | seconds the target came down to the stream's bitrate |
@@ -705,11 +714,18 @@ and the filters below), `src/server/video_service.rs` (wait, key frames),
   refresh key frames in the `LATENCY` counters. An encoder that refuses a forced key frame is
   restarted once (`SWITCH` reason `lag_key_unsupported`; its first frame is a key frame) and
   that display stops dropping and leaving LAGGING connections behind, and is never asked for
-  a lag key frame again, until a viewer refresh's forced key frame (`enable-refresh-keyframe`)
-  is accepted on it, else until the host process restarts. The shared encoder means every
+  a lag key frame again, until a forced key frame (a viewer refresh or a lane repair with
+  `enable-refresh-keyframe`) is accepted on it, or its capture loop opens another kind of
+  encoder (config kind or codec, e.g. VP9 then H265 nvenc). The shared encoder means every
   viewer of the display gets these key frames. Only a connection the loop still sends to
   counts: one that switched to another display (or closed this one) keeps its drop run until
   it gets a key frame of the display or goes, but no longer makes the loop force key frames.
+- **Live UDP lane.** A frame a live lane takes stays counted as unwritten until the lane
+  releases it (sent within its send window, held past 100 ms, dropped), so a LAGGING
+  connection on a lane is dropped to a key frame like one on TCP. A loss repair of such a
+  lane (viewer request, tail loss, lane end) while the connection is LAGGING starts its drop
+  run instead of forcing a key frame itself: the capture loop's lag key (at most one per 3 s)
+  serves it, never a key frame per loss report.
 - **Monitors only.** View-camera connections have no gate (their frames carry the camera index
   as `display`) and camera capture loops neither leave connections behind nor force lag key
   frames.
@@ -744,7 +760,7 @@ PRIMARY display=0 encoder takes forced key frames again
 | `PRIMARY key display= dropping=` | the capture loop forced a key frame for connections dropping to one; `dropping` how many of the connections it sends to wait for it (at most one line per 3 s per display) |
 | `PRIMARY drops conn=` | at most every 10 s, per secondary connection that dropped frames since the last line: `frames` dropped, `runs` drop-to-key runs started, `peak_queue` the highest number of unwritten frames seen at an enqueue, `lagging` its state now |
 | `PRIMARY display= encoder has no forced key frame` | warning, once per display: no drop-to-key there any more (until the next line) |
-| `PRIMARY display= encoder takes forced key frames again` | a viewer refresh's forced key frame was accepted on a display marked above: drop-to-key is back on there |
+| `PRIMARY display= encoder takes forced key frames again` | a forced key frame (refresh or lane repair) was accepted on a display marked above, or its capture loop opened another kind of encoder: drop-to-key is back on there |
 
 Tests (`cargo test latency_primary`): the gate (drop run to the next key frame, key frames pass
 a full queue, no drop unless LAGGING, counts released when a connection goes, no underflow),
@@ -844,7 +860,10 @@ the viewer option `enable-udp-video` is on by default and only acts when a host 
 video still goes over TCP; every Nth frame (`udp-video-shadow-every`, default 2) is also sent
 over UDP, and the viewer only measures it. These lines are logged whenever a lane exists,
 independent of `enable-latency-log` (the lane exists only to measure). Since M20 the window
-lines carry `mode=shadow` after the lane id.
+lines carry `mode=shadow` after the lane id. A live lane (next sections) is a transport: its
+periodic window lines (host and viewer) only appear with `enable-latency-log=Y` on that side
+(a host window with a send error is always logged); the state lines (offer, accepted, active,
+stop, request stop, fallback, handshake failure) always do.
 
 ```
 UDPVIDEO host conn=5 not offered (viewer v1): host option enable-udp-video is "" (live: live, shadow or Y: shadow)
@@ -958,9 +977,11 @@ marker waits for the next video item, so it comes right before the first TCP fra
 displays that get a key frame for their restart on TCP. After a live lane ends the host offers
 again after 30 s and 120 s, then stays on TCP.
 
-Viewer window line, live (`mode=live`): the receive-side fields as in the shadow line (`lost`
-here: 80 ms after a frame's first fragment, above the pacer's 25 ms longest spread of a frame,
-or 5 ms after a later frame completed), plus:
+Viewer window line, live (`mode=live`), logged only with the viewer's `enable-latency-log=Y`
+(live is a transport, not a probe): the receive-side fields as in the shadow line (`lost`
+here: a frame's deadline after its first fragment, or 5 ms after a later frame completed; the
+deadline is 80 ms, at least 160 ms for a key frame, or 1.5 x the frame's bytes at the delivery
+rate of recent complete frames plus 20 ms when that is longer, 400 ms at most), plus:
 
 | Field | Meaning |
 |---|---|
@@ -973,6 +994,9 @@ or 5 ms after a later frame completed), plus:
 | `lost_fixed` | losses a key frame completed in the same poll right behind them repaired (the host's tail loss key frame, typically): no request |
 | `tcp_drop` | TCP frames dropped after the lane ended until a key frame, for displays whose last UDP frames did not all arrive |
 | `acks` | ACK datagrams sent |
+| `slow` | frames declared lost on their deadline while their fragments were still arriving (the last within 20 ms): slow rather than lost. Part of `lost` |
+| `key_lost` | lost frames whose header said key frame (one of their fragments arrived). Part of `lost`; with the host's `keys` the IDR loss ratio |
+| `rx_gap_max_ms` | longest time between two authenticated datagrams from the host in the window |
 
 The viewer asks the host to stop the lane (`request stop`) when a display has no key frame 1 s
 after a loss, frames wait 1 s for ACTIVE or for the SwitchDisplay of their epoch, frames arrive
@@ -1193,7 +1217,7 @@ the congestion while the host's TCP meter `rtt` (`LATENCY tcp`) does not.
 ### Viewer (Rust)
 
 ```
-LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 shown_gap=… discard=0 dec_fail=0 via=TCP
+LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 shown_gap=… gap50=0 gap_long=0 gap_max_ms=34 discard=0 dec_fail=0 via=TCP
 ```
 
 | Field | Meaning |
@@ -1220,6 +1244,7 @@ LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=
 | `decode_skip` | `decode` of the skipped frames that were decoded without output (`DecodeOutput::DecodedNoOutput`, see "Decode without output" below), p50/p95/max ms, `n/a` when there was none. `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
 | `decode_skip_conv` | `decode` of the skipped frames that were converted anyway, p50/p95/max ms, `n/a` when there was none: a frame that turned stale only during its decode, every skipped frame with `enable-viewer-decode-no-output` off, and every skipped frame of a decoder that always outputs (AMF/MFX GPU decoders). Kept apart so `decode_skip` stays a pure no-output time. |
 | `noout` | of the decoded frames, those decoded without output (`DecodeOutput::DecodedNoOutput`), count in the window. Equal to `skip` when every skipped frame was decided before its decode; lower when a frame turned stale only during its decode (the callback is skipped then, the conversion was already done) or the decoder always outputs (AMF/MFX GPU decoders) |
+| `gap50` / `gap_long` / `gap_max_ms` | shown gaps (as `shown_gap`) over 50 ms up to 1 s (stutters), over 1 s (an idle screen or a freeze; a live lane's `UDPVIDEO viewer` `fix_ms` / `request stop` tell which), and the longest one, not clipped at 1 s. Counts per window, so TCP and UDP runs compare as gaps per minute |
 | `shown_gap` | time between two consecutive frames that reached the screen (`to_ui` done → next `to_ui` done; frames counted in `ui_dropped`, and frames a later one replaced (`ui_replaced`), are left out: the gap runs from the frame shown before the replaced one to the replacing one), p50/p95/max ms. A gap is added once the next frame did not replace its frame, so the newest one lands in the next window. Gaps over 1 s (static screen) are left out. Its p95 shows stutter: with pacing on it must not grow in calm use. |
 | `discard` | received frames dropped undecoded, count in the window: `discard_queue` after a refresh request, or evicted by a full 120-deep queue |
 | `dec_fail` | `handle_frame` calls that returned no picture or an error (a frame decoded without output is not one) |

@@ -10,9 +10,10 @@
 //! jitter.
 //!
 //! The pacer only computes when to send; the live sender thread (M20) waits with a [`Waiter`]:
-//! a high-resolution waitable timer on Windows (1803+) for all but the last half millisecond,
-//! then a spin, so the wait between bursts costs little CPU and is not rounded up to the 1 ms
-//! (or 15.6 ms) scheduler tick.
+//! a high-resolution waitable timer on Windows (1803+) for all but the last 150 us, then a
+//! spin, so the wait between bursts costs little CPU and is not rounded up to the 1 ms (or
+//! 15.6 ms) scheduler tick. A wait shorter than [`MIN_WAIT`] is not waited at all: the burst
+//! goes early and the bucket carries the debt into the next wait.
 
 use std::time::{Duration, Instant};
 
@@ -123,8 +124,11 @@ pub struct Waiter {
     timer: Option<win::Timer>,
 }
 
-/// The tail of a wait that is spun rather than slept.
-const SPIN_TAIL: Duration = Duration::from_micros(500);
+/// The tail of a wait that is spun rather than slept (the high-resolution timer is accurate to
+/// well under this).
+const SPIN_TAIL: Duration = Duration::from_micros(150);
+/// A shorter wait is skipped: spinning it would cost a busy core for little spacing.
+pub const MIN_WAIT: Duration = Duration::from_micros(300);
 
 impl Waiter {
     pub fn new() -> Self {
@@ -147,6 +151,9 @@ impl Waiter {
     }
 
     pub fn wait_until(&mut self, deadline: Instant) {
+        if deadline.saturating_duration_since(Instant::now()) < MIN_WAIT {
+            return;
+        }
         #[cfg(windows)]
         if let Some(t) = &self.timer {
             let now = Instant::now();
@@ -307,11 +314,13 @@ mod latency_tests {
         assert!(Instant::now() >= deadline);
         wait_until(Instant::now() - Duration::from_millis(1));
         let mut w = Waiter::new();
-        for us in [200u64, 1_500, 4_000] {
+        for us in [1_000u64, 1_500, 4_000] {
             let deadline = Instant::now() + Duration::from_micros(us);
             w.wait_until(deadline);
             assert!(Instant::now() >= deadline);
         }
+        // Below MIN_WAIT: no wait at all (returns before that deadline unless descheduled).
+        w.wait_until(Instant::now() + Duration::from_micros(100));
         #[cfg(windows)]
         assert!(w.high_resolution());
     }

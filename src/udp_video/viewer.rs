@@ -95,6 +95,9 @@ const FEEDBACK_LOST_MAX: usize = 32;
 /// last one (the key frame or its request may be lost too). Losses in between ask nothing: the
 /// key frame already asked for repairs them. About 2.5x the usual request-to-IDR time on a LAN.
 const KF_RETRY: Duration = Duration::from_millis(250);
+/// A host offers one lane per setup: an offer this soon after the last accepted one is refused,
+/// so a host cannot churn sockets and threads or aim HELLOs at many addresses.
+const OFFER_MIN_GAP: Duration = Duration::from_secs(2);
 /// Live: a frame not complete this long after its first fragment is lost. Above the pacer's
 /// longest spread (`pacing::MAX_SPREAD`, 25 ms) with room for Wi-Fi jitter.
 pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
@@ -186,6 +189,8 @@ pub struct RecvWindow {
     pub pongs: u64,
     pub acks: u64,
     pub recv_errors: u64,
+    /// Longest time between two authenticated datagrams from the host.
+    pub rx_gap_max: Duration,
 }
 
 pub enum ViewerEvent {
@@ -254,7 +259,14 @@ pub struct Accepted {
 }
 
 /// Checks an offer against what this build speaks and the session's own local address.
-pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted, String> {
+/// `session_host`: the host address the session stream reached, when known; the offer must
+/// name that host (it binds the very address the viewer's TCP stream reached), so a host
+/// cannot aim the viewer's datagrams at another address of the viewer's network.
+pub fn check_offer(
+    offer: &UdpVideoOffer,
+    local: SocketAddr,
+    session_host: Option<IpAddr>,
+) -> Result<Accepted, String> {
     if offer.wan {
         return Err("internet lane offered on a LAN check".to_owned());
     }
@@ -264,6 +276,14 @@ pub fn check_offer(offer: &UdpVideoOffer, local: SocketAddr) -> Result<Accepted,
     let local_ip = net::lane_ip(local.ip()).map_err(|e| format!("local address {local}: {e}"))?;
     if local_ip.is_ipv4() != host_ip.is_ipv4() {
         return Err("address families differ".to_owned());
+    }
+    if let Some(session) = session_host {
+        let session = hbb_common::try_into_v4(SocketAddr::new(session, 0)).ip();
+        if session != host_ip {
+            return Err(format!(
+                "host address {host_ip} is not the session's host {session}"
+            ));
+        }
     }
     a.local = local_ip;
     a.host = SocketAddr::new(host_ip, a.host.port());
@@ -465,6 +485,7 @@ fn recv_loop(
         ReassemblyConfig {
             first_frame_id: Some(0),
             frame_timeout: LIVE_FRAME_TIMEOUT,
+            rate_timeout: true,
             ..Default::default()
         }
     } else {
@@ -555,7 +576,11 @@ fn recv_loop(
                 errors_in_row = 0;
                 let res = lane_rx.on_datagram(&mut buf[..n], Instant::now());
                 if res.is_ok() {
-                    last_heard = Instant::now();
+                    let heard = Instant::now();
+                    win.rx_gap_max = win
+                        .rx_gap_max
+                        .max(heard.saturating_duration_since(last_heard));
+                    last_heard = heard;
                 }
                 match res {
                     Ok(Received::HelloAck { lane_id: l }) if l == lane_id && !acked => {
@@ -586,8 +611,9 @@ fn recv_loop(
                     log::warn!("UDPVIDEO viewer recv error: {e}");
                 }
                 if p.live && errors_in_row >= RECV_ERRORS_MAX {
+                    // `e` is in the warning above; the host gets the count only.
                     let _ = tx.send(ViewerEvent::Failed(format!(
-                        "{errors_in_row} receive errors in a row: {e}"
+                        "{errors_in_row} receive errors in a row"
                     )));
                     return;
                 }
@@ -783,6 +809,8 @@ fn keyframe_request(lane_id: u64, display: u8, from: u32, to: u32) -> Message {
 struct Round {
     /// The session stream's local address, when the session may take a lane.
     local: Option<SocketAddr>,
+    /// The host address the session stream reached (direct TCP), when known.
+    lan_host: Option<IpAddr>,
     /// Internet lane (M24): the host's address and the rendezvous server, when the session may
     /// take one.
     wan: Option<WanRound>,
@@ -800,6 +828,10 @@ struct LiveDisp {
     last_req: Option<Instant>,
     /// The first frames lost since `awaiting` (what the requests report).
     lost: (u32, u32),
+    /// Broken when a SwitchDisplay started a new epoch, and no frame of the display came in
+    /// that epoch yet (it may be a display the session left): no key frame requests and no
+    /// watchdog for it until one does.
+    parked: bool,
 }
 
 /// Live: the io_loop's state of a live lane, kept after the client closed until the host's
@@ -846,6 +878,7 @@ impl LiveLane {
                     awaiting: None,
                     last_req: None,
                     lost: (0, 0),
+                    parked: false,
                 });
                 self.displays.len() - 1
             }
@@ -898,6 +931,8 @@ pub struct ViewerLane {
     /// `take_feedback`, the ranges bounded by `FEEDBACK_LOST_MAX`.
     fb_counts: UdpCounts,
     fb_lost: Vec<LostRange>,
+    /// When the last offer of this round was accepted (`OFFER_MIN_GAP`).
+    last_offer: Option<Instant>,
 }
 
 impl ViewerLane {
@@ -905,10 +940,12 @@ impl ViewerLane {
     /// direct TCP (no KCP, no WebRTC, no relay) and encrypted, else None (a LAN offer is
     /// refused). `wan`: what an internet lane needs when the session is direct (KCP too) and
     /// encrypted and the host's address is known, else None (an internet offer is refused).
+    /// `lan_host`: the host address the session stream reached, which a LAN offer must name.
     pub fn begin_round(
         &mut self,
         peer: &str,
         local: Option<SocketAddr>,
+        lan_host: Option<IpAddr>,
         wan: Option<WanRound>,
     ) -> mpsc::UnboundedReceiver<ViewerEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -921,7 +958,13 @@ impl ViewerLane {
         self.fb_lost.clear();
         self.matcher = ShadowMatcher::default();
         self.peer = peer.to_owned();
-        self.round = Some(Round { local, wan, tx });
+        self.last_offer = None;
+        self.round = Some(Round {
+            local,
+            lan_host,
+            wan,
+            tx,
+        });
         rx
     }
 
@@ -962,6 +1005,15 @@ impl ViewerLane {
         let Some(round) = &self.round else {
             return refuse("no session round".to_owned());
         };
+        if self
+            .last_offer
+            .is_some_and(|t| t.elapsed() < OFFER_MIN_GAP)
+        {
+            return refuse(format!(
+                "offer within {} ms of the last one",
+                OFFER_MIN_GAP.as_millis()
+            ));
+        }
         let checked = if offer.wan {
             if !wan_enabled() {
                 return refuse("enable-udp-video-wan is N".to_owned());
@@ -982,7 +1034,7 @@ impl ViewerLane {
             let Some(local) = round.local else {
                 return refuse("session is not direct encrypted TCP".to_owned());
             };
-            check_offer(offer, local)
+            check_offer(offer, local, round.lan_host)
         };
         let a = match checked {
             Ok(a) => a,
@@ -991,6 +1043,7 @@ impl ViewerLane {
         let tx = round.tx.clone();
         self.close("replaced by a new offer");
         self.replace_live();
+        self.last_offer = Some(Instant::now());
         match UdpVideoClient::start(&a, offer.lane_id, tx) {
             Ok((client, bound)) => {
                 log::info!(
@@ -1017,7 +1070,15 @@ impl ViewerLane {
                 }
                 None
             }
-            Err(why) => refuse(why),
+            Err(why) => {
+                // The OS error text stays in this log: the host gets a fixed reason.
+                log::info!(
+                    "UDPVIDEO viewer peer={} lane={:016x} socket setup failed: {why}",
+                    self.peer,
+                    offer.lane_id
+                );
+                refuse("socket setup failed".to_owned())
+            }
         }
     }
 
@@ -1126,6 +1187,9 @@ impl ViewerLane {
             }
             if let Some(epoch) = l.next_epoch.take() {
                 l.epoch = epoch;
+                for d in l.displays.iter_mut() {
+                    d.parked = d.awaiting.is_some();
+                }
                 self.release_held();
             }
         }
@@ -1178,6 +1242,11 @@ impl ViewerLane {
             return;
         }
         let d = l.disp(f.display);
+        if std::mem::take(&mut d.parked) && !f.key && !f.recovery {
+            // The display is still received: it waits for its key frame from now, and asks.
+            d.awaiting = Some(Instant::now());
+            d.last_req = None;
+        }
         if d.awaiting.is_some() && !f.key && !f.recovery {
             self.stats.gated += 1;
             return;
@@ -1267,10 +1336,11 @@ impl ViewerLane {
                 self.client = None;
                 // No READY went out, so the host never went live.
                 self.live = None;
+                // The detail (socket errors among it) stays in this log.
                 Some(control(
                     udp_video_control::Kind::KindRequestStop,
                     lane_id,
-                    &why,
+                    "viewer handshake failed",
                 ))
             }
             ViewerEvent::Frame(f) => {
@@ -1340,6 +1410,7 @@ impl ViewerLane {
         }
         let d = l.displays.iter_mut().find(|d| {
             d.awaiting.is_some()
+                && !d.parked
                 && d.last_req
                     .map_or(true, |t| now.saturating_duration_since(t) >= KF_RETRY)
         })?;
@@ -1381,7 +1452,7 @@ impl ViewerLane {
                 return self.request_stop(&why);
             }
         }
-        let broken = l.displays.iter().find_map(|d| {
+        let broken = l.displays.iter().filter(|d| !d.parked).find_map(|d| {
             d.awaiting
                 .filter(|t| now.saturating_duration_since(*t) >= WATCHDOG)
                 .map(|t| (d.display, now.saturating_duration_since(t)))
@@ -1463,8 +1534,12 @@ impl ViewerLane {
         let d = &w.drops;
         if self.live.is_some() {
             let s = std::mem::take(&mut self.stats);
+            // Live is a transport, not a probe: its window lines only with enable-latency-log.
+            if !crate::client::latency::is_log_enabled() {
+                return;
+            }
             log::info!(
-                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} rp={} fix_ms={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={}",
+                "UDPVIDEO viewer peer={} lane={lane_id:016x} mode=live win_s={:.1} frames={} lost={} gated={} frag_miss={} dgrams={}/{} loss_pct={:.2} reorder={}/{} dup={} late={} bad={} drop={}/{}/{}/{} shown={} held={}/{} stale={} gated_app={} kf_req={} lost_fixed={} tcp_drop={} rp={} fix_ms={} owd_var_ms={} asm_ms={} rtt_ms={} pings={}/{} acks={} rx_err={} fec_rec={} fec_unrec={} fec_shards={} parity={} slow={} key_lost={} rx_gap_max_ms={}",
                 self.peer,
                 w.span.as_secs_f64(),
                 l.frames_completed,
@@ -1504,6 +1579,9 @@ impl ViewerLane {
                 l.fec_unrecoverable,
                 l.fec_shards,
                 l.parity_received,
+                l.frames_slow,
+                l.key_lost,
+                w.rx_gap_max.as_millis(),
             );
             return;
         }
@@ -1579,29 +1657,29 @@ mod latency_tests {
     #[test]
     fn latency_check_offer_rules() {
         let local: SocketAddr = "192.168.1.9:50123".parse().unwrap();
-        let a = check_offer(&offer(), local).unwrap();
+        let a = check_offer(&offer(), local, None).unwrap();
         assert_eq!(a.local, "192.168.1.9".parse::<IpAddr>().unwrap());
         assert_eq!(a.host, "192.168.1.5:40000".parse().unwrap());
         assert_eq!((a.every, a.live, a.timeout, a.fec), (2, false, DEFAULT_TIMEOUT, 0));
         let mut fec_offer = offer();
         fec_offer.fec_percent = 20;
-        assert_eq!(check_offer(&fec_offer, local).unwrap().fec, 20);
+        assert_eq!(check_offer(&fec_offer, local, None).unwrap().fec, 20);
         fec_offer.fec_percent = 900;
-        assert_eq!(check_offer(&fec_offer, local).unwrap().fec, fec::MAX_PERCENT);
+        assert_eq!(check_offer(&fec_offer, local, None).unwrap().fec, fec::MAX_PERCENT);
         let mut live = offer();
         live.mode = udp_video_offer::Mode::ModeLive.into();
         // A live offer of lane v1 (the first M20 host, no EPOCH markers) is refused.
-        assert!(check_offer(&live, local).is_err());
+        assert!(check_offer(&live, local, None).is_err());
         live.version = LIVE_LANE_VERSION;
         live.timeout_ms = 400;
-        let a = check_offer(&live, local).unwrap();
+        let a = check_offer(&live, local, None).unwrap();
         assert_eq!((a.live, a.timeout), (true, Duration::from_millis(400)));
         live.timeout_ms = 50;
-        assert_eq!(check_offer(&live, local).unwrap().timeout, DEFAULT_TIMEOUT);
+        assert_eq!(check_offer(&live, local, None).unwrap().timeout, DEFAULT_TIMEOUT);
         let bad = |f: &dyn Fn(&mut UdpVideoOffer)| {
             let mut o = offer();
             f(&mut o);
-            check_offer(&o, local).is_err()
+            check_offer(&o, local, None).is_err()
         };
         assert!(bad(&|o| o.version = 2));
         assert!(bad(&|o| o.mode = udp_video_offer::Mode::ModeOff.into()));
@@ -1611,8 +1689,13 @@ mod latency_tests {
         assert!(bad(&|o| o.port = 0));
         assert!(bad(&|o| o.port = 70000));
         assert!(bad(&|o| o.max_datagram = 9000));
-        assert!(check_offer(&offer(), "0.0.0.0:1".parse().unwrap()).is_err());
-        assert!(check_offer(&offer(), "[fd00::1]:1".parse().unwrap()).is_err());
+        assert!(check_offer(&offer(), "0.0.0.0:1".parse().unwrap(), None).is_err());
+        assert!(check_offer(&offer(), "[fd00::1]:1".parse().unwrap(), None).is_err());
+        // The offer must name the host the session stream reached.
+        let host = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        assert!(check_offer(&offer(), local, host("192.168.1.5")).is_ok());
+        assert!(check_offer(&offer(), local, host("::ffff:192.168.1.5")).is_ok());
+        assert!(check_offer(&offer(), local, host("192.168.1.1")).is_err());
     }
 
     fn next_event(rx: &mut mpsc::UnboundedReceiver<ViewerEvent>) -> ViewerEvent {
@@ -1767,7 +1850,7 @@ mod latency_tests {
         assert_eq!(a.host, "81.2.3.4:40000".parse().unwrap());
         assert_eq!(a.local, "0.0.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(a.wan.as_deref(), Some("rs.example"));
-        assert!(check_offer(&o, "192.168.1.9:50123".parse().unwrap()).is_err());
+        assert!(check_offer(&o, "192.168.1.9:50123".parse().unwrap(), None).is_err());
         assert!(check_wan_offer(&offer(), &wan).is_err());
         o.max_datagram = 1400;
         assert!(check_wan_offer(&o, &wan).is_err());
@@ -1968,6 +2051,28 @@ mod latency_tests {
         assert!(lane.on_tcp_frame(&tcp(0, true)));
         assert!(lane.on_tcp_frame(&tcp(0, false)));
         assert_eq!(lane.stats.tcp_drop, 1);
+    }
+
+    /// A display broken when a SwitchDisplay starts a new epoch asks for nothing until a frame
+    /// of it comes in that epoch (the session may have left it).
+    #[test]
+    fn latency_viewer_live_switch_parks_a_left_display() {
+        let mut lane = ViewerLane::default();
+        lane.live = Some(LiveLane::new(5));
+        lane.on_control(&ctl(udp_video_control::Kind::KindActive, 0));
+        lane.on_live_frame(live_frame(0, 0, 0, true));
+        lane.live.as_mut().unwrap().disp(0).awaiting = Some(Instant::now() - WATCHDOG);
+        lane.on_control(&ctl(udp_video_control::Kind::KindEpoch, 1));
+        lane.on_switch_display();
+        let now = Instant::now();
+        assert!(lane.next_request(5, now).is_none());
+        // Display 1 is the new one; display 0 stays parked.
+        lane.on_live_frame(live_frame(1, 0, 1, true));
+        assert!(lane.next_request(5, now).is_none());
+        // A P-frame of display 0 in the new epoch: still gated, and now it asks.
+        lane.on_live_frame(live_frame(0, 1, 1, false));
+        assert_eq!(ready_ids(&mut lane), vec![0, 0]);
+        assert!(lane.next_request(5, Instant::now()).is_some());
     }
 
     /// M22: a broken display resumes at a RECOVERY_POINT frame as at a key frame, and the

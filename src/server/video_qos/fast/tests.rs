@@ -1082,3 +1082,68 @@ fn latency_fast_feedback_slow_viewer_is_receiver_limited() {
     assert!(d.iter().all(|d| d.kind == Kind::Increase), "{:?}", d);
     assert_eq!(est.state(), State::Receiver);
 }
+
+// A live UDP lane takes every frame off TCP: the lane's frames (no TCP write) and the viewer's
+// feedback are all the estimator gets. The stream follows the estimator's own target.
+fn lane_run(
+    est: &mut FastEstimator,
+    t: &mut u64,
+    secs: f64,
+    feedback: Option<&dyn Fn(u64) -> FeedbackSample>,
+) -> Vec<Decision> {
+    let mut out = Vec::new();
+    let end = *t + (secs * 1e6) as u64;
+    let mut kbps = est.report(None).set_kbps.unwrap_or(8000.0);
+    while *t < end {
+        *t += 50_000;
+        let n = if (*t / 50_000) % 2 == 0 { 1 } else { 2 };
+        for i in 0..n {
+            let bytes = (kbps * 1000.0 / 8.0 / 30.0) as u32;
+            est.on_lane_frame(*t - 20_000 * i, bytes, 0);
+        }
+        if let Some(fb) = feedback {
+            let mut s = fb(*t);
+            s.at_us = *t;
+            out.extend(est.on_feedback(s));
+        }
+        // The stream takes the estimator's target at once (VideoQoS::on_fast).
+        if let Some(k) = est.report(None).set_kbps {
+            kbps = k;
+        }
+        if *t % 1_000_000 == 0 {
+            out.extend(est.on_second(*t, live_ctx(kbps, kbps)));
+        }
+    }
+    out
+}
+
+#[test]
+fn latency_fast_lane_feedback_cut_then_calm_rises_again() {
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    // Calm: the lane's frames make the stream full, so the estimator may raise, never cut.
+    let d = lane_run(&mut est, &mut t, 4.0, Some(&calm));
+    assert!(d.iter().all(|d| d.kind == Kind::Increase), "{:?}", d);
+    assert_eq!(est.ineligible(), None);
+    let before = est.target().unwrap();
+    let lossy = |_| FeedbackSample {
+        loss: Some(0.2),
+        ..calm(0)
+    };
+    let d = lane_run(&mut est, &mut t, 0.5, Some(&lossy));
+    assert!(d.iter().any(|d| d.kind == Kind::Loss), "{:?}", d);
+    let cut = est.target().unwrap();
+    assert!(cut < 0.95 * before, "{} {}", cut, before);
+    let d = lane_run(&mut est, &mut t, 10.0, Some(&calm));
+    assert!(d.iter().any(|d| d.kind == Kind::Increase), "{:?}", d);
+    assert!(est.target().unwrap() > cut * 1.1, "{:?}", est.target());
+}
+
+#[test]
+fn latency_fast_lane_without_feedback_is_not_eligible() {
+    let mut est = FastEstimator::new(false);
+    let mut t = 0u64;
+    assert!(lane_run(&mut est, &mut t, 4.0, None).is_empty());
+    assert_eq!(est.ineligible(), Some("udp"));
+    assert!(est.report(None).set_kbps.is_none());
+}

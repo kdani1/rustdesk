@@ -343,6 +343,8 @@ struct DispWin {
     newest_at: Option<Instant>,
     /// The newest id a tail loss key frame was already asked for.
     tail_fixed: Option<u32>,
+    /// The tap epoch of the newest id: a display left at a SwitchDisplay gets no tail loss.
+    newest_epoch: u8,
 }
 
 impl DispWin {
@@ -363,12 +365,22 @@ impl DispWin {
         }
         self.newest_at = Some(now);
     }
+
+    /// `on_newest` for a frame of tap epoch `epoch`.
+    fn on_newest_of(&mut self, id: u32, now: Instant, epoch: u8) {
+        self.on_newest(id, now);
+        if self.last_sent == Some(id) {
+            self.newest_epoch = epoch;
+        }
+    }
 }
 
 /// Live mode: the send window and the round trip of the ACKs.
 #[derive(Default)]
 struct Live {
     displays: Vec<DispWin>,
+    /// The tap's epoch (bumped at each SwitchDisplay of the video stream).
+    epoch: u8,
     /// Frames that waited for the window, and how long.
     win_wait: Samples,
     win_timeouts: u64,
@@ -878,7 +890,8 @@ impl VideoTap {
                         shared.qdrop.fetch_add(1, Ordering::Relaxed);
                         shared.qdrop_live.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut live) = shared.live.lock() {
-                            live.disp(display).on_newest(frame_id, Instant::now());
+                            live.disp(display)
+                                .on_newest_of(frame_id, Instant::now(), t.epoch);
                         }
                         // A recovery point that is not sent repairs nothing.
                         if let (Some(r), Some(first_lost)) = (rfi.as_mut(), ended) {
@@ -900,6 +913,13 @@ impl VideoTap {
                 // this one: the viewer bumps its epoch only for a SwitchDisplay after that
                 // marker. Before ACTIVE no marker is needed: ACTIVE carries the bumped epoch.
                 t.epoch = t.epoch.wrapping_add(1);
+                if let TapMode::Live { shared, .. } = &t.mode {
+                    // A display this connection no longer receives must not raise a tail loss
+                    // key frame for its last frame.
+                    if let Ok(mut live) = shared.live.lock() {
+                        live.epoch = t.epoch;
+                    }
+                }
                 if let TapMode::Live {
                     lane_id,
                     announced: true,
@@ -947,6 +967,9 @@ impl VideoTap {
         rfi: bool,
     ) {
         if let Ok(mut t) = self.inner.lock() {
+            if let Ok(mut live) = shared.live.lock() {
+                live.epoch = t.epoch;
+            }
             t.mode = TapMode::Live {
                 tx,
                 shared,
@@ -1955,7 +1978,7 @@ fn send_loop(
                             });
                         }
                     }
-                    on_live_sent(shared, job.display, frame_id, fetched);
+                    on_live_sent(shared, job.display, frame_id, job.epoch, fetched);
                 }
                 _ => send_job(
                     sender,
@@ -2014,12 +2037,18 @@ fn send_loop(
 }
 
 /// A live frame is out: report it fetched now if the window allows, else hold it.
-fn on_live_sent(shared: &Shared, display: u8, frame_id: u32, fetched: Option<Fetched>) {
+fn on_live_sent(
+    shared: &Shared,
+    display: u8,
+    frame_id: u32,
+    epoch: u8,
+    fetched: Option<Fetched>,
+) {
     let Ok(mut live) = shared.live.lock() else {
         return;
     };
     let d = live.disp(display);
-    d.on_newest(frame_id, Instant::now());
+    d.on_newest_of(frame_id, Instant::now(), epoch);
     let inflight = d.inflight();
     // An older held frame goes now: only the newest waits.
     let older = d.pending.take();
@@ -2043,8 +2072,14 @@ fn tail_losses(shared: &Shared, now: Instant) -> Vec<u8> {
         return Vec::new();
     };
     let after = TAIL_LOSS_AFTER + Duration::from_micros(live.baseline().unwrap_or(0) as u64);
+    let epoch = live.epoch;
     let mut out = Vec::new();
     for d in live.displays.iter_mut() {
+        if d.newest_epoch != epoch {
+            // Its newest frame is from before a SwitchDisplay: the display may be one the
+            // connection left, and a display it still receives has newer frames coming.
+            continue;
+        }
         let (Some(newest), Some(at)) = (d.last_sent, d.newest_at) else {
             continue;
         };
@@ -2308,7 +2343,13 @@ fn log_window(
     } else {
         String::new()
     };
-    log::info!(
+    // Live is a transport, not a probe: its window lines only with enable-latency-log=Y (a
+    // window with a send error is always logged). Shadow exists only to measure.
+    let quiet = mode == Mode::Live
+        && w.first_error.is_none()
+        && hbb_common::config::Config::get_option(base::config::keys::OPTION_ENABLE_LATENCY_LOG)
+            != "Y";
+    let line = format!(
         "UDPVIDEO host conn={} lane={:016x} mode={} win_s={:.1} frames={} keys={} skipped={} qdrop={} dgrams={} kB={} send_ms={} lag_ms={} err={} pings={} refused={}{}{}{}",
         conn_id,
         lane_id,
@@ -2332,6 +2373,9 @@ fn log_window(
             .map(|e| format!(" first_err=\"{e}\""))
             .unwrap_or_default()
     );
+    if !quiet {
+        log::info!("{line}");
+    }
     *w = Window::default();
 }
 
@@ -2827,11 +2871,11 @@ pub(crate) mod latency_tests {
             })
         };
         for id in 0..WINDOW_FRAMES {
-            on_live_sent(&shared, 0, id, guard(0));
+            on_live_sent(&shared, 0, id, 0, guard(0));
         }
         assert_eq!(fetched.lock().unwrap().len(), 3);
         // The fourth unsettled frame waits.
-        on_live_sent(&shared, 0, 3, guard(0));
+        on_live_sent(&shared, 0, 3, 0, guard(0));
         assert_eq!(fetched.lock().unwrap().len(), 3);
         let ack = |settled: u32, lost_total: u32| Ack {
             display: 0,
@@ -2849,7 +2893,7 @@ pub(crate) mod latency_tests {
         assert_eq!(shared.live.lock().unwrap().displays[0].settled, Some(3));
         // Held again, then released by the timeout.
         for id in 4..8 {
-            on_live_sent(&shared, 0, id, guard(0));
+            on_live_sent(&shared, 0, id, 0, guard(0));
         }
         assert_eq!(fetched.lock().unwrap().len(), 7);
         std::thread::sleep(WINDOW_WAIT_MAX + Duration::from_millis(5));
@@ -2886,6 +2930,14 @@ pub(crate) mod latency_tests {
         // The repairing key frame is a newer id: its own tail is watched again.
         shared.live.lock().unwrap().disp(0).on_newest(5, t0);
         assert_eq!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER), vec![0]);
+        // A SwitchDisplay: the display left behind raises none; one of the new epoch does.
+        {
+            let mut live = shared.live.lock().unwrap();
+            live.epoch = 1;
+            live.disp(0).on_newest(6, t0);
+            live.disp(1).on_newest_of(1, t0, 1);
+        }
+        assert_eq!(tail_losses(&shared, t0 + TAIL_LOSS_AFTER), vec![1]);
     }
 
     #[test]

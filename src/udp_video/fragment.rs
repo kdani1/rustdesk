@@ -5,7 +5,10 @@
 //! The oldest missing frame is declared lost when a later frame completed more than
 //! `gap_grace` ago (5 ms: reordering on a LAN is shorter than that), or when its first
 //! fragment (or, if none arrived, the oldest later fragment) is older than `frame_timeout`
-//! (50 ms). Both are estimates to tune from shadow data.
+//! (50 ms). Both are estimates to tune from shadow data. With `rate_timeout` (live) a head frame
+//! whose size is known gets `frame_timeout` or what its bytes need at the delivery rate of
+//! recent complete frames, whichever is longer (key frames at least twice `frame_timeout`,
+//! `RATE_TIMEOUT_MAX` at most): a large frame on a slow link is not lost for being slow.
 //!
 //! After a loss the decoder must not get a frame whose reference is missing, so with
 //! `gate_after_loss` every frame up to the next KEY or RECOVERY_POINT frame is dropped and
@@ -27,6 +30,19 @@ use std::{
 
 /// Largest frame the lane carries: a 4K IDR at a high bitrate stays well below this.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// `rate_timeout`: the longest deadline a frame gets (below the viewer's 1 s watchdog).
+pub const RATE_TIMEOUT_MAX: Duration = Duration::from_millis(400);
+// `rate_timeout`: a frame's bytes at the delivery rate times this, plus `RATE_MARGIN`.
+const RATE_HEADROOM: f64 = 1.5;
+const RATE_MARGIN: Duration = Duration::from_millis(20);
+// Rate samples come from complete frames of at least this many fragments that took at least
+// `RATE_MIN_ASM` from first to last fragment (smaller ones say little about the path).
+const RATE_MIN_FRAGS: u16 = 4;
+const RATE_MIN_ASM: Duration = Duration::from_millis(1);
+const RATE_EWMA: f64 = 0.25;
+// A frame lost on its timeout whose last fragment came this recently was still arriving
+// (`frames_slow`).
+const SLOW_RECENT: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragmentError {
@@ -102,6 +118,8 @@ pub struct ReassemblyConfig {
     /// (shadow mode). Live mode starts every display at 0, the id of the first frame the host
     /// gives the lane, so a lost first frame is a loss like any other.
     pub first_frame_id: Option<u32>,
+    /// Per-frame deadlines from the delivery rate (module doc). Off: `frame_timeout` for all.
+    pub rate_timeout: bool,
 }
 
 impl Default for ReassemblyConfig {
@@ -113,6 +131,7 @@ impl Default for ReassemblyConfig {
             max_frame_len: MAX_FRAME_LEN,
             gate_after_loss: true,
             first_frame_id: None,
+            rate_timeout: false,
         }
     }
 }
@@ -177,6 +196,12 @@ pub struct LossStats {
     /// arrived and said so): more shards of a block were missing than parity arrived. Part of
     /// `frames_lost`; a frame of which nothing arrived is lost without being counted here.
     pub fec_unrecoverable: u64,
+    /// Frames declared lost on their timeout while their fragments were still arriving (the
+    /// last one within `SLOW_RECENT`): slow rather than lost. Part of `frames_lost`.
+    pub frames_slow: u64,
+    /// Frames declared lost whose header (of a fragment that arrived) carried FLAG_KEY. Part of
+    /// `frames_lost`; a key frame of which nothing arrived is not known as one.
+    pub key_lost: u64,
 }
 
 impl LossStats {
@@ -214,6 +239,8 @@ struct PendingFrame {
     bytes: usize,
     corrupt: bool,
     first_at: Instant,
+    /// When its newest shard (data or parity) arrived.
+    last_at: Instant,
     completed_at: Option<Instant>,
     /// FEC block count of the frame (`fec_block >> 4`; 0: no FEC).
     fec_blocks: u8,
@@ -237,6 +264,7 @@ impl PendingFrame {
             bytes: 0,
             corrupt: false,
             first_at: now,
+            last_at: now,
             completed_at: None,
             fec_blocks,
             fec: vec![FecBlock::default(); fec_blocks as usize],
@@ -362,6 +390,8 @@ struct DisplayState {
 
 pub struct Reassembler {
     config: ReassemblyConfig,
+    /// `rate_timeout`: delivery rate of recent complete frames, bytes per ms.
+    rate: Option<f64>,
     displays: Vec<DisplayState>,
     events: VecDeque<Event>,
     stats: LossStats,
@@ -373,6 +403,7 @@ impl Reassembler {
     pub fn new(config: ReassemblyConfig) -> Self {
         Self {
             config,
+            rate: None,
             displays: Vec::new(),
             events: VecDeque::new(),
             stats: LossStats::default(),
@@ -515,6 +546,7 @@ impl Reassembler {
         // Every fragment but the last is the same size, so a frame can only fit if its bytes
         // add up; checked when complete.
         *slot = Some(payload.to_vec());
+        p.last_at = now;
         p.received += 1;
         p.bytes += payload.len();
         stats.fragments_received += 1;
@@ -571,6 +603,7 @@ impl Reassembler {
             return;
         }
         *slot = Some(payload.to_vec());
+        p.last_at = now;
         blk.parity_received += 1;
         blk.shard_len = payload.len();
         if !p.try_recover(b, stats) {
@@ -607,7 +640,7 @@ impl Reassembler {
                     Some(h) => h.first_at,
                     None => d.pending.iter().map(|p| p.first_at).min()?,
                 };
-                let mut at = started + c.frame_timeout;
+                let mut at = started + head_timeout(&c, self.rate, head);
                 if let Some(done) = d
                     .pending
                     .iter()
@@ -635,6 +668,7 @@ impl Reassembler {
 
     fn release(&mut self, now: Instant) {
         let c = self.config;
+        let rate = self.rate;
         for di in 0..self.displays.len() {
             loop {
                 let d = &mut self.displays[di];
@@ -665,10 +699,19 @@ impl Reassembler {
                     .filter(|p| p.frame_id != next_id)
                     .filter_map(|p| p.completed_at)
                     .min();
-                let timed_out = now.saturating_duration_since(started) >= c.frame_timeout;
+                let head = d.pending.first().filter(|_| head_is_next);
+                let timed_out =
+                    now.saturating_duration_since(started) >= head_timeout(&c, rate, head);
                 let overtaken =
                     later_done.map_or(false, |t| now.saturating_duration_since(t) >= c.gap_grace);
                 if timed_out || overtaken {
+                    if !overtaken
+                        && head.is_some_and(|h| {
+                            h.received > 0 && now.saturating_duration_since(h.last_at) < SLOW_RECENT
+                        })
+                    {
+                        self.stats.frames_slow += 1;
+                    }
                     self.declare_lost_until(di, next_id.wrapping_add(1));
                     continue;
                 }
@@ -688,6 +731,19 @@ impl Reassembler {
             d.awaiting_recovery = false;
         }
         self.stats.frames_completed += 1;
+        if self.config.rate_timeout && p.frag_count >= RATE_MIN_FRAGS {
+            if let Some(asm) = p
+                .completed_at
+                .map(|t| t.saturating_duration_since(p.first_at))
+                .filter(|a| *a >= RATE_MIN_ASM)
+            {
+                let sample = p.frame_len as f64 / (asm.as_secs_f64() * 1000.0);
+                self.rate = Some(match self.rate {
+                    Some(r) => (1.0 - RATE_EWMA) * r + RATE_EWMA * sample,
+                    None => sample,
+                });
+            }
+        }
         // Counted on delivery, not on completion: a rebuilt frame that is then gated behind a
         // loss saved nothing the decoder can use, and stays only in `frames_gated`.
         if p.recovered > 0 {
@@ -727,6 +783,9 @@ impl Reassembler {
             .map_or(false, |p| id_before(p.frame_id, until))
         {
             let p = d.pending.remove(0);
+            if p.completed_at.is_none() && p.flags & FLAG_KEY != 0 {
+                self.stats.key_lost += 1;
+            }
             if p.completed_at.is_none() && !p.corrupt {
                 self.stats.fragments_missing += (p.frag_count - p.received) as u64;
                 if p.fec_blocks > 0 {
@@ -752,6 +811,23 @@ impl Reassembler {
         }
         self.events.push_back(Event::Lost { display, from, to });
     }
+}
+
+/// The deadline of the oldest undelivered frame, from its first fragment (`head`: that frame,
+/// when any of it arrived; otherwise the oldest later fragment starts `frame_timeout`).
+fn head_timeout(c: &ReassemblyConfig, rate: Option<f64>, head: Option<&PendingFrame>) -> Duration {
+    let Some(h) = head.filter(|_| c.rate_timeout) else {
+        return c.frame_timeout;
+    };
+    let mut t = c.frame_timeout;
+    if h.flags & FLAG_KEY != 0 {
+        t = t.max(c.frame_timeout * 2);
+    }
+    if let Some(r) = rate.filter(|r| *r > 0.0) {
+        let need_ms = RATE_HEADROOM * h.frame_len as f64 / r;
+        t = t.max(Duration::from_secs_f64(need_ms.min(1e6) / 1000.0) + RATE_MARGIN);
+    }
+    t.min(RATE_TIMEOUT_MAX.max(c.frame_timeout))
 }
 
 #[cfg(test)]
@@ -893,6 +969,48 @@ mod latency_tests {
         assert_eq!(r.settled(0), Some(2));
         assert!(!r.awaiting_recovery(0));
         assert_eq!(r.settled(1), None);
+    }
+
+    /// `rate_timeout`: a large key frame crossing a slow link at the rate recent frames showed
+    /// is not lost for being slow; one far slower than that rate is lost at its deadline while
+    /// still arriving and counts as slow. A lost key frame counts in `key_lost`.
+    #[test]
+    fn latency_rate_timeout_gives_large_frames_their_time() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            first_frame_id: Some(0),
+            frame_timeout: Duration::from_millis(80),
+            rate_timeout: true,
+            ..Default::default()
+        });
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Frame 0: 20 KB in 10 ms, 2 KB/ms.
+        let f = frame_bytes(20_000, 1);
+        for (i, (h, p)) in fragment(&f, meta(0, 0), 1000).unwrap().into_iter().enumerate() {
+            r.push(&h, p, t0 + Duration::from_micros(500 * i as u64));
+        }
+        assert_eq!(delivered_ids(&r.poll(ms(10))), vec![0]);
+        // Frame 1: a 250 KB key frame at the same 2 KB/ms takes 125 ms, beyond 80 ms.
+        let key = frame_bytes(250_000, 2);
+        let parts = fragment(&key, meta(1, FLAG_KEY), 1000).unwrap();
+        let start = 20u64;
+        for (i, (h, p)) in parts.iter().enumerate() {
+            r.push(h, p, ms(start) + Duration::from_micros(500 * i as u64));
+            if i == 200 {
+                assert!(r.poll(ms(start + 100)).is_empty());
+            }
+        }
+        assert_eq!(delivered_ids(&r.poll(ms(start + 126))), vec![1]);
+        assert_eq!(r.stats().frames_lost, 0);
+        // Frame 2: the same key frame at a quarter of that rate.
+        let parts = fragment(&key, meta(2, FLAG_KEY), 1000).unwrap();
+        let start = 200u64;
+        for (i, (h, p)) in parts.iter().enumerate() {
+            r.push(h, p, ms(start) + Duration::from_micros(2_000 * i as u64));
+        }
+        let ev = r.poll(ms(start + 500));
+        assert!(ev.iter().any(|e| matches!(e, Event::Lost { from: 2, .. })), "{ev:?}");
+        assert_eq!((r.stats().frames_slow, r.stats().key_lost), (1, 1));
     }
 
     #[test]

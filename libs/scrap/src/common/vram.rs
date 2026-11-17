@@ -40,6 +40,10 @@ lazy_static::lazy_static! {
 // whether the NV SDK driver failed in this process (open or encode): then FFmpeg stays.
 static RFI_WANTED: AtomicUsize = AtomicUsize::new(0);
 static NV_RFI_FAILED: AtomicBool = AtomicBool::new(false);
+// hwcodec takes the RFI request through one process-wide flag (`set_nv_rfi`) that the NV SDK
+// driver's encoder reads while it opens: displays opening encoders on their own capture
+// threads must not interleave between setting it and opening.
+static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Held while a UDP lane that takes recovery points is offered or live (roadmap M22, host option
 /// `enable-nvenc-rfi`): HEVC encoders on NVIDIA opened meanwhile use hwcodec's NV SDK driver,
@@ -139,6 +143,7 @@ impl EncoderApi for VRamEncoder {
                     && config.feature.vendor == Driver::NV
                     && config.feature.data_format == DataFormat::H265;
                 let rfi_on = nv_hevc && rfi_wanted();
+                let open_guard = OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 hwcodec::vram::encode::set_nv_rfi(rfi_on);
                 let mut ctx = ctx;
                 let mut nv_rfi = false;
@@ -169,6 +174,7 @@ impl EncoderApi for VRamEncoder {
                     Some(encoder) => Ok(encoder),
                     None => Encoder::new(ctx.clone()),
                 };
+                drop(open_guard);
                 // hwcodec applies the VBV to the FFmpeg driver's nvenc only (`set_vbv`).
                 let small_vbv = vbv_frames > 0
                     && ctx.f.driver == Driver::FFMPEG

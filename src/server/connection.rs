@@ -523,8 +523,12 @@ impl crate::session_io::WriterHooks for SplitHooks {
                 f.on_dequeue(msg, queued_at.into());
             }
         } else {
-            // Primary viewer rule: the frame left this connection's queue.
-            on_video_written(self.video_gate.as_ref(), msg);
+            // The lane's frames count in the estimator's rate and frame count (no queue sample).
+            if let Some(f) = self.fast_abr.as_ref() {
+                f.on_lane(msg);
+            }
+            // Primary viewer rule: the frame stays queued until the lane releases it (the
+            // live hooks' `fetched`), so a LAGGING connection on a lane is dropped to a key frame.
         }
         // As the loop's video branch: "fetched" at dequeue, unless the viewer acks frames. A
         // frame that went to a live lane is reported by the lane's sender (send window).
@@ -620,6 +624,29 @@ impl ConnInner {
     #[inline]
     fn on_video_written(&self, msg: &Message) {
         on_video_written(self.video_gate.as_ref(), msg);
+    }
+}
+
+/// A live UDP lane lost frames of `display`: a LAGGING connection is dropped to the primary
+/// viewer rule's lag key (at most one per `LAG_KEY_INTERVAL`); otherwise the display's capture
+/// loop gets `OPTION_LANE_KEY`, a forced key frame that never counts as a viewer's refresh.
+fn request_lane_key(
+    server: &super::ServerPtrWeak,
+    source: VideoSource,
+    gate: Option<&Arc<super::video_qos::primary::VideoGate>>,
+    display: usize,
+) {
+    if gate.is_some_and(|g| g.drop_to_key(display)) {
+        return;
+    }
+    if let Some(s) = server.upgrade() {
+        if let Ok(s) = s.read() {
+            s.set_video_service_opt(
+                Some((source, display)),
+                video_service::OPTION_LANE_KEY,
+                super::service::SERVICE_OPTION_VALUE_TRUE,
+            );
+        }
     }
 }
 
@@ -1421,8 +1448,11 @@ impl Connection {
                         break;
                     }
                     if !route.tcp {
-                        // Primary viewer rule: the frame left this connection's queue.
-                        conn.inner.on_video_written(&value);
+                        if let Some(f) = fast_abr.as_ref() {
+                            f.on_lane(&value);
+                        }
+                        // Primary viewer rule: the frame stays queued until the lane releases
+                        // it (the live hooks' `fetched`).
                         continue;
                     }
                     if let Some(f) = fast_abr.as_ref() {
@@ -5003,6 +5033,16 @@ impl Connection {
         ((failure, time), res)
     }
 
+    /// A live UDP lane's loss repair for `display` (`request_lane_key`).
+    fn lane_key_display(&self, display: usize) {
+        request_lane_key(
+            &self.server,
+            self.video_source(),
+            self.inner.video_gate.as_ref(),
+            display,
+        );
+    }
+
     fn refresh_video_display(&self, display: Option<usize>) {
         if let Some(display) = display {
             super::latency_stats::on_refresh_request(self.video_source(), display);
@@ -6186,26 +6226,22 @@ impl Connection {
             && version >= udp::VIEWER_RFI_VERSION
             && scrap::codec::enable_nvenc_rfi();
         let hooks = (mode == Mode::Live).then(|| {
-            // A tail loss key frame, as `refresh_video_display`, from the lane's sender thread.
+            // A tail loss key frame, as `lane_key_display`, from the lane's sender thread.
             let server = self.server.clone();
             let source = self.video_source();
+            let gate = self.inner.video_gate.clone();
+            let key_gate = gate.clone();
             Arc::new(udp::LiveHooks {
                 fetched: Box::new(move |display, queued| {
+                    // Primary viewer rule: the frame left this connection's queue only now.
+                    if let Some(g) = gate.as_ref() {
+                        g.on_written(display);
+                    }
                     video_service::notify_video_frame_fetched(display, id, Some(queued))
                 }),
                 sent: Box::new(|msg, send| super::latency_stats::on_video_send(msg, send)),
                 keyframe: Box::new(move |display| {
-                    super::latency_stats::on_refresh_request(source, display);
-                    video_service::refresh();
-                    if let Some(s) = server.upgrade() {
-                        if let Ok(s) = s.read() {
-                            s.set_video_service_opt(
-                                Some((source, display)),
-                                video_service::OPTION_REFRESH,
-                                super::service::SERVICE_OPTION_VALUE_TRUE,
-                            );
-                        }
-                    }
+                    request_lane_key(&server, source, key_gate.as_ref(), display)
                 }),
             })
         });
@@ -6336,7 +6372,7 @@ impl Connection {
             return;
         };
         match lane.on_feedback(f) {
-            Ok(Some(Repair::KeyFrame(display))) => self.refresh_video_display(Some(display)),
+            Ok(Some(Repair::KeyFrame(display))) => self.lane_key_display(display),
             // The lane already asked the capture loop (`rfi::request`).
             Ok(Some(Repair::Rfi { .. })) => {}
             Ok(None) => {}
@@ -6456,7 +6492,7 @@ impl Connection {
         // static screen).
         for display in &info.displays {
             if *display >= 0 {
-                self.refresh_video_display(Some(*display as usize));
+                self.lane_key_display(*display as usize);
             }
         }
         // A live lane that fell back, or an internet lane whose handshake failed (a lost punch

@@ -398,6 +398,12 @@ pub struct FastEstimator {
     ceiling_c: Option<f64>,
     c_reached_at: Option<u64>,
     frames: VecDeque<FrameRec>,
+    // Frames a live UDP lane took off TCP: (taken at, bytes, display). They count in the 1 s
+    // rate, frame count and displays; they have no TCP write, so no queue sample.
+    lane: VecDeque<(u64, u32, i32)>,
+    // The last second's frames went over a live lane and no viewer feedback is fresh: no
+    // congestion signal at all, so no decision ("udp").
+    lane_blind: bool,
     tcp: VecDeque<TcpInput>,
     // Per-frame feedback batches (M23), last 2 s.
     fb: VecDeque<FeedbackSample>,
@@ -450,6 +456,8 @@ impl FastEstimator {
             ceiling_c: None,
             c_reached_at: None,
             frames: VecDeque::new(),
+            lane: VecDeque::new(),
+            lane_blind: false,
             tcp: VecDeque::new(),
             fb: VecDeque::new(),
             last_loss_cut_at: None,
@@ -568,6 +576,8 @@ impl FastEstimator {
             Some("ack")
         } else if self.displays_seen > 1 {
             Some("multi")
+        } else if self.lane_blind {
+            Some("udp")
         } else if ctx.configured_kbps == 0 {
             Some("br")
         } else if self.target.is_none() {
@@ -632,6 +642,20 @@ impl FastEstimator {
         let q = q_ms.max(self.tcp_q(end, self.last_rates.r_acked));
         self.push_q(end, q);
         self.maybe_eval(end)
+    }
+
+    /// A live UDP lane took a video frame of `bytes` off TCP at `at`.
+    pub fn on_lane_frame(&mut self, at: u64, bytes: u32, display: i32) {
+        self.first_us.get_or_insert(at);
+        self.lane.push_back((at, bytes, display));
+        while self.lane.len() > MAX_FRAMES
+            || self
+                .lane
+                .front()
+                .is_some_and(|f| f.0 + FRAME_KEEP_US < at)
+        {
+            self.lane.pop_front();
+        }
     }
 
     /// One TCP meter reading.
@@ -728,12 +752,25 @@ impl FastEstimator {
                 displays.push(f.display);
             }
         }
+        let mut lane_1s = 0u32;
+        for &(at, bytes, display) in self.lane.iter() {
+            if at > from {
+                lane_1s += 1;
+                bytes_1s += bytes as u64;
+            }
+            if !displays.contains(&display) {
+                displays.push(display);
+            }
+        }
+        frames_1s += lane_1s;
         self.displays_seen = displays.len();
         self.frames_1s = frames_1s;
-        let r1 = match self.tcp_rate(now, 1_000_000, 500_000) {
+        // Frames over a live lane have no TCP write: the meter would read about zero.
+        let r1 = match self.tcp_rate(now, 1_000_000, 500_000).filter(|_| lane_1s == 0) {
             Some((r_send, _)) => r_send,
             None => bytes_1s as f64 * 8.0 / 1000.0,
         };
+        self.lane_blind = lane_1s > 0 && self.fresh_fb(now).is_none();
         self.r_send_1s = r1;
         let full = ctx.fps > 0 && frames_1s as f64 >= 0.8 * ctx.fps as f64;
         let mut k_decayed = false;
@@ -1509,6 +1546,23 @@ impl ConnFastAbr {
             inner
                 .est
                 .on_write_begin(self.us(queued_at), self.us(now), bytes as u32);
+        }
+    }
+
+    /// A live UDP lane took a video frame off TCP now (no TCP write follows).
+    pub fn on_lane(&self, msg: &Message) {
+        if !self.on.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(base::message_proto::message::Union::VideoFrame(vf)) = &msg.union else {
+            return;
+        };
+        let bytes: usize = super::super::latency_stats::encoded_frames(msg)
+            .map(|f| f.iter().map(|f| f.data.len()).sum())
+            .unwrap_or(0);
+        let now = Instant::now();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.est.on_lane_frame(self.us(now), bytes as u32, vf.display);
         }
     }
 

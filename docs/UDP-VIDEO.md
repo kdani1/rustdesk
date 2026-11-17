@@ -231,8 +231,13 @@ Misc 1002 was taken by the lane.
    port, `max_datagram` 1400, `shadow_every`. The host binds the lane socket to the stream's
    local IP (port 0) before it sends the offer.
 4. **Viewer check:** version 1, mode shadow, a 32-byte secret, `max_datagram` within its
-   2048-byte buffer, a host address that passes `lane_ip`, and a session that is itself direct
-   TCP (`direct`, no KCP, no WebRTC, encrypted) with a local address that passes `lane_ip`. The
+   2048-byte buffer, a host address that passes `lane_ip` and is the host the session stream
+   reached (when the viewer's connect knows it: `udp_video_host`), and a session that is itself
+   direct TCP (`direct`, no KCP, no WebRTC, encrypted) with a local address that passes
+   `lane_ip`. An offer less than 2 s after the last accepted one is refused (a host cannot churn
+   sockets or aim HELLOs at many addresses). A refusal for a socket error, a failed handshake
+   or receive errors carries a fixed reason to the host; the OS error text stays in the
+   viewer's log. The
    viewer binds to that local address (never the wildcard) and `connect()`s to the host's
    address. A refusal goes back as `UdpVideoControl` (1003) `KindRequestStop` with the reason.
 5. **Handshake on UDP:** the viewer sends HELLO every 20 ms for up to 1 s. Until the first
@@ -343,9 +348,11 @@ The log lines are in docs/LATENCY-METRICS.md, "UDP video lane (shadow probe)".
 ### Loss: key frames, never a broken reference
 
 - The receive thread reassembles with the loss gate on and every display starting at frame 0:
-  after a loss (`Lost{from,to}`: 80 ms after a frame's first fragment, above the pacer's 25 ms
-  longest spread plus Wi-Fi jitter; 5 ms after a later frame completed; a frame id gap; a frame
-  that does not parse) nothing of that display reaches the io_loop until a `KEY` (or, later,
+  after a loss (`Lost{from,to}`: a frame's deadline after its first fragment: 80 ms, above the
+  pacer's 25 ms longest spread plus Wi-Fi jitter, at least 160 ms for a key frame, and 1.5 x
+  its bytes at the delivery rate of recent complete frames plus 20 ms when that is longer, at
+  most 400 ms, so a large IDR crossing a slow link is not lost for being slow; 5 ms after a
+  later frame completed; a frame id gap; a frame that does not parse) nothing of that display reaches the io_loop until a `KEY` (or, later,
   `RECOVERY_POINT`) frame. A loss followed in the same poll by a key frame of its display (the
   key frame overtook the gap) is reported repaired and asks nothing.
 - The io_loop marks the display broken (also when the 32-frame hold buffer drops one of its
@@ -358,11 +365,19 @@ The log lines are in docs/LATENCY-METRICS.md, "UDP video lane (shadow probe)".
   otherwise static screen) shows the viewer no gap. The host's sender thread watches each
   display's newest frame (sent, or dropped from the full queue): not settled by the ACKs 200 ms
   (plus the ACK round-trip baseline) after it went out, with nothing newer sent, it asks the
-  capture loop for a key frame itself (`tail_kf`), once per newest frame id.
-- The host answers through the refresh path of the display: with `enable-refresh-keyframe=Y`
-  (M13) a forced key frame on the running encoder (merged with others, at most one per 200 ms,
-  3 within 3 s escalate to a restart); otherwise a capture restart (`SWITCH`) for every viewer.
-  The offer logs which. Live mode is meant to run with M13 on.
+  capture loop for a key frame itself (`tail_kf`), once per newest frame id. A display whose
+  newest frame is from before the last SwitchDisplay of the stream (the connection may have
+  left it) raises none.
+- A SwitchDisplay that starts a new epoch parks every display then broken on the viewer: no
+  requests and no watchdog for it until one of its frames comes in the new epoch (it then asks
+  at once). So a display the session left asks for nothing.
+- The host answers through the display's `lane_key` service option: with
+  `enable-refresh-keyframe=Y` (M13) a forced key frame on the running encoder (merged with
+  others, at most one per 200 ms) that never counts as a viewer's refresh, so lane repairs never
+  escalate to a capture restart; otherwise a capture restart (`SWITCH`) for every viewer. The
+  offer logs which. Live mode is meant to run with M13 on. While the connection is LAGGING
+  under the primary viewer rule (M18), a repair starts its drop-to-key run instead, served by
+  the lag key at most once per 3 s.
 - The host counts the requests and its tail loss key frames: 4 within 5 s end the lane
   (sustained loss).
 
@@ -374,6 +389,7 @@ once the frame is sent and at most 3 frames of the display are unsettled by the 
 (the roadmap's 2-3 unacknowledged frames), or after 100 ms without an ACK. The capture loop
 keeps taking the newest image, as with TCP. A frame dropped anywhere on the way (full queue of
 8, lane ended) is reported fetched when it is dropped, so the capture loop never waits for it.
+The primary viewer gate (M18) counts the frame as unwritten until that same report.
 
 ### Pacing
 
@@ -383,7 +399,8 @@ interval, 25 ms))`, so even an IDR is out within half a frame period (the roadma
 and within 25 ms, well inside the viewer's 80 ms reassembly timeout also at a low frame rate.
 Waits
 use a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10
-1803+) for all but the last 0.5 ms, then a spin. The frame interval is an EWMA of the frames'
+1803+) for all but the last 150 us, then a spin; a wait under 300 us is skipped (the burst goes
+early and the bucket carries the debt), so the sender thread does not busy-spin a core. The frame interval is an EWMA of the frames'
 queue times, the bitrate the bytes sent over the last second. Every datagram is still sealed
 and sent under the sender lock, so PONGs keep the seq order. The connected live socket gets a
 qWAVE AudioVideo flow (DSCP 40, WMM video) unless `enable-lan-qos` is `N`: the lane is LAN only.
@@ -651,12 +668,14 @@ What the merge connected:
    unchanged), so `video_qos` is not fed the same delay twice.
 
 A frame a live lane takes off TCP has no TCP write, so the estimator gets no `on_dequeue` /
-`on_sent` for it (the TCP write terms stay empty, and the feedback carries the queue); the
-primary-viewer gate (M18) counts it as written when the lane takes it. Log fields: `fb`,
+`on_sent` for it (the TCP write terms stay empty, and the feedback carries the queue); its bytes
+count in the estimator's 1 s rate, frame count and displays (`on_lane`), so an app-limited
+estimator can undo a cut. With no fresh feedback while the frames go over a lane the estimator
+is not eligible (`elig=udp`): no signal at all, the TestDelay loop owns the bitrate. The
+primary-viewer gate (M18) counts it as written when the lane releases it. Log fields: `fb`,
 `loss_cuts` and `kind=loss` (docs/LATENCY-METRICS.md, "Fast estimator input from per-frame
 feedback"). Not done: the trendline's slope itself is not a separate estimator term (`usage`
-is), and an app-limited estimator on a live lane only undoes cuts (no TCP writes, so no frames
-to call the stream full).
+is).
 
 ### Left out of M23
 

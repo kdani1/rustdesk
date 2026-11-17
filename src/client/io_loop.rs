@@ -330,9 +330,15 @@ impl<T: InvokeUiSession> Remote<T> {
                     host,
                     rendezvous: rendezvous_server.clone(),
                 });
-                let mut udp_rx =
-                    self.udp_video
-                        .begin_round(&self.handler.get_id(), udp_local, udp_wan);
+                // The host address that stream reached: a LAN offer must name it.
+                let udp_lan_host = udp_local
+                    .and_then(|_| self.handler.lc.read().unwrap().udp_video_host);
+                let mut udp_rx = self.udp_video.begin_round(
+                    &self.handler.get_id(),
+                    udp_local,
+                    udp_lan_host,
+                    udp_wan,
+                );
                 // Per-frame feedback is decided again by this round's PeerInfo.
                 self.video_feedback = None;
 

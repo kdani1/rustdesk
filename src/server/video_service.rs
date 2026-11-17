@@ -63,6 +63,10 @@ use std::{
 };
 
 pub const OPTION_REFRESH: &'static str = "refresh";
+/// A live UDP lane lost frames of this display and wants a key frame. With
+/// enable-refresh-keyframe a forced key frame that is never counted as a viewer's refresh (no
+/// M13 escalation to a restart), else a refresh as before.
+pub const OPTION_LANE_KEY: &'static str = "lane_key";
 
 /// One encoded message as the capture loop saw it: any key frame in it, and its size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -810,6 +814,16 @@ fn run(vs: VideoService) -> ResultType<()> {
     if sp.is_option_true(OPTION_REFRESH) {
         sp.set_option_bool(OPTION_REFRESH, false);
     }
+    // The new encoder's first frame is a key frame.
+    if sp.is_option_true(OPTION_LANE_KEY) {
+        sp.set_option_bool(OPTION_LANE_KEY, false);
+    }
+    #[cfg(windows)]
+    let key_tag = encoder_tag(&encoder_cfg, codec_format);
+    #[cfg(windows)]
+    if vs.source.is_monitor() {
+        super::video_qos::primary::on_new_encoder(display_idx, key_tag);
+    }
 
     let mut frame_controller = VideoFrameController::new(display_idx);
     // M22: this loop's pts start from 0, so older RFI requests and recovery frames of this
@@ -929,7 +943,43 @@ fn run(vs: VideoService) -> ResultType<()> {
                         r => {
                             log::debug!("rfi from pts {from_pts}: {r:?}, key frame instead");
                             latency_stats.on_rfi(false);
-                            super::latency_stats::on_refresh_request(vs.source, display_idx);
+                            sp.set_option_bool(OPTION_LANE_KEY, true);
+                        }
+                    }
+                }
+            }
+        }
+        if sp.is_option_true(OPTION_LANE_KEY) {
+            #[cfg(windows)]
+            let keyframe = refresh_keyframe_enabled();
+            #[cfg(not(windows))]
+            let keyframe = false;
+            if !keyframe {
+                // Without forced key frames a lane's repair is a refresh (capture restart).
+                sp.set_option_bool(OPTION_LANE_KEY, false);
+                super::latency_stats::on_refresh_request(vs.source, display_idx);
+                sp.set_option_bool(OPTION_REFRESH, true);
+            }
+            #[cfg(windows)]
+            if keyframe {
+                let now = Instant::now();
+                match key_refresh.on_lane_key(now) {
+                    super::key_refresh::LaneKey::Wait => {}
+                    super::key_refresh::LaneKey::Merged => {
+                        sp.set_option_bool(OPTION_LANE_KEY, false);
+                        super::latency_stats::on_refresh_request(vs.source, display_idx);
+                        latency_stats.on_refresh_merged();
+                    }
+                    super::key_refresh::LaneKey::Request => {
+                        sp.set_option_bool(OPTION_LANE_KEY, false);
+                        super::latency_stats::on_refresh_request(vs.source, display_idx);
+                        if encoder.request_keyframe() {
+                            key_refresh.on_lane_requested(now);
+                            if vs.source.is_monitor() {
+                                super::video_qos::primary::set_key_supported(display_idx);
+                            }
+                        } else {
+                            // The refresh below restarts ("refresh_unsupported").
                             sp.set_option_bool(OPTION_REFRESH, true);
                         }
                     }
@@ -968,7 +1018,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                 }
                 match key_refresh.on_refresh(Instant::now()) {
                     super::key_refresh::RefreshAction::Request => {
-                        request_refresh_key(&mut encoder, &mut key_refresh)?
+                        request_refresh_key(&mut encoder, &mut key_refresh)?;
+                        if vs.source.is_monitor() {
+                            super::video_qos::primary::set_key_supported(display_idx);
+                        }
                     }
                     super::key_refresh::RefreshAction::Merged => latency_stats.on_refresh_merged(),
                     super::key_refresh::RefreshAction::Switch(reason) => {
@@ -1010,7 +1063,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     key_refresh.on_lag_requested(now);
                     log::info!("PRIMARY key display={display_idx} dropping={lag_dropping}");
                 } else {
-                    super::video_qos::primary::set_key_unsupported(display_idx);
+                    super::video_qos::primary::set_key_unsupported(display_idx, key_tag);
                     bail_switch!("lag_key_unsupported");
                 }
             }
@@ -1321,8 +1374,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 );
                                 latency_stats.on_rfi(false);
                                 rfi.clear();
-                                super::latency_stats::on_refresh_request(vs.source, display_idx);
-                                sp.set_option_bool(OPTION_REFRESH, true);
+                                sp.set_option_bool(OPTION_LANE_KEY, true);
                             }
                         }
                     } else if !key_refresh.pending() && static_refine.on_idle(now) {
@@ -1596,6 +1648,21 @@ fn setup_encoder(
     let use_i444 = Encoder::use_i444(&encoder_cfg);
     let encoder = Encoder::new(encoder_cfg.clone(), use_i444)?;
     Ok((encoder, encoder_cfg, codec_format, use_i444, recorder))
+}
+
+// The kind of encoder (config variant and codec) for the primary viewer rule's mark of one that
+// refused a forced key frame (`primary::on_new_encoder`).
+#[cfg(windows)]
+fn encoder_tag(cfg: &EncoderCfg, format: CodecFormat) -> u8 {
+    let kind: u8 = match cfg {
+        EncoderCfg::VPX(_) => 1,
+        EncoderCfg::AOM(_) => 2,
+        #[cfg(feature = "hwcodec")]
+        EncoderCfg::HWRAM(_) => 3,
+        #[cfg(feature = "vram")]
+        EncoderCfg::VRAM(_) => 4,
+    };
+    (kind << 4) | (format as u8 & 0x0f)
 }
 
 // The encoder's configured kbps for a ratio, as its `set_quality` computes it, for the fast

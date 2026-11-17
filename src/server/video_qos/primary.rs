@@ -65,10 +65,14 @@ const FALSE: AtomicBool = AtomicBool::new(false);
 // receiving the display (display switch) keeps its count until it goes or gets a key frame of
 // the display, so the capture loop asks `dropping_among` its own receivers.
 static DROPPING: [AtomicU32; MAX_DISPLAYS] = [ZERO_U32; MAX_DISPLAYS];
-// The encoder of this display refused a forced key frame: no drop-to-key there until a viewer
-// refresh's forced key frame is accepted again (`set_key_supported`), else until the host
-// process restarts.
+// The encoder of this display refused a forced key frame: no drop-to-key there until a forced
+// key frame is accepted again (`set_key_supported`) or the display's capture loop opens a
+// different kind of encoder (`on_new_encoder`).
 static KEY_UNSUPPORTED: [AtomicBool; MAX_DISPLAYS] = [FALSE; MAX_DISPLAYS];
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_U8: AtomicU8 = AtomicU8::new(0);
+// The kind of encoder (`video_service::encoder_tag`) that refused it.
+static KEY_REFUSED_BY: [AtomicU8; MAX_DISPLAYS] = [ZERO_U8; MAX_DISPLAYS];
 
 /// enable-primary-viewer-rule: Windows hosts, off unless "Y". Read once per second.
 pub fn rule_option() -> bool {
@@ -141,7 +145,28 @@ impl VideoGate {
         true
     }
 
-    /// A video frame of `display` left this connection's queue (written, or the write failed).
+    /// A live UDP lane of this connection lost frames of `display` and wants a key frame. While
+    /// the connection is LAGGING, its frames are dropped until one instead: the capture loop
+    /// forces it at most once per `LAG_KEY_INTERVAL` and never counts it as a viewer's refresh.
+    /// False when the rule does not cover it (not lagging, no forced key frames there): the
+    /// caller asks for the key frame itself.
+    pub fn drop_to_key(&self, display: usize) -> bool {
+        if display >= MAX_DISPLAYS
+            || !self.lagging.load(Ordering::Relaxed)
+            || !key_on_demand(display)
+        {
+            return false;
+        }
+        let bit = 1u8 << display;
+        if self.dropping.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            DROPPING[display].fetch_add(1, Ordering::Relaxed);
+            self.runs.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// A video frame of `display` left this connection's queue (written, the write failed, or
+    /// a live UDP lane released it: sent within its window, expired, dropped).
     pub fn on_written(&self, display: usize) {
         if display < MAX_DISPLAYS {
             let queued = &self.queued[display];
@@ -285,20 +310,35 @@ pub fn dropping_among(display: usize, conns: &HashSet<i32>) -> u32 {
         .count() as u32
 }
 
-/// The encoder of this display refused a forced key frame: lagging connections are no longer
-/// dropped to key frames there (the capture loop restarts the encoder once, which gives the
-/// dropping connections their key frame) until `set_key_supported`, else until the host
-/// process restarts.
-pub fn set_key_unsupported(display: usize) {
-    if display < MAX_DISPLAYS && !KEY_UNSUPPORTED[display].swap(true, Ordering::Relaxed) {
+/// The encoder of this display (kind `tag`) refused a forced key frame: lagging connections are
+/// no longer dropped to key frames there (the capture loop restarts the encoder once, which
+/// gives the dropping connections their key frame) until `set_key_supported`, or until the
+/// loop opens another kind of encoder (`on_new_encoder`).
+pub fn set_key_unsupported(display: usize, tag: u8) {
+    if display >= MAX_DISPLAYS {
+        return;
+    }
+    KEY_REFUSED_BY[display].store(tag, Ordering::Relaxed);
+    if !KEY_UNSUPPORTED[display].swap(true, Ordering::Relaxed) {
         log::warn!(
             "PRIMARY display={display} encoder has no forced key frame: lagging viewers are no longer dropped to key frames"
         );
     }
 }
 
-/// A forced key frame of this display was accepted again (a viewer refresh with
-/// enable-refresh-keyframe): lagging connections may be dropped to key frames there again.
+/// The display's capture loop opened an encoder of kind `tag`: one of another kind than the
+/// encoder that refused a forced key frame may take them.
+pub fn on_new_encoder(display: usize, tag: u8) {
+    if display < MAX_DISPLAYS
+        && KEY_UNSUPPORTED[display].load(Ordering::Relaxed)
+        && KEY_REFUSED_BY[display].load(Ordering::Relaxed) != tag
+    {
+        set_key_supported(display);
+    }
+}
+
+/// A forced key frame of this display was accepted again (a refresh, a lane repair or a lag
+/// key): lagging connections may be dropped to key frames there again.
 pub fn set_key_supported(display: usize) {
     if display < MAX_DISPLAYS && KEY_UNSUPPORTED[display].swap(false, Ordering::Relaxed) {
         log::info!("PRIMARY display={display} encoder takes forced key frames again");
@@ -508,9 +548,15 @@ mod tests {
     #[test]
     fn latency_primary_key_unsupported_cleared() {
         let d = 2;
-        set_key_unsupported(d);
+        set_key_unsupported(d, 0x41);
         assert!(!key_on_demand(d));
         set_key_supported(d);
+        assert_eq!(key_on_demand(d), cfg!(windows));
+        // The same kind of encoder again keeps the mark; another kind clears it.
+        set_key_unsupported(d, 0x41);
+        on_new_encoder(d, 0x41);
+        assert!(!key_on_demand(d));
+        on_new_encoder(d, 0x44);
         assert_eq!(key_on_demand(d), cfg!(windows));
     }
 
