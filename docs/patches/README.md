@@ -9,18 +9,23 @@
 Since the M9/M13/M14 merges RustDesk calls hwcodec API that exists only in that fork, so this
 branch does **not** build against upstream `https://github.com/rustdesk-org/hwcodec` (errors
 E0425/E0599 wherever the `hwcodec` feature is on: Windows, Linux, macOS and the Android viewer).
-`libs/scrap/Cargo.toml` still names the upstream git URL. Until the fork is published, a build
-has to use the fork through the `[patch]` in the `CARGO_HOME` config of the build
-(`C:\RustDeskBuild\cargo\config.toml`, set by `C:\RustDeskBuild\latency\env.cmd`):
+
+The fork is published as `https://github.com/kdani1/hwcodec`, branch `rustdesk-nvenc-low-latency`
+(a GitHub fork of rustdesk-org/hwcodec). `libs/scrap/Cargo.toml` names it and `Cargo.lock` pins
+commit e65c44d, so a plain checkout of this branch builds on any machine or CI.
+
+For local work on hwcodec itself, the build machine overrides the git dependency with the local
+checkout in its `CARGO_HOME` config (`C:\RustDeskBuild\cargo\config.toml`, set by
+`C:\RustDeskBuild\latency\env.cmd`). That override drops the `source` line of the hwcodec entry
+from the local `Cargo.lock`; do not commit that local change.
 
 ```toml
-[patch."https://github.com/rustdesk-org/hwcodec"]
+[patch."https://github.com/kdani1/hwcodec"]
 hwcodec = { path = "C:/Projects/hwcodec" }
 ```
 
-Removing that override does not give a working upstream build: it also needs these RustDesk
-commits reverted. Another machine or CI needs the fork checked out and the same `[patch]` (or
-the patch above applied to an hwcodec checkout at 778df1f).
+After changing hwcodec, push the fork branch and update the commit in `Cargo.lock`
+(`cargo update -p hwcodec` without the override) before committing a RustDesk change that needs it.
 
 Fork-only API that RustDesk uses:
 
@@ -50,6 +55,4 @@ otherwise. The NV driver passes a frame counter as `inputTimeStamp`.
 
 The patch was last regenerated at fork commit e65c44d (merge of `rustdesk-b3-rate`, M7/M17,
 and `rustdesk-b3-udp`, M22).
-
-Whether and where to publish the fork (and then point `libs/scrap/Cargo.toml` at it) is the
-owner's decision; until then `Cargo.toml` and `Cargo.lock` stay as they are.
+The patch file is kept as a readable record of the fork's changes against 778df1f.
