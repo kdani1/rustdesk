@@ -63,6 +63,16 @@ mod ui_cm_interface;
 mod ui_interface;
 mod ui_session_interface;
 
+// Headless MCP agent. Lives inside the lib so it can reach the private
+// client/ui_session_interface/port_forward modules (a [[bin]] cannot). Gated on
+// flutter because it mirrors the flutter Session<T> shape (cursor_shapes,
+// is_multi_ui_session, on_texture). The thin bin is src/bin/rustdesk-agent.rs.
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    feature = "flutter"
+))]
+pub mod agent;
+
 mod hbbs_http;
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]

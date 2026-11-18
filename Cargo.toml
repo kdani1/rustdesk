@@ -16,6 +16,14 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 name = "naming"
 path = "src/naming.rs"
 
+# Headless MCP client: exposes RustDesk's own client capabilities over stdio
+# JSON-RPC. Built with the SAME features as the flutter DLL so the librustdesk
+# lib unit is reused (cargo build --release --features flutter,hwcodec,vram).
+# The implementation lives in librustdesk::agent (src/agent); this is a thin bin.
+[[bin]]
+name = "rustdesk-agent"
+path = "src/bin/rustdesk-agent.rs"
+
 [[bin]]
 name = "service"
 path = "src/service.rs"
