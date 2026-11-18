@@ -104,6 +104,14 @@ android {
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+        // Side-by-side private builds: RUSTDESK_APP_ID_SUFFIX (e.g. ".latency") installs next to
+        // a store/GitHub RustDesk signed with another key instead of failing to update it, and
+        // RUSTDESK_APP_LABEL names it in the launcher. Unset: the normal package and label.
+        def appIdSuffix = System.getenv("RUSTDESK_APP_ID_SUFFIX") ?: ""
+        if (!appIdSuffix.isEmpty()) {
+            applicationIdSuffix appIdSuffix
+        }
+        manifestPlaceholders = [appLabel: System.getenv("RUSTDESK_APP_LABEL") ?: "RustDesk"]
     }
 
     signingConfigs {

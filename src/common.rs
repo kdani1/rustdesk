@@ -2366,7 +2366,30 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+/// Self-hosted server built in at compile time, for private builds that must not carry the
+/// address in the source: environment variables `RENDEZVOUS_SERVER`, `RS_PUB_KEY` and
+/// optionally `RELAY_SERVER` (empty or unset: none). They become default settings
+/// (`custom-rendezvous-server`, `key`, `relay-server`): used while the user has not set the
+/// option, overridden by a custom client config, and the user can still change them.
+pub fn apply_build_time_server() {
+    fn non_empty(v: Option<&'static str>) -> Option<&'static str> {
+        v.map(str::trim).filter(|v| !v.is_empty())
+    }
+    let Some(server) = non_empty(option_env!("RENDEZVOUS_SERVER")) else {
+        return;
+    };
+    let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+    defaults.insert("custom-rendezvous-server".to_owned(), server.to_owned());
+    if let Some(key) = non_empty(option_env!("RS_PUB_KEY")) {
+        defaults.insert("key".to_owned(), key.to_owned());
+    }
+    if let Some(relay) = non_empty(option_env!("RELAY_SERVER")) {
+        defaults.insert("relay-server".to_owned(), relay.to_owned());
+    }
+}
+
 pub fn load_custom_client() {
+    apply_build_time_server();
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2465,6 +2488,7 @@ pub fn get_dst_align_rgba() -> usize {
 }
 
 pub fn read_custom_client(config: &str) {
+    apply_build_time_server();
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
         return;

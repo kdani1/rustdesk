@@ -112,6 +112,11 @@ pub mod screenshot;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
+/// Platforms whose viewer turns the latency options on by default ("N" turns each off):
+/// present pacing, gentle fps control, the adaptive audio target, the UDP video lane
+/// advertisement and per-frame video feedback. Windows, and Android (the Quest / phone
+/// client); elsewhere each stays off unless "Y" (or a number for `audio-target-ms`).
+pub const VIEWER_LATENCY_DEFAULTS: bool = cfg!(any(windows, target_os = "android"));
 // Empirical restart reconnect grace window.
 const RESTART_REMOTE_DEVICE_GRACE: Duration = Duration::from_secs(5 * 60);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
@@ -2562,8 +2567,8 @@ impl Default for AudioBufferTarget {
             };
         }
         let option = LocalConfig::get_option(keys::OPTION_AUDIO_TARGET_MS);
-        // Adaptive by default only on Windows; elsewhere a number turns it on.
-        let target = audio_target::AudioTarget::from_option(&option, cfg!(windows));
+        // Adaptive by default on Windows and Android; elsewhere a number turns it on.
+        let target = audio_target::AudioTarget::from_option(&option, VIEWER_LATENCY_DEFAULTS);
         log::info!(
             "LATENCY client audio_policy={} floor_ms={}",
             if target.is_some() { "adaptive" } else { "legacy" },
@@ -4705,8 +4710,8 @@ impl PresentPacing {
     pub fn new() -> Self {
         let option = LocalConfig::get_option(keys::OPTION_ENABLE_VIEWER_PRESENT_PACING);
         Self {
-            // Default on only on Windows; other platforms keep the old behaviour unless "Y".
-            enabled: if cfg!(windows) {
+            // Default on on Windows and Android; other platforms keep the old behaviour unless "Y".
+            enabled: if VIEWER_LATENCY_DEFAULTS {
                 option != "N"
             } else {
                 option == "Y"

@@ -107,7 +107,9 @@ pub const LIVE_FRAME_TIMEOUT: Duration = Duration::from_millis(80);
 /// is advertised only when it is off the LAN, so a host never offers one the viewer cannot
 /// address.
 pub fn advertised_version(conn_type: ConnType, host_ip: Option<IpAddr>) -> u32 {
-    if !(cfg!(windows) && conn_type == ConnType::DEFAULT_CONN && enabled()) {
+    // Windows and Android viewers advertise (`client::VIEWER_LATENCY_DEFAULTS`).
+    if !(crate::client::VIEWER_LATENCY_DEFAULTS && conn_type == ConnType::DEFAULT_CONN && enabled())
+    {
         0
     } else if wan_allowed() && host_ip.map_or(false, |ip| net::wan_ip(ip).is_ok()) {
         VIEWER_WAN_VERSION

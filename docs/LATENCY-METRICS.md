@@ -1151,7 +1151,7 @@ Roadmap gate (4a/5): on a phone hotspot and another network, the live window lin
 
 ### Per-frame feedback (M23)
 
-Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows
+Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows or Android
 (`enable-video-feedback` not `N`): the viewer reports every video frame's arrival, size, decode
 and present time and, on a live UDP lane, its losses, at most every 50 ms over the session
 stream; the host turns that into a one-way queueing delay, a GCC trend, jitter and loss rates
@@ -1345,7 +1345,7 @@ user's fps as before.
 #### Gentle fps control
 
 `io_loop.rs` `GentleFpsControl`, local option `enable-gentle-fps-control`: on by
-default on Windows (`N` brings back the legacy controller above), off by default on
+default on Windows and Android (`N` brings back the legacy controller above), off by default on
 other platforms (`Y` turns it on). Read when a connection starts. It sends the same
 message as the legacy controller (`Misc` `OptionMessage{custom_fps}`), with values in
 10..custom, so a stock host accepts it; no wire change. It works from the decoder
@@ -1430,7 +1430,7 @@ are not used); after the second `|` the gentle state per display:
 ### Viewer: present pacing
 
 "Always show the newest frame" (`src/client.rs` `PresentPacer`), local option
-`enable-viewer-present-pacing`: on by default on Windows (`N` turns it off), off
+`enable-viewer-present-pacing`: on by default on Windows and Android (`N` turns it off), off
 by default on other platforms (`Y` turns it on). Read when a display's video thread
 starts, so a change applies from the next connection (or display switch). No wire
 change; the host is not involved.
@@ -1473,8 +1473,8 @@ the frame will be shown. A frame that will not be shown is still decoded, but:
   hand-off; one GPU event query still waits for the decode, so `decode_skip` stays an
   honest decode time and the GPU queue cannot run ahead of the decoder. AMF/MFX
   decoders ignore the flag and always output (counted in `skip`, not in `noout`).
-- Android MediaCodec: the output buffer is released without conversion (only with
-  pacing turned on there, `Y`).
+- Android MediaCodec: the output buffer is released without conversion (pacing is on
+  by default there too, `N` turns it off).
 
 `handle_frame` returns `DecodeOutput::DecodedNoOutput` for such a frame, a success:
 it resets the decoder's fail counter like a shown frame, so skipped frames never get
@@ -1569,7 +1569,7 @@ lines do not say which session they belong to. Capacity overwrites past 3 s of a
 not counted in `trim` (they have their own debug log line).
 
 Adaptive audio target (`src/client/audio_target.rs`), local option `audio-target-ms`:
-empty is adaptive on Windows and the legacy rule elsewhere, `0` is the legacy rule
+empty is adaptive on Windows and Android and the legacy rule elsewhere, `0` is the legacy rule
 everywhere, a number N > 0 is adaptive with N ms as the lower bound (at most 2000).
 Read when the audio format of a session starts. Only the viewer's received audio
 (`start_audio_thread`) follows it; the microphone audio a host plays into its virtual

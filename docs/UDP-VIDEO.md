@@ -560,7 +560,7 @@ sees, and it carries the lane's losses to the host's QoS and FEC.
   host with `enable-video-feedback=Y` for remote-control logins (not file transfer, terminal,
   camera or port forward). Stock and older fork viewers ignore the field.
 - **Viewer -> host:** `Misc.video_feedback` (1005, `VideoFeedback`), sent only by a Windows
-  viewer with `enable-video-feedback` not `N`, only after such a PeerInfo, decided again at every
+  or Android viewer with `enable-video-feedback` not `N`, only after such a PeerInfo, decided again at every
   login. A stock host never advertises, so it never receives one; an older fork host neither.
 - Nothing else changes on the wire. The existing `UdpVideoFeedback` (1004) key frame request
   stays the immediate per-loss NACK (sent at once on the loss, repeated every 250 ms); the batch
@@ -908,7 +908,8 @@ offered, which works only behind a port-preserving NAT.
   at the start of every connect and set only by a direct win), and the host's transport gate
   would refuse anyway.
 - `KindCandidate` is sent only after a `wan` offer, which only a v6-aware host makes.
-- Other platforms compile the code; only Windows hosts offer and only Windows viewers advertise.
+- Other platforms compile the code; only Windows hosts offer, and only Windows and Android viewers advertise
+  (`client::VIEWER_LATENCY_DEFAULTS`; the Android viewer asks for the same socket buffer sizes).
 
 ### Left out of M24
 

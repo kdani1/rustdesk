@@ -2340,6 +2340,33 @@ bool handleUriLink({List<String>? cmdArgs, Uri? uri, String? uriString}) {
         break;
     }
   }
+  if (type != null && id != null && (isAndroid || isIOS)) {
+    // Mobile has no session windows (rustDeskWinManager is desktop only): open the session page
+    // in the app's navigator, as the connection page does. On a cold start the navigator may
+    // not exist yet, so wait for it (up to 5 s).
+    if (type == UriLinkType.portForward || type == UriLinkType.rdp) {
+      return false;
+    }
+    final peerId = id;
+    final linkType = type;
+    () async {
+      for (var i = 0; i < 50 && globalKey.currentContext == null; i++) {
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      final context = globalKey.currentContext;
+      if (context == null) {
+        debugPrint("uri link: no navigator, $peerId not opened");
+        return;
+      }
+      connect(context, peerId,
+          isFileTransfer: linkType == UriLinkType.fileTransfer,
+          isViewCamera: linkType == UriLinkType.viewCamera,
+          isTerminal: linkType == UriLinkType.terminal,
+          password: password,
+          forceRelay: forceRelay ?? false);
+    }();
+    return true;
+  }
   if (type != null && id != null) {
     switch (type) {
       case UriLinkType.remoteDesktop:
