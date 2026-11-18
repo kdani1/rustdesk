@@ -17,6 +17,7 @@ import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/state_model.dart';
 import 'input_modifier_utils.dart';
+import 'quest_input_model.dart';
 import 'relative_mouse_model.dart';
 import '../common.dart';
 import '../consts.dart';
@@ -444,6 +445,9 @@ class InputModel {
 
   bool _pointerMovedAfterEnter = false;
   bool _pointerInsideImage = false;
+
+  /// Meta Quest controllers and pointer mode (Android only; inert elsewhere).
+  late final QuestInputModel quest = QuestInputModel(this);
 
   // mouse
   final isPhysicalMouse = false.obs;
@@ -1291,8 +1295,65 @@ class InputModel {
     _relativeMouse.onWindowFocus();
   }
 
+  // ---- Meta Quest pointer mode (see QuestInputModel) ----
+  // The laser pointer and direct touch on the Quest panel arrive as touch or mouse PointerEvents.
+  // The phone gesture layer reads a tap as "click where the cursor already is" (mouse mode), and
+  // hover events flip isPhysicalMouse back and forth, so neither worked. In pointer mode every
+  // pointer is absolute: hover moves the cursor, down/up press/release at that point.
+  int? _questPointer;
+  MouseButtons _questPointerButton = MouseButtons.left;
+
+  /// Returns true when Quest pointer mode handled the event.
+  bool _questPointerEvent(PointerEvent e, String phase) {
+    if (!quest.pointerModeActive || !quest.attached) return false;
+    if (_relativeMouse.enabled.value) return false;
+    quest.logPointer(e, phase);
+    if (isViewOnly && !showMyCursor) return true;
+    if (isViewCamera) return true;
+    final pos = _pointerPositionForRemoteCanvas(e);
+    switch (phase) {
+      case 'hover':
+        if (_questPointer == null) _questMoveTo(pos);
+        break;
+      case 'down':
+        if (_questPointer != null) break; // a second finger: ignore
+        if (parent.target?.cursorModel.shouldBlock(pos.dx, pos.dy) ?? false) {
+          break;
+        }
+        _questPointer = e.pointer;
+        _questPointerButton = (e.kind == ui.PointerDeviceKind.mouse &&
+                (e.buttons & kSecondaryMouseButton) != 0)
+            ? MouseButtons.right
+            : MouseButtons.left;
+        _questMoveTo(pos);
+        quest.button(_questPointerButton, 'pointer', true);
+        break;
+      case 'move':
+        if (_questPointer == e.pointer) _questMoveTo(pos);
+        break;
+      case 'up':
+      case 'cancel':
+        if (_questPointer != e.pointer) break;
+        if (phase == 'up') _questMoveTo(pos);
+        _questPointer = null;
+        quest.button(_questPointerButton, 'pointer', false);
+        break;
+    }
+    return true;
+  }
+
+  void _questMoveTo(Offset pos) {
+    handleMouse({'type': _kMouseEventMove, 'buttons': quest.heldButtonsMask}, pos,
+        moveCanvas: false);
+  }
+
+  void onPointCancelImage(PointerCancelEvent e) {
+    _questPointerEvent(e, 'cancel');
+  }
+
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
+    if (_questPointerEvent(e, 'hover')) return;
     if (isViewOnly && !showMyCursor) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;
 
@@ -1526,6 +1587,7 @@ class InputModel {
     if (isDesktop) _queryOtherWindowCoords = true;
     _remoteWindowCoords = [];
     _windowRect = null;
+    if (_questPointerEvent(e, 'down')) return;
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
 
@@ -1567,6 +1629,7 @@ class InputModel {
 
   void onPointUpImage(PointerUpEvent e) {
     if (isDesktop) _queryOtherWindowCoords = false;
+    if (_questPointerEvent(e, 'up')) return;
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
 
@@ -1589,6 +1652,7 @@ class InputModel {
   }
 
   void onPointMoveImage(PointerMoveEvent e) {
+    if (_questPointerEvent(e, 'move')) return;
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
     if (e.kind != ui.PointerDeviceKind.mouse) return;

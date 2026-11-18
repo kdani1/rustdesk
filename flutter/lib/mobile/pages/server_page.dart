@@ -894,6 +894,11 @@ class ClientInfo extends StatelessWidget {
 
 void androidChannelInit() {
   gFFI.setMethodCallHandler((method, arguments) {
+    // Quest controller events arrive at up to ~90 Hz: route them before the log line below.
+    if (method == "quest_input") {
+      gFFI.inputModel.quest.onPlatformEvent(arguments);
+      return "";
+    }
     debugPrint("flutter got android msg,$method,$arguments");
     try {
       switch (method) {

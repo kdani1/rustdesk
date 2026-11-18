@@ -623,6 +623,7 @@ class RawPointerMouseRegion extends StatelessWidget {
         inputModel.onPointUpImage(evt);
       },
       onPointerMove: inputModel.onPointMoveImage,
+      onPointerCancel: inputModel.onPointCancelImage,
       onPointerSignal: inputModel.onPointerSignalImage,
       onPointerPanZoomStart: inputModel.onPointerPanZoomStart,
       onPointerPanZoomUpdate: inputModel.onPointerPanZoomUpdate,

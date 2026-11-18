@@ -108,6 +108,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     WakelockManager.enable(_uniqueKey);
     _physicalFocusNode.requestFocus();
     gFFI.inputModel.listenToMouse(true);
+    unawaited(gFFI.inputModel.quest.attach());
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
@@ -155,6 +156,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
     gFFI.inputModel.listenToMouse(false);
+    unawaited(gFFI.inputModel.quest.detach());
     gFFI.imageModel.disposeImage();
     gFFI.cursorModel.disposeImages();
     await gFFI.invokeMethod("enable_soft_keyboard", true);
@@ -515,14 +517,18 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   gFFI.canvasModel.updateViewStyle();
                                 });
                               }
+                              // Quest pointer mode: the laser and direct touch are absolute
+                              // pointers handled by InputModel, not phone gestures.
                               return Container(
                                 color: MyTheme.canvasColor,
-                                child: inputModel.isPhysicalMouse.value
+                                child: Obx(() => inputModel
+                                            .isPhysicalMouse.value ||
+                                        inputModel.quest.pointerModeActive
                                     ? getBodyForMobile()
                                     : RawTouchGestureDetectorRegion(
                                         child: getBodyForMobile(),
                                         ffi: gFFI,
-                                      ),
+                                      )),
                               );
                             }),
                           ),
@@ -626,6 +632,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   ))
                         ]) +
                   [
+                    if (isAndroid) _questMenuButton(),
                     if (isAndroid) Obx(() {
                       final model = gFFI.ffiModel;
                       final active = model.microphoneForwardingState.value == 'active';
@@ -660,6 +667,68 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  /// Raw controller/pointer events received on a Quest, so the user can report what arrives.
+  /// IgnorePointer: the laser must reach the remote screen underneath.
+  Widget _questDebugReadout() {
+    final quest = inputModel.quest;
+    return Positioned(
+      left: 8,
+      top: 8,
+      child: IgnorePointer(
+        child: Obx(() {
+          if (!quest.isQuest.value || !quest.debug.value) {
+            return const SizedBox.shrink();
+          }
+          final lines = <String>[
+            'Quest input | pointer mode ${quest.pointerMode.value ? 'ON' : 'OFF'}'
+                '${quest.debugStatus.value.isEmpty ? '' : ' | ${quest.debugStatus.value}'}',
+            ...quest.debugLines,
+          ];
+          return Container(
+            constraints: const BoxConstraints(maxWidth: 620),
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            color: Colors.black.withOpacity(0.6),
+            child: Text(
+              lines.join('\n'),
+              style: const TextStyle(
+                  color: Colors.greenAccent,
+                  fontSize: 11,
+                  fontFamily: 'monospace',
+                  height: 1.25),
+            ),
+          );
+        }),
+      ),
+    );
+  }
+
+  Widget _questMenuButton() {
+    final quest = inputModel.quest;
+    return Obx(() {
+      if (!quest.isQuest.value) return const SizedBox.shrink();
+      return PopupMenuButton<String>(
+        icon: const Icon(Icons.sports_esports, color: Colors.white),
+        tooltip: 'Quest controller',
+        onSelected: (v) {
+          if (v == 'pointer') quest.setPointerMode(!quest.pointerMode.value);
+          if (v == 'debug') quest.setDebug(!quest.debug.value);
+        },
+        itemBuilder: (_) => [
+          CheckedPopupMenuItem(
+            value: 'pointer',
+            checked: quest.pointerMode.value,
+            child: const Text('Quest pointer mode (laser/touch = mouse)'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'debug',
+            checked: quest.debug.value,
+            child: const Text('Show input debug readout'),
+          ),
+        ],
+      );
+    });
   }
 
   bool get showCursorPaint =>
@@ -716,6 +785,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           if (showCursorPaint) {
             paints.add(CursorPaint(widget.id));
           }
+          paints.add(_questDebugReadout());
           if (gFFI.ffiModel.touchMode) {
             paints.add(FloatingMouse(
               ffi: gFFI,

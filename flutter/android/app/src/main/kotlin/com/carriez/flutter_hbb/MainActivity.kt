@@ -19,6 +19,8 @@ import android.os.Bundle
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.media.MediaCodecInfo
 import android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -647,6 +649,12 @@ class MainActivity : FlutterActivity() {
                 "on_voice_call_closed" -> {
                     onVoiceCallClosed()
                 }
+                "quest_get_info" -> {
+                    result.success(QuestInput.info())
+                }
+                "quest_input_config" -> {
+                    result.success(QuestInput.configure(call.arguments))
+                }
                 else -> {
                     result.error("-1", "No such method", null)
                 }
@@ -1006,5 +1014,22 @@ class MainActivity : FlutterActivity() {
     override fun onStart() {
         super.onStart()
         stopService(Intent(this, FloatingWindowService::class.java))
+    }
+
+    // Meta Quest controllers: their buttons and sticks never reach Flutter as pointer events,
+    // so the remote page gets them from QuestInput over the method channel. See QuestInput.kt.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (QuestInput.onKey(flutterMethodChannel, event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (QuestInput.onGenericMotion(flutterMethodChannel, ev)) return true
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        QuestInput.onTouch(flutterMethodChannel, ev)
+        return super.dispatchTouchEvent(ev)
     }
 }
