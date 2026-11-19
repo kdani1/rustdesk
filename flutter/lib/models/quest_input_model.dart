@@ -85,8 +85,11 @@ class QuestInputModel {
   /// (see CursorModel.remoteCursorIsText). On by default; toggleable.
   final autoKeyboard = true.obs;
 
-  /// Called after a Quest pointer left click/drag is released (auto-keyboard hook).
-  void Function()? onLeftClick;
+  /// Called after a Quest pointer left click/drag is released (auto-keyboard hook), with the
+  /// release position in local logical px.
+  void Function(Offset localPos)? onLeftClick;
+  /// Hover while no button is held (auto-keyboard disarm when the pointer leaves the click spot).
+  void Function(Offset localPos)? onHover;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 

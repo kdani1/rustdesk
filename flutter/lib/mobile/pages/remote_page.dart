@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
@@ -32,7 +33,7 @@ final initText = '1' * 1024;
 // https://github.com/flutter/flutter/issues/159384
 // https://github.com/flutter/flutter/issues/159383
 void _disableAndroidSoftKeyboard({bool? isKeyboardVisible}) {
-  if (isAndroid) {
+  if (isAndroid && !gFFI.inputModel.quest.isQuest.value) {
     if (isKeyboardVisible != true) {
       // `enable_soft_keyboard` will be set to `true` when clicking the keyboard icon, in `openKeyboard()`.
       gFFI.invokeMethod("enable_soft_keyboard", false);
@@ -76,9 +77,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   var _showEdit = false; // use soft keyboard
 
   Worker? _waylandKeyboardGateWorker;
+  // Quest auto-keyboard: a left click arms ONE open (see _onQuestLeftClick).
   Worker? _questAutoKbdWorker;
-  Timer? _questClickKbdTimer;
-  DateTime _lastQuestClick = DateTime(0);
+  Timer? _questArmTimer;
+  bool _questKbdArmed = false;
+  Offset _questArmPos = Offset.zero;
+  static const _kQuestKbdArmWindow = Duration(milliseconds: 1200);
+  static const double _kQuestKbdArmSlop = 24.0; // same as input_model long-press slop
+  Timer? _kbdVisFocusTimer; // onSoftKeyboardChanged's own; must not cancel _timer
   bool _waylandKeyboardGateInitialized = false;
 
   InputModel get inputModel => gFFI.inputModel;
@@ -112,14 +118,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _physicalFocusNode.requestFocus();
     gFFI.inputModel.listenToMouse(true);
     unawaited(gFFI.inputModel.quest.attach());
-    // Quest auto-keyboard: when the remote cursor becomes a text caret, bring up
-    // the soft keyboard. Debounced so a brief hover over text, or cursor flicker,
-    // does not open it; it is never auto-closed (the user closes it), so moving
-    // off text leaves it open rather than flickering.
-    _questAutoKbdWorker = debounce<bool>(
-        gFFI.cursorModel.remoteCursorIsText, _onRemoteTextCursor,
-        time: const Duration(milliseconds: 350));
+    // Quest auto-keyboard: a left click arms one open, fired when the remote cursor is (or,
+    // while the pointer stays put, becomes) a text caret. Never auto-closed.
+    _questAutoKbdWorker =
+        ever<bool>(gFFI.cursorModel.remoteCursorIsText, (isText) {
+      if (isText && _questKbdArmed) _questKbdFire('shape');
+    });
     gFFI.inputModel.quest.onLeftClick = _onQuestLeftClick;
+    gFFI.inputModel.quest.onHover = _onQuestHover;
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
@@ -177,7 +183,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _waylandKeyboardGateWorker?.dispose();
     _questAutoKbdWorker?.dispose();
     gFFI.inputModel.quest.onLeftClick = null;
-    _questClickKbdTimer?.cancel();
+    gFFI.inputModel.quest.onHover = null;
+    _questArmTimer?.cancel();
+    _kbdVisFocusTimer?.cancel();
     inputModel.keyboardInputAllowed = true;
     await gFFI.close();
     _timer?.cancel();
@@ -198,6 +206,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       trySyncClipboard();
+    } else if (inputModel.quest.isQuest.value) {
+      // Android restarts input on resume; the Quest IME may re-commit the field text.
+      _value = '';
+      _textController.clear();
     }
   }
 
@@ -255,11 +267,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       );
 
   void onSoftKeyboardChanged(bool visible) {
+    inputModel.quest.log('kbdVis=$visible');
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
       if (gFFI.chatModel.chatWindowOverlayEntry == null &&
-          gFFI.ffiModel.pi.version.isNotEmpty) {
+          gFFI.ffiModel.pi.version.isNotEmpty &&
+          !inputModel.quest.isQuest.value) {
         gFFI.invokeMethod("enable_soft_keyboard", false);
       }
 
@@ -280,8 +294,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     } else {
       _iosKeyboardWorkaroundTimer?.cancel();
       _iosKeyboardWorkaroundTimer = null;
-      _timer?.cancel();
-      _timer = Timer(kMobileDelaySoftKeyboardFocus, () {
+      _kbdVisFocusTimer?.cancel();
+      _kbdVisFocusTimer = Timer(kMobileDelaySoftKeyboardFocus, () {
+        if (!mounted) return;
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
             overlays: SystemUiOverlay.values);
         _mobileFocusNode.requestFocus();
@@ -372,7 +387,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 content == '【】')) {
           // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
           bind.sessionInputString(sessionId: sessionId, value: content);
-          _openKeyboardUnlocked();
+          if (!inputModel.quest.isQuest.value) _openKeyboardUnlocked();
           return;
         }
         bind.sessionInputString(sessionId: sessionId, value: content);
@@ -406,37 +421,55 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     inputModel.inputKey(char);
   }
 
-  void _onQuestLeftClick() {
-    _lastQuestClick = DateTime.now();
-    // The shape under the click arrives after a host cursor poll (33 ms) plus the round trip.
-    _questClickKbdTimer?.cancel();
-    _questClickKbdTimer = Timer(const Duration(milliseconds: 300),
-        () => _autoKeyboard(gFFI.cursorModel.remoteCursorIsText.value, 'click'));
+  /// A Quest left click arms the auto-keyboard for ONE open: it fires now if the remote cursor
+  /// is already a caret (the laser hovered there first), or when it turns into one before the
+  /// window ends while the pointer stays put (direct touch / slow link). Firing disarms, so one
+  /// click opens at most once and I-beam flapping (pointer hidden while typing) never re-opens.
+  void _onQuestLeftClick(Offset pos) {
+    if (!mounted) return;
+    final quest = inputModel.quest;
+    final String? skip = !quest.isQuest.value
+        ? 'not-quest'
+        : !quest.autoKeyboard.value
+            ? 'toggle-off'
+            : !gFFI.ffiModel.keyboard
+                ? 'no-kbd-perm'
+                : null;
+    if (skip != null) {
+      quest.log('autoKbd[click] -> $skip');
+      return;
+    }
+    if (gFFI.cursorModel.remoteCursorIsText.value) {
+      _questKbdFire('click'); // laser hovered the caret before clicking
+      return;
+    }
+    // Direct touch / slow link: the caret shape may arrive after the click.
+    _questKbdArmed = true;
+    _questArmPos = pos;
+    _questArmTimer?.cancel();
+    _questArmTimer =
+        Timer(_kQuestKbdArmWindow, () => _questKbdDisarm('expired'));
+    quest.log('autoKbd[click] text=false -> armed');
   }
 
-  // Worker: the cursor turned into a caret shortly after a click (no hover before the click).
-  void _onRemoteTextCursor(bool isText) => _autoKeyboard(isText, 'shape');
-
-  void _autoKeyboard(bool isText, String from) {
-    final quest = inputModel.quest;
-    String? skip;
-    if (!mounted) return;
-    if (!isText) {
-      skip = 'not-text';
-    } else if (!quest.isQuest.value) {
-      skip = 'not-quest';
-    } else if (!quest.autoKeyboard.value) {
-      skip = 'toggle-off';
-    } else if (!gFFI.ffiModel.keyboard) {
-      skip = 'no-kbd-perm';
-    } else if (DateTime.now().difference(_lastQuestClick).inMilliseconds > 1500) {
-      skip = 'no-recent-click';
-    } else if (keyboardVisibilityController.isVisible && _showEdit) {
-      skip = 'already-open';
+  void _onQuestHover(Offset pos) {
+    if (_questKbdArmed && (pos - _questArmPos).distance > _kQuestKbdArmSlop) {
+      _questKbdDisarm('moved'); // a caret under a later hover is not the clicked field
     }
-    quest.log('autoKbd[$from] text=$isText -> ${skip ?? "OPEN"}');
-    if (skip != null) return;
-    openKeyboard();
+  }
+
+  void _questKbdDisarm(String why) {
+    if (_questKbdArmed) inputModel.quest.log('autoKbd armed -> $why');
+    _questKbdArmed = false;
+    _questArmTimer?.cancel();
+  }
+
+  void _questKbdFire(String from) {
+    _questKbdArmed = false;
+    _questArmTimer?.cancel();
+    if (!mounted) return;
+    inputModel.quest.log('autoKbd[$from] -> OPEN');
+    openKeyboard(); // keeps the Wayland gate
   }
 
   void openKeyboard() {
@@ -463,6 +496,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   void _openKeyboardUnlocked() {
     inputModel.keyboardInputAllowed = true;
+    if (inputModel.quest.isQuest.value) {
+      unawaited(_openKeyboardQuest());
+      return;
+    }
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
     // The phone trick pre-fills the hidden field with `initText` ('1' * 1024) so a
@@ -472,7 +509,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // the sentinel '1's were forwarded to the remote and flooded it with "1"s.
     // On a Quest start empty: nothing to echo. (Trade-off: a backspace with an
     // empty local field won't reach the remote; typing is unaffected.)
-    _value = gFFI.inputModel.quest.isQuest.value ? '' : initText;
+    _value = initText;
     _textController.text = _value;
     setState(() => _showEdit = false);
     _timer?.cancel();
@@ -486,6 +523,43 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             overlays: SystemUiOverlay.values);
         _mobileFocusNode.requestFocus();
       });
+    });
+  }
+
+  /// Quest: never tear the hidden field down to (re)open; safe to call repeatedly.
+  /// Tearing it down closes the input connection, Flutter hides the IME, and the Quest drops
+  /// the show that follows ~30-60 ms later (the flicker).
+  Future<void> _openKeyboardQuest() async {
+    _timer?.cancel();
+    // await: FLAG_ALT_FOCUSABLE_IM cleared before anything asks for the IME.
+    await gFFI.invokeMethod("enable_soft_keyboard", true);
+    if (!mounted) return;
+    if (_showEdit && _mobileFocusNode.hasFocus) {
+      // Focused, IME closed by the user (connection kept) -> just show it, like a tapped TextField.
+      final ets = _mobileFocusNode.context
+          ?.findAncestorStateOfType<EditableTextState>();
+      if (ets != null) {
+        ets.requestKeyboard(); // re-attaches if the connection is gone, else show()
+      } else {
+        await SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+      }
+      if (_textController.text.length > 1024) {
+        // bound the 0-px-wide layout
+        _value = '';
+        _textController.clear();
+      }
+      return;
+    }
+    // A new connection follows: clear first, the Quest IME echoes existing text on attach.
+    _value = '';
+    _textController.clear();
+    if (_showEdit) {
+      _mobileFocusNode.requestFocus(); // mounted, unfocused: real focus change -> attach + show
+      return;
+    }
+    setState(() => _showEdit = true); // schedules the frame the callback below needs
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _showEdit) _mobileFocusNode.requestFocus();
     });
   }
 
@@ -834,6 +908,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       // enableSuggestions: false,
                       autofocus: true,
                       focusNode: _mobileFocusNode,
+                      // Quest laser clicks arrive as mouse PointerDowns; Flutter's Android
+                      // default unfocuses on those, closing the keyboard on every click.
+                      onTapOutside: (e) {
+                        if (inputModel.quest.isQuest.value) return;
+                        if (e.kind != PointerDeviceKind.touch) {
+                          _mobileFocusNode.unfocus();
+                        }
+                      },
                       maxLines: null,
                       controller: _textController,
                       // trick way to make backspace work always

@@ -1325,7 +1325,10 @@ class InputModel {
     final pos = _pointerPositionForRemoteCanvas(e);
     switch (phase) {
       case 'hover':
-        if (_questPointer == null) _questMoveTo(pos);
+        if (_questPointer == null) {
+          _questMoveTo(pos);
+          quest.onHover?.call(e.localPosition);
+        }
         break;
       case 'down':
         if (_questPointer != null) break; // a second finger: ignore
@@ -1381,12 +1384,12 @@ class InputModel {
         } else if (_questLeftPressed) {
           _questLeftPressed = false;
           quest.button(MouseButtons.left, 'pointer', false);
-          quest.onLeftClick?.call();
+          quest.onLeftClick?.call(e.localPosition);
         } else if (phase == 'up') {
           // Quick tap, never moved far: a normal left click.
           quest.button(MouseButtons.left, 'pointer', true);
           quest.button(MouseButtons.left, 'pointer', false);
-          quest.onLeftClick?.call();
+          quest.onLeftClick?.call(e.localPosition);
         }
         break;
     }
