@@ -454,20 +454,23 @@ fn run(args: &Value) -> Result<String, String> {
         let end_prefix = format!("__RD_END_{}_", nonce);
 
         // PowerShell: quiet the prompt, bracket the command with markers, and
-        // print the exit code after it. One send per line, CR-terminated.
-        // (Host default shell is assumed PowerShell on Windows; a cmd/bash host
-        // would need shell detection -- noted as phase-2 work.)
+        // print the exit code after it. Send it ALL as ONE send_terminal_input,
+        // because some older RustDesk hosts deliver only the FIRST send of a
+        // burst (observed on the PartyVR Dell build): four separate sends left
+        // everything after the first undelivered, so the command never ran.
+        // The markers are emitted with a string CONCATENATION ('__RD'+'_BEGIN_..')
+        // so the literal, contiguous marker appears ONLY in the command's real
+        // output, never in the terminal's echo of the input line -- otherwise the
+        // poll loop and extract_between would match the echoed command instead of
+        // the result. ';' separates the statements, the trailing CR submits, and
+        // try/catch keeps the end marker printing even if the command throws.
+        // Commands with embedded newlines are not supported by this one-line form.
         s.session.send_terminal_input(
             tid,
-            "Remove-Module PSReadLine -EA 0; $ProgressPreference='SilentlyContinue'\r".to_string(),
-        );
-        s.session
-            .send_terminal_input(tid, format!("Write-Output '{}'\r", begin));
-        s.session
-            .send_terminal_input(tid, format!("{}\r", command));
-        s.session.send_terminal_input(
-            tid,
-            format!("Write-Output \"{}$LASTEXITCODE\"\r", end_prefix),
+            format!(
+                "Remove-Module PSReadLine -EA 0; $ProgressPreference='SilentlyContinue'; Write-Output ('__RD'+'_BEGIN_{nonce}__'); try {{ {command} }} catch {{ Write-Output ('ERR: ' + $_) }}; Write-Output ('__RD'+'_END_{nonce}_'+$LASTEXITCODE)\r",
+                nonce = nonce, command = command
+            ),
         );
 
         // Poll for the end marker.
