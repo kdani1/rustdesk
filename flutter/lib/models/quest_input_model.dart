@@ -69,11 +69,15 @@ class QuestInputModel {
 
   final isQuest = false.obs;
   final pointerMode = true.obs;
-  final debug = true.obs;
 
-  /// Draw the local software cursor in the remote view (it hides the small
-  /// pointer-tracking latency). On by default; toggleable from the Quest menu.
-  final cursorOverlay = true.obs;
+  /// On-screen debug readout (the green status/event HUD). Off by default;
+  /// toggleable at runtime (left-stick click / Quest menu). Separate from the
+  /// compile-time [kQuestDebug] logcat flag.
+  final debug = false.obs;
+
+  /// Draw the local software cursor in the remote view. Off by default (the
+  /// Quest's own laser pointer is enough); toggleable from the Quest menu.
+  final cursorOverlay = false.obs;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 
@@ -99,9 +103,9 @@ class QuestInputModel {
     _attached = true;
     pointerMode.value =
         bind.mainGetLocalOption(key: kOptionPointerMode) != 'N';
-    debug.value = bind.mainGetLocalOption(key: kOptionDebug) != 'N';
+    debug.value = bind.mainGetLocalOption(key: kOptionDebug) == 'Y';
     cursorOverlay.value =
-        bind.mainGetLocalOption(key: kOptionCursorOverlay) != 'N';
+        bind.mainGetLocalOption(key: kOptionCursorOverlay) == 'Y';
     String model = '';
     try {
       final info = await platformFFI.invokeMethod('quest_get_info');
