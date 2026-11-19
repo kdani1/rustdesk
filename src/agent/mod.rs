@@ -26,14 +26,20 @@
 //  * auto-login with each peer's saved password.
 
 mod handler;
-mod input_stub;
 mod mcp;
+mod stdio_guard;
 mod tools;
 
 /// Entry point called by the rustdesk-agent binary. Initializes the client core
 /// (as the interactive user, so config resolves to %APPDATA%\RustDesk) and then
 /// serves MCP over stdio until stdin closes.
 pub fn run() {
+    // WORK ITEM A: lock down the stdout pipe BEFORE anything can write to it.
+    // Saves the real stdout handle for the MCP writer and redirects the process
+    // STD_OUTPUT_HANDLE away so stray print!/println! in the reused core cannot
+    // corrupt the JSON-RPC stream. See stdio_guard.rs for the mechanism.
+    stdio_guard::install();
+
     if !crate::common::global_init() {
         eprintln!("[rustdesk-agent] global_init() failed");
         std::process::exit(1);
@@ -41,7 +47,8 @@ pub fn run() {
     crate::load_custom_client();
 
     // Logs go to a file / stderr (init_log never writes to stdout), which keeps
-    // the stdout JSON-RPC stream clean. See mcp.rs for the stdout hazard note.
+    // the stdout JSON-RPC stream clean. The stdout-corruption hazard from stray
+    // println! in the reused core is handled by stdio_guard::install() above.
     hbb_common::init_log(false, "agent");
 
     #[cfg(windows)]

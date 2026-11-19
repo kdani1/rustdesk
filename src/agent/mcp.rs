@@ -8,21 +8,21 @@
 // We implement just enough of MCP: `initialize`, `tools/list`, `tools/call`, and
 // we ignore notifications (methods with no `id`, e.g. notifications/initialized).
 //
-// STDOUT HAZARD (v1 note): two code paths in the reused client core write to the
-// real stdout with `println!` -- the file-transfer digest error
-// (src/client/io_loop.rs ~2605) and an RDP debug line (src/port_forward.rs ~148).
-// Either could in principle interleave a stray line into this JSON-RPC stream.
-// The RDP line only fires for RDP/mstsc forwarding (port 0), which this agent
-// never requests. The digest line only fires on a rare file-transfer error. Logs
-// from init_log go to a file/stderr, not stdout. For v1 we accept this and keep
-// all our framing on a single locked stdout handle with an explicit flush per
-// message. PHASE 2 should redirect STD_OUTPUT_HANDLE so those println! cannot
-// reach the client at all.
+// STDOUT HAZARD (resolved in phase 2): two code paths in the reused client core
+// write to the real stdout with `println!` -- the file-transfer digest error
+// (src/client/io_loop.rs ~2605, reachable on the download path) and an RDP debug
+// line (src/port_forward.rs ~148). Either could interleave a stray line into
+// this JSON-RPC stream. This is now handled structurally: super::stdio_guard
+// (installed first thing in run()) saves the real stdout handle for the writer
+// below and redirects the process STD_OUTPUT_HANDLE elsewhere, so those println!
+// can no longer reach the protocol pipe. The writer here never touches
+// io::stdout(); it goes through stdio_guard::write_all to the saved handle.
 
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 
 use serde_json::{json, Value};
 
+use super::stdio_guard;
 use super::tools;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -97,11 +97,14 @@ fn handle_message(req: &Value) {
             // Guard the whole call so a panic in a tool (panic=abort would kill
             // the process) cannot take the server down for a recoverable error:
             // we validate/handle errors inside, returning them as tool errors.
+            // dispatch returns the full MCP `content` array on success (a text
+            // block for most tools, an image block for `screenshot`), or an
+            // error string we wrap as a text block with isError = true.
             match tools::dispatch(&name, &args) {
-                Ok(text) => reply_result(
+                Ok(content) => reply_result(
                     id,
                     json!({
-                        "content": [ { "type": "text", "text": text } ],
+                        "content": content,
                         "isError": false
                     }),
                 ),
@@ -148,11 +151,10 @@ fn reply_result_err(id: Option<Value>, code: i64, message: &str) {
 }
 
 fn write_response(v: &Value) {
-    let s = v.to_string();
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    // One object per line, then flush so the client sees it promptly.
-    let _ = lock.write_all(s.as_bytes());
-    let _ = lock.write_all(b"\n");
-    let _ = lock.flush();
+    // One object per line, written to the saved stdout handle via stdio_guard
+    // (NOT io::stdout(), whose STD_OUTPUT_HANDLE has been redirected away). The
+    // underlying handle is unbuffered, so the client sees each message promptly.
+    let mut buf = v.to_string().into_bytes();
+    buf.push(b'\n');
+    stdio_guard::write_all(&buf);
 }

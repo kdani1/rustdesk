@@ -103,6 +103,12 @@ pub struct Shared {
     pub dir_seq: u64,
     pub jobs: HashMap<i32, JobOutcome>,
     pub terminals: HashMap<i32, TermState>,
+    /// Screenshot responses keyed by the request sid. The value is the host's
+    /// message: empty means success (the PNG is in the client-side screenshot
+    /// cache, pulled out via crate::client::screenshot::handle_screenshot), a
+    /// non-empty string is the host-reported error. Presence of the key means
+    /// the response arrived.
+    pub screenshots: HashMap<String, String>,
     /// Human-readable errors reported via msgbox("error", ...).
     pub errors: Vec<String>,
 }
@@ -306,6 +312,33 @@ impl AgentHandler {
         }
     }
 
+    /// Wait for the screenshot response identified by `sid`. Ok(()) means the
+    /// PNG is now in the client-side screenshot cache; Err carries the host's
+    /// error or a connection/timeout error.
+    pub fn wait_screenshot(&self, sid: &str, timeout: Duration) -> Result<(), String> {
+        let g = self.state.m.lock().unwrap();
+        let (g, res) = self
+            .state
+            .cv
+            .wait_timeout_while(g, timeout, |s| {
+                !s.screenshots.contains_key(sid) && !matches!(s.conn, Conn::Failed(_))
+            })
+            .unwrap();
+        if let Some(msg) = g.screenshots.get(sid) {
+            if msg.is_empty() {
+                return Ok(());
+            }
+            return Err(format!("host reported screenshot error: {}", msg));
+        }
+        if let Conn::Failed(e) = &g.conn {
+            return Err(e.clone());
+        }
+        if res.timed_out() {
+            return Err("timed out waiting for screenshot response".into());
+        }
+        Err("screenshot response not received".into())
+    }
+
     pub fn first_error(&self) -> Option<String> {
         let g = self.state.m.lock().unwrap();
         if let Conn::Failed(e) = &g.conn {
@@ -498,8 +531,15 @@ impl InvokeUiSession for AgentHandler {
     fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
     fn printer_request(&self, _id: i32, _path: String) {}
 
-    fn handle_screenshot_resp(&self, _sid: String, _msg: String) {
-        // PHASE 2: screenshot capture. See src/agent/input_stub.rs.
+    fn handle_screenshot_resp(&self, sid: String, msg: String) {
+        // io_loop calls crate::client::screenshot::set_screenshot(response.data)
+        // just before this, so by the time a waiter is released the PNG bytes
+        // are already in the client-side cache. Record the outcome (empty msg =
+        // success) and wake the waiter keyed by sid.
+        let mut g = self.state.m.lock().unwrap();
+        g.screenshots.insert(sid, msg);
+        drop(g);
+        self.notify();
     }
 
     fn handle_terminal_response(&self, response: TerminalResponse) {
