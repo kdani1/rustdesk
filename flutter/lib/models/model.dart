@@ -3177,7 +3177,7 @@ class CursorModel with ChangeNotifier {
   String _id = "-1";
   // Quest auto-keyboard: whether the current remote cursor looks like a text
   // caret (Windows IDC_IBEAM). Computed per shape from its bitmap (Android only)
-  // and republished whenever the current cursor changes. See [_looksLikeIBeam].
+  // and republished whenever the current cursor changes. See [iBeamReject].
   final RxBool remoteCursorIsText = false.obs;
   final _textCursorIds = <String, bool>{};
   double _hotx = 0;
@@ -3607,7 +3607,12 @@ class CursorModel with ChangeNotifier {
       int height, Uint8List rgba) async {
     final generation = _generation;
     if (_unavailable == id) _unavailable = null;
-    if (isAndroid) _textCursorIds[id] = _looksLikeIBeam(rgba, width, height);
+    if (isAndroid) {
+      final why = iBeamReject(rgba, width, height);
+      _textCursorIds[id] = why == null;
+      parent.target?.inputModel.quest
+          .log('cur shape ${width}x$height ${why ?? "IBEAM"}');
+    }
     final hotx = hotxInt.toDouble();
     final hoty = hotyInt.toDouble();
     final image = await img.decodeImageFromPixels(
@@ -3869,7 +3874,14 @@ class CursorModel with ChangeNotifier {
       _image = null;
     }
     _evictImages();
-    if (isAndroid) remoteCursorIsText.value = _textCursorIds[_id] ?? false;
+    if (isAndroid) {
+      final t = _textCursorIds[_id] ?? false;
+      if (t != remoteCursorIsText.value) {
+        parent.target?.inputModel.quest
+            .log('cur now text=$t known=${_textCursorIds.containsKey(_id)}');
+      }
+      remoteCursorIsText.value = t;
+    }
     try {
       // may throw exception, because the listener maybe already dispose
       notifyListeners();
@@ -3879,48 +3891,52 @@ class CursorModel with ChangeNotifier {
     return tmp != null || cache != null;
   }
 
-  /// Heuristic: does this cursor bitmap look like a Windows text caret
-  /// (IDC_IBEAM)? The I-beam is a thin shape, clearly taller than wide, whose
-  /// opaque pixels form a near-full-height vertical stroke down the middle
-  /// (with small top/bottom serifs). Thresholds are deliberately loose; a false
-  /// negative just means the keyboard is not auto-opened (the manual button
-  /// still works), and the central-stroke test keeps arrow/resize/hand cursors
-  /// from matching. Client-only: no host or protocol change.
-  static bool _looksLikeIBeam(Uint8List rgba, int width, int height) {
-    if (width <= 0 || height <= 0 || rgba.length < width * height * 4) {
-      return false;
-    }
+  /// null when the bitmap is a text caret (I-beam); otherwise why not (for the debug readout).
+  /// The Windows host draws XOR cursors black with a 1px white outline, so IDC_IBEAM arrives as
+  /// an opaque 11x18 (100% DPI) / 16x27 (150%) "I": full-width first and last rows, thin centred stem.
+  @visibleForTesting
+  static String? iBeamReject(Uint8List rgba, int width, int height) {
+    if (width <= 0 || height <= 0 || rgba.length < width * height * 4) return 'bad-size';
+    final rowL = List<int>.filled(height, -1);
+    final rowR = List<int>.filled(height, -1);
+    final rowN = List<int>.filled(height, 0);
     int minx = width, miny = height, maxx = -1, maxy = -1;
-    final colTop = List<int>.filled(width, -1);
-    final colBottom = List<int>.filled(width, -1);
     for (int y = 0; y < height; y++) {
       final row = y * width;
       for (int x = 0; x < width; x++) {
         if (rgba[(row + x) * 4 + 3] > 128) {
+          if (rowL[y] < 0) rowL[y] = x;
+          rowR[y] = x;
+          rowN[y]++;
           if (x < minx) minx = x;
           if (x > maxx) maxx = x;
           if (y < miny) miny = y;
           if (y > maxy) maxy = y;
-          if (colTop[x] < 0) colTop[x] = y;
-          colBottom[x] = y;
         }
       }
     }
-    if (maxx < 0) return false; // fully transparent
-    final bw = maxx - minx + 1;
-    final bh = maxy - miny + 1;
-    if (bh < 8) return false; // too small to be a caret
-    if (bw > 16) return false; // the I-beam stays narrow even at high DPI
-    if (bh < bw * 2) return false; // must be clearly taller than wide
-    // A column near the horizontal centre spans most of the height.
-    final c0 = minx + (bw ~/ 3);
-    final c1 = maxx - (bw ~/ 3);
-    for (int x = c0; x <= c1; x++) {
-      if (colBottom[x] >= 0 && (colBottom[x] - colTop[x] + 1) >= bh * 0.8) {
-        return true;
-      }
+    if (maxx < 0) return 'empty';
+    final bw = maxx - minx + 1, bh = maxy - miny + 1;
+    final d = '${bw}x$bh';
+    if (bh < 10 || bw < 3 || bw > 48) return '$d size';
+    if (bh * 10 < bw * 13) return '$d aspect'; // at least 1.3x taller than wide
+    // Stem: every row of the middle half is one solid run at the same place.
+    final y0 = miny + bh ~/ 4, y1 = maxy - bh ~/ 4;
+    final sl = rowL[y0], sr = rowR[y0];
+    if (sl < 0) return '$d gap';
+    for (int y = y0; y <= y1; y++) {
+      if (rowL[y] < 0 ||
+          rowN[y] != rowR[y] - rowL[y] + 1 ||
+          (rowL[y] - sl).abs() > 1 ||
+          (rowR[y] - sr).abs() > 1) return '$d stem-shape';
     }
-    return false;
+    final sw = sr - sl + 1;
+    if (sw * 2 > bw) return '$d stem-wide';
+    if (((sl + sr) - (minx + maxx)).abs() > 3) return '$d off-centre';
+    // Serifs: the very first and very last rows span most of the width (an arrow tip does not).
+    final top = rowR[miny] - rowL[miny] + 1, bot = rowR[maxy] - rowL[maxy] + 1;
+    if (top * 10 < bw * 6 || bot * 10 < bw * 6) return '$d serif';
+    return null;
   }
 
   updateCursorId(Map<String, dynamic> evt) {

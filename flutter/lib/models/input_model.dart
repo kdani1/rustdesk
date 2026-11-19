@@ -1381,10 +1381,12 @@ class InputModel {
         } else if (_questLeftPressed) {
           _questLeftPressed = false;
           quest.button(MouseButtons.left, 'pointer', false);
+          quest.onLeftClick?.call();
         } else if (phase == 'up') {
           // Quick tap, never moved far: a normal left click.
           quest.button(MouseButtons.left, 'pointer', true);
           quest.button(MouseButtons.left, 'pointer', false);
+          quest.onLeftClick?.call();
         }
         break;
     }

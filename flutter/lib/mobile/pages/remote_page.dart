@@ -77,6 +77,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   Worker? _waylandKeyboardGateWorker;
   Worker? _questAutoKbdWorker;
+  Timer? _questClickKbdTimer;
+  DateTime _lastQuestClick = DateTime(0);
   bool _waylandKeyboardGateInitialized = false;
 
   InputModel get inputModel => gFFI.inputModel;
@@ -117,6 +119,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _questAutoKbdWorker = debounce<bool>(
         gFFI.cursorModel.remoteCursorIsText, _onRemoteTextCursor,
         time: const Duration(milliseconds: 350));
+    gFFI.inputModel.quest.onLeftClick = _onQuestLeftClick;
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
@@ -173,6 +176,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     clearWaylandKeyboardPromptSuppressedForConnection(sessionId.toString());
     _waylandKeyboardGateWorker?.dispose();
     _questAutoKbdWorker?.dispose();
+    gFFI.inputModel.quest.onLeftClick = null;
+    _questClickKbdTimer?.cancel();
     inputModel.keyboardInputAllowed = true;
     await gFFI.close();
     _timer?.cancel();
@@ -401,13 +406,36 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     inputModel.inputKey(char);
   }
 
-  void _onRemoteTextCursor(bool isText) {
-    if (!mounted || !isText) return;
+  void _onQuestLeftClick() {
+    _lastQuestClick = DateTime.now();
+    // The shape under the click arrives after a host cursor poll (33 ms) plus the round trip.
+    _questClickKbdTimer?.cancel();
+    _questClickKbdTimer = Timer(const Duration(milliseconds: 300),
+        () => _autoKeyboard(gFFI.cursorModel.remoteCursorIsText.value, 'click'));
+  }
+
+  // Worker: the cursor turned into a caret shortly after a click (no hover before the click).
+  void _onRemoteTextCursor(bool isText) => _autoKeyboard(isText, 'shape');
+
+  void _autoKeyboard(bool isText, String from) {
     final quest = inputModel.quest;
-    if (!quest.isQuest.value || !quest.autoKeyboard.value) return;
-    if (!gFFI.ffiModel.keyboard) return; // no keyboard permission on this session
-    // Already showing: do not re-open (would reset the field / steal focus).
-    if (keyboardVisibilityController.isVisible && _showEdit) return;
+    String? skip;
+    if (!mounted) return;
+    if (!isText) {
+      skip = 'not-text';
+    } else if (!quest.isQuest.value) {
+      skip = 'not-quest';
+    } else if (!quest.autoKeyboard.value) {
+      skip = 'toggle-off';
+    } else if (!gFFI.ffiModel.keyboard) {
+      skip = 'no-kbd-perm';
+    } else if (DateTime.now().difference(_lastQuestClick).inMilliseconds > 1500) {
+      skip = 'no-recent-click';
+    } else if (keyboardVisibilityController.isVisible && _showEdit) {
+      skip = 'already-open';
+    }
+    quest.log('autoKbd[$from] text=$isText -> ${skip ?? "OPEN"}');
+    if (skip != null) return;
     openKeyboard();
   }
 

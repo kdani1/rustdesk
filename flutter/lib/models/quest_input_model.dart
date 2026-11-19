@@ -71,10 +71,11 @@ class QuestInputModel {
   final isQuest = false.obs;
   final pointerMode = true.obs;
 
-  /// On-screen debug readout (the green status/event HUD). Off by default;
-  /// toggleable at runtime (left-stick click / Quest menu). Separate from the
-  /// compile-time [kQuestDebug] logcat flag.
-  final debug = false.obs;
+  /// On-screen debug readout (the green status/event HUD). On by default for
+  /// this diagnostic build so the auto-keyboard "cur shape"/"autoKbd" lines are
+  /// visible in the headset; toggleable at runtime (left-stick click / Quest
+  /// menu). Separate from the compile-time [kQuestDebug] logcat flag.
+  final debug = true.obs;
 
   /// Draw the local software cursor in the remote view. Off by default (the
   /// Quest's own laser pointer is enough); toggleable from the Quest menu.
@@ -83,6 +84,9 @@ class QuestInputModel {
   /// Auto-open the soft keyboard when the remote cursor becomes a text caret
   /// (see CursorModel.remoteCursorIsText). On by default; toggleable.
   final autoKeyboard = true.obs;
+
+  /// Called after a Quest pointer left click/drag is released (auto-keyboard hook).
+  void Function()? onLeftClick;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 
@@ -108,7 +112,7 @@ class QuestInputModel {
     _attached = true;
     pointerMode.value =
         bind.mainGetLocalOption(key: kOptionPointerMode) != 'N';
-    debug.value = bind.mainGetLocalOption(key: kOptionDebug) == 'Y';
+    debug.value = bind.mainGetLocalOption(key: kOptionDebug) != 'N';
     cursorOverlay.value =
         bind.mainGetLocalOption(key: kOptionCursorOverlay) == 'Y';
     autoKeyboard.value =
