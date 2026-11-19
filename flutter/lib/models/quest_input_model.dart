@@ -71,11 +71,11 @@ class QuestInputModel {
   final isQuest = false.obs;
   final pointerMode = true.obs;
 
-  /// On-screen debug readout (the green status/event HUD). On by default for
-  /// this diagnostic build so the auto-keyboard "cur shape"/"autoKbd" lines are
-  /// visible in the headset; toggleable at runtime (left-stick click / Quest
-  /// menu). Separate from the compile-time [kQuestDebug] logcat flag.
-  final debug = true.obs;
+  /// On-screen debug readout (the green status/event HUD). Off by default (it
+  /// distracts in normal use); on only when the user enabled it, toggleable at
+  /// runtime (left-stick click / Quest menu). Separate from the compile-time
+  /// [kQuestDebug] logcat flag.
+  final debug = false.obs;
 
   /// Draw the local software cursor in the remote view. Off by default (the
   /// Quest's own laser pointer is enough); toggleable from the Quest menu.
@@ -115,7 +115,7 @@ class QuestInputModel {
     _attached = true;
     pointerMode.value =
         bind.mainGetLocalOption(key: kOptionPointerMode) != 'N';
-    debug.value = bind.mainGetLocalOption(key: kOptionDebug) != 'N';
+    debug.value = bind.mainGetLocalOption(key: kOptionDebug) == 'Y';
     cursorOverlay.value =
         bind.mainGetLocalOption(key: kOptionCursorOverlay) == 'Y';
     autoKeyboard.value =
