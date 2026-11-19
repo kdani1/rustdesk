@@ -29,9 +29,16 @@ import 'platform_model.dart';
 /// direct touch are absolute: hover moves the remote cursor, press/release is a
 /// left button press/release at that point, and moving while pressed drags.
 /// See InputModel._questPointerEvent.
+
+/// Verbose "[quest] ..." logging to the device log. Off by default (the events
+/// are high-rate); flip to true and rebuild to debug. The on-screen debug
+/// readout is separate and stays controllable at runtime (left-stick / menu).
+const bool kQuestDebug = false;
+
 class QuestInputModel {
   static const kOptionPointerMode = 'quest-pointer-mode';
   static const kOptionDebug = 'quest-input-debug';
+  static const kOptionCursorOverlay = 'quest-cursor-overlay';
 
   // Android KeyEvent key codes.
   static const _kDpadUp = 19;
@@ -63,6 +70,10 @@ class QuestInputModel {
   final isQuest = false.obs;
   final pointerMode = true.obs;
   final debug = true.obs;
+
+  /// Draw the local software cursor in the remote view (it hides the small
+  /// pointer-tracking latency). On by default; toggleable from the Quest menu.
+  final cursorOverlay = true.obs;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 
@@ -89,6 +100,8 @@ class QuestInputModel {
     pointerMode.value =
         bind.mainGetLocalOption(key: kOptionPointerMode) != 'N';
     debug.value = bind.mainGetLocalOption(key: kOptionDebug) != 'N';
+    cursorOverlay.value =
+        bind.mainGetLocalOption(key: kOptionCursorOverlay) != 'N';
     String model = '';
     try {
       final info = await platformFFI.invokeMethod('quest_get_info');
@@ -138,6 +151,11 @@ class QuestInputModel {
     log('Pointer mode ${v ? 'ON' : 'OFF'}');
   }
 
+  void setCursorOverlay(bool v) {
+    cursorOverlay.value = v;
+    bind.mainSetLocalOption(key: kOptionCursorOverlay, value: v ? 'Y' : 'N');
+  }
+
   void setDebug(bool v) {
     debug.value = v;
     bind.mainSetLocalOption(key: kOptionDebug, value: v ? 'Y' : 'N');
@@ -150,7 +168,7 @@ class QuestInputModel {
 
   void log(String line) {
     if (!debug.value) return;
-    debugPrint('[quest] $line');
+    if (kQuestDebug) debugPrint('[quest] $line');
     debugLines.add(line);
     if (debugLines.length > 7) debugLines.removeRange(0, debugLines.length - 7);
   }

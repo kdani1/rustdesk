@@ -418,7 +418,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     inputModel.keyboardInputAllowed = true;
     gFFI.invokeMethod("enable_soft_keyboard", true);
     // destroy first, so that our _value trick can work
-    _value = initText;
+    // The phone trick pre-fills the hidden field with `initText` ('1' * 1024) so a
+    // backspace always has a sentinel char to consume; phone IMEs keep that text
+    // silent and only report later edits. The Quest's built-in keyboard instead
+    // commits the existing field text back through onChanged when it attaches, so
+    // the sentinel '1's were forwarded to the remote and flooded it with "1"s.
+    // On a Quest start empty: nothing to echo. (Trade-off: a backspace with an
+    // empty local field won't reach the remote; typing is unaffected.)
+    _value = gFFI.inputModel.quest.isQuest.value ? '' : initText;
     _textController.text = _value;
     setState(() => _showEdit = false);
     _timer?.cancel();
@@ -713,6 +720,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         tooltip: 'Quest controller',
         onSelected: (v) {
           if (v == 'pointer') quest.setPointerMode(!quest.pointerMode.value);
+          if (v == 'cursor') quest.setCursorOverlay(!quest.cursorOverlay.value);
           if (v == 'debug') quest.setDebug(!quest.debug.value);
         },
         itemBuilder: (_) => [
@@ -720,6 +728,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             value: 'pointer',
             checked: quest.pointerMode.value,
             child: const Text('Quest pointer mode (laser/touch = mouse)'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'cursor',
+            checked: quest.cursorOverlay.value,
+            child: const Text('Show cursor overlay'),
           ),
           CheckedPopupMenuItem(
             value: 'debug',
@@ -783,7 +796,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             ),
           ];
           if (showCursorPaint) {
-            paints.add(CursorPaint(widget.id));
+            // On a Quest the cursor overlay is toggleable (default on); elsewhere always shown.
+            paints.add(Obx(() =>
+                (!inputModel.quest.isQuest.value ||
+                        inputModel.quest.cursorOverlay.value)
+                    ? CursorPaint(widget.id)
+                    : const SizedBox.shrink()));
           }
           paints.add(_questDebugReadout());
           if (gFFI.ffiModel.touchMode) {

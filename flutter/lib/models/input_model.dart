@@ -1303,6 +1303,18 @@ class InputModel {
   int? _questPointer;
   MouseButtons _questPointerButton = MouseButtons.left;
 
+  // Long-press (laser/touch held still) -> right click, so the native Windows
+  // context menu (select/copy/paste/cut) comes up. The left press is deferred:
+  // holding still ~500 ms is a right click, moving first is a drag (left held),
+  // a quick release is a normal left click.
+  static const int _kQuestLongPressMs = 500;
+  static const double _kQuestLongPressSlop = 24.0; // logical px of travel
+  Timer? _questLongPressTimer;
+  Offset _questDownPos = Offset.zero;
+  Offset _questDownLocal = Offset.zero;
+  bool _questLeftPressed = false;
+  bool _questLongPressFired = false;
+
   /// Returns true when Quest pointer mode handled the event.
   bool _questPointerEvent(PointerEvent e, String phase) {
     if (!quest.pointerModeActive || !quest.attached) return false;
@@ -1326,20 +1338,70 @@ class InputModel {
             ? MouseButtons.right
             : MouseButtons.left;
         _questMoveTo(pos);
-        quest.button(_questPointerButton, 'pointer', true);
+        if (_questPointerButton == MouseButtons.left) {
+          _questDownPos = pos;
+          _questDownLocal = e.localPosition;
+          _questLeftPressed = false;
+          _questLongPressFired = false;
+          _questLongPressTimer?.cancel();
+          _questLongPressTimer = Timer(
+              const Duration(milliseconds: _kQuestLongPressMs),
+              _questLongPressFire);
+        } else {
+          // Laser reporting a secondary button already: pass it straight through.
+          quest.button(_questPointerButton, 'pointer', true);
+        }
         break;
       case 'move':
-        if (_questPointer == e.pointer) _questMoveTo(pos);
+        if (_questPointer != e.pointer) break;
+        _questMoveTo(pos);
+        if (_questPointerButton == MouseButtons.left &&
+            !_questLeftPressed &&
+            !_questLongPressFired &&
+            (e.localPosition - _questDownLocal).distance >
+                _kQuestLongPressSlop) {
+          // Moved before the long-press fired: it's a drag -> press left now.
+          _questLongPressTimer?.cancel();
+          _questLongPressTimer = null;
+          _questLeftPressed = true;
+          quest.button(MouseButtons.left, 'pointer', true);
+        }
         break;
       case 'up':
       case 'cancel':
         if (_questPointer != e.pointer) break;
+        _questLongPressTimer?.cancel();
+        _questLongPressTimer = null;
         if (phase == 'up') _questMoveTo(pos);
         _questPointer = null;
-        quest.button(_questPointerButton, 'pointer', false);
+        if (_questPointerButton == MouseButtons.right) {
+          quest.button(MouseButtons.right, 'pointer', false);
+        } else if (_questLongPressFired) {
+          // Right click already sent on long-press; nothing is held.
+        } else if (_questLeftPressed) {
+          _questLeftPressed = false;
+          quest.button(MouseButtons.left, 'pointer', false);
+        } else if (phase == 'up') {
+          // Quick tap, never moved far: a normal left click.
+          quest.button(MouseButtons.left, 'pointer', true);
+          quest.button(MouseButtons.left, 'pointer', false);
+        }
         break;
     }
     return true;
+  }
+
+  void _questLongPressFire() {
+    _questLongPressTimer = null;
+    if (_questPointer == null || _questLeftPressed || _questLongPressFired) {
+      return;
+    }
+    if (!quest.pointerModeActive || !quest.attached) return;
+    _questLongPressFired = true;
+    // Right click at the press position -> native context menu.
+    _questMoveTo(_questDownPos);
+    quest.button(MouseButtons.right, 'longpress', true);
+    quest.button(MouseButtons.right, 'longpress', false);
   }
 
   void _questMoveTo(Offset pos) {

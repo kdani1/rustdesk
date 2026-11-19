@@ -30,6 +30,9 @@ import kotlin.math.max
 object QuestInput {
     private const val TAG = "QuestInput"
 
+    /** Verbose logcat for controller/pointer events. Off by default; flip to true and rebuild to debug. */
+    private const val LOG = false
+
     /** Set by Dart while the remote page is open on a Quest: controller events are consumed. */
     @Volatile
     var active = false
@@ -78,7 +81,7 @@ object QuestInput {
     }
 
     private fun debugText(channel: MethodChannel?, text: String) {
-        Log.d(TAG, text)
+        if (LOG) Log.d(TAG, text)
         send(channel, mapOf("k" to "dbg", "t" to text))
     }
 
@@ -217,7 +220,7 @@ object QuestInput {
             (args["debug"] as? Boolean)?.let { debug = it }
             if (!active) lastAxes.fill(0f)
         }
-        Log.d(TAG, "configure: active=$active debug=$debug isQuest=$isQuest")
+        if (LOG) Log.d(TAG, "configure: active=$active debug=$debug isQuest=$isQuest")
         return isQuest
     }
 
