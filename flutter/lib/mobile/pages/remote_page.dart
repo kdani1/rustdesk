@@ -76,6 +76,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   var _showEdit = false; // use soft keyboard
 
   Worker? _waylandKeyboardGateWorker;
+  Worker? _questAutoKbdWorker;
   bool _waylandKeyboardGateInitialized = false;
 
   InputModel get inputModel => gFFI.inputModel;
@@ -109,6 +110,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _physicalFocusNode.requestFocus();
     gFFI.inputModel.listenToMouse(true);
     unawaited(gFFI.inputModel.quest.attach());
+    // Quest auto-keyboard: when the remote cursor becomes a text caret, bring up
+    // the soft keyboard. Debounced so a brief hover over text, or cursor flicker,
+    // does not open it; it is never auto-closed (the user closes it), so moving
+    // off text leaves it open rather than flickering.
+    _questAutoKbdWorker = debounce<bool>(
+        gFFI.cursorModel.remoteCursorIsText, _onRemoteTextCursor,
+        time: const Duration(milliseconds: 350));
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
@@ -164,6 +172,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _physicalFocusNode.dispose();
     clearWaylandKeyboardPromptSuppressedForConnection(sessionId.toString());
     _waylandKeyboardGateWorker?.dispose();
+    _questAutoKbdWorker?.dispose();
     inputModel.keyboardInputAllowed = true;
     await gFFI.close();
     _timer?.cancel();
@@ -390,6 +399,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       char = 'VK_SPACE';
     }
     inputModel.inputKey(char);
+  }
+
+  void _onRemoteTextCursor(bool isText) {
+    if (!mounted || !isText) return;
+    final quest = inputModel.quest;
+    if (!quest.isQuest.value || !quest.autoKeyboard.value) return;
+    if (!gFFI.ffiModel.keyboard) return; // no keyboard permission on this session
+    // Already showing: do not re-open (would reset the field / steal focus).
+    if (keyboardVisibilityController.isVisible && _showEdit) return;
+    openKeyboard();
   }
 
   void openKeyboard() {
@@ -721,6 +740,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         onSelected: (v) {
           if (v == 'pointer') quest.setPointerMode(!quest.pointerMode.value);
           if (v == 'cursor') quest.setCursorOverlay(!quest.cursorOverlay.value);
+          if (v == 'autokbd') {
+            quest.setAutoKeyboard(!quest.autoKeyboard.value);
+          }
           if (v == 'debug') quest.setDebug(!quest.debug.value);
         },
         itemBuilder: (_) => [
@@ -733,6 +755,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             value: 'cursor',
             checked: quest.cursorOverlay.value,
             child: const Text('Show cursor overlay'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'autokbd',
+            checked: quest.autoKeyboard.value,
+            child: const Text('Auto-open keyboard on text fields'),
           ),
           CheckedPopupMenuItem(
             value: 'debug',

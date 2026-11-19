@@ -39,6 +39,7 @@ class QuestInputModel {
   static const kOptionPointerMode = 'quest-pointer-mode';
   static const kOptionDebug = 'quest-input-debug';
   static const kOptionCursorOverlay = 'quest-cursor-overlay';
+  static const kOptionAutoKeyboard = 'quest-auto-keyboard';
 
   // Android KeyEvent key codes.
   static const _kDpadUp = 19;
@@ -78,6 +79,10 @@ class QuestInputModel {
   /// Draw the local software cursor in the remote view. Off by default (the
   /// Quest's own laser pointer is enough); toggleable from the Quest menu.
   final cursorOverlay = false.obs;
+
+  /// Auto-open the soft keyboard when the remote cursor becomes a text caret
+  /// (see CursorModel.remoteCursorIsText). On by default; toggleable.
+  final autoKeyboard = true.obs;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 
@@ -106,6 +111,8 @@ class QuestInputModel {
     debug.value = bind.mainGetLocalOption(key: kOptionDebug) == 'Y';
     cursorOverlay.value =
         bind.mainGetLocalOption(key: kOptionCursorOverlay) == 'Y';
+    autoKeyboard.value =
+        bind.mainGetLocalOption(key: kOptionAutoKeyboard) != 'N';
     String model = '';
     try {
       final info = await platformFFI.invokeMethod('quest_get_info');
@@ -158,6 +165,11 @@ class QuestInputModel {
   void setCursorOverlay(bool v) {
     cursorOverlay.value = v;
     bind.mainSetLocalOption(key: kOptionCursorOverlay, value: v ? 'Y' : 'N');
+  }
+
+  void setAutoKeyboard(bool v) {
+    autoKeyboard.value = v;
+    bind.mainSetLocalOption(key: kOptionAutoKeyboard, value: v ? 'Y' : 'N');
   }
 
   void setDebug(bool v) {

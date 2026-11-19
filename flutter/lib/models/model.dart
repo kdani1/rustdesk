@@ -3175,6 +3175,11 @@ class CursorModel with ChangeNotifier {
   // int.parse(evt['id']) may cause FormatException
   // So we use String here.
   String _id = "-1";
+  // Quest auto-keyboard: whether the current remote cursor looks like a text
+  // caret (Windows IDC_IBEAM). Computed per shape from its bitmap (Android only)
+  // and republished whenever the current cursor changes. See [_looksLikeIBeam].
+  final RxBool remoteCursorIsText = false.obs;
+  final _textCursorIds = <String, bool>{};
   double _hotx = 0;
   double _hoty = 0;
   double _displayOriginX = 0;
@@ -3602,6 +3607,7 @@ class CursorModel with ChangeNotifier {
       int height, Uint8List rgba) async {
     final generation = _generation;
     if (_unavailable == id) _unavailable = null;
+    if (isAndroid) _textCursorIds[id] = _looksLikeIBeam(rgba, width, height);
     final hotx = hotxInt.toDouble();
     final hoty = hotyInt.toDouble();
     final image = await img.decodeImageFromPixels(
@@ -3863,6 +3869,7 @@ class CursorModel with ChangeNotifier {
       _image = null;
     }
     _evictImages();
+    if (isAndroid) remoteCursorIsText.value = _textCursorIds[_id] ?? false;
     try {
       // may throw exception, because the listener maybe already dispose
       notifyListeners();
@@ -3870,6 +3877,50 @@ class CursorModel with ChangeNotifier {
       debugPrint('WARNING: updateCursorId $_id, without notifyListeners(). $e');
     }
     return tmp != null || cache != null;
+  }
+
+  /// Heuristic: does this cursor bitmap look like a Windows text caret
+  /// (IDC_IBEAM)? The I-beam is a thin shape, clearly taller than wide, whose
+  /// opaque pixels form a near-full-height vertical stroke down the middle
+  /// (with small top/bottom serifs). Thresholds are deliberately loose; a false
+  /// negative just means the keyboard is not auto-opened (the manual button
+  /// still works), and the central-stroke test keeps arrow/resize/hand cursors
+  /// from matching. Client-only: no host or protocol change.
+  static bool _looksLikeIBeam(Uint8List rgba, int width, int height) {
+    if (width <= 0 || height <= 0 || rgba.length < width * height * 4) {
+      return false;
+    }
+    int minx = width, miny = height, maxx = -1, maxy = -1;
+    final colTop = List<int>.filled(width, -1);
+    final colBottom = List<int>.filled(width, -1);
+    for (int y = 0; y < height; y++) {
+      final row = y * width;
+      for (int x = 0; x < width; x++) {
+        if (rgba[(row + x) * 4 + 3] > 128) {
+          if (x < minx) minx = x;
+          if (x > maxx) maxx = x;
+          if (y < miny) miny = y;
+          if (y > maxy) maxy = y;
+          if (colTop[x] < 0) colTop[x] = y;
+          colBottom[x] = y;
+        }
+      }
+    }
+    if (maxx < 0) return false; // fully transparent
+    final bw = maxx - minx + 1;
+    final bh = maxy - miny + 1;
+    if (bh < 8) return false; // too small to be a caret
+    if (bw > 16) return false; // the I-beam stays narrow even at high DPI
+    if (bh < bw * 2) return false; // must be clearly taller than wide
+    // A column near the horizontal centre spans most of the height.
+    final c0 = minx + (bw ~/ 3);
+    final c1 = maxx - (bw ~/ 3);
+    for (int x = c0; x <= c1; x++) {
+      if (colBottom[x] >= 0 && (colBottom[x] - colTop[x] + 1) >= bh * 0.8) {
+        return true;
+      }
+    }
+    return false;
   }
 
   updateCursorId(Map<String, dynamic> evt) {
