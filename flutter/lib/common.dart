@@ -30,6 +30,8 @@ import 'package:window_size/window_size.dart' as window_size;
 
 import '../consts.dart';
 import 'common/widgets/overlay.dart';
+import 'common/widgets/toolbar.dart'
+    show toggleAmyuniVirtualDisplay, showVirtualDisplayMenu;
 import 'mobile/pages/file_manager_page.dart';
 import 'mobile/pages/remote_page.dart';
 import 'mobile/pages/view_camera_page.dart';
@@ -700,6 +702,10 @@ String formatDurationToTime(Duration duration) {
 }
 
 closeConnection({String? id}) {
+  if (isDisplayPanel) {
+    closeDisplayPanel();
+    return;
+  }
   if (isAndroid || isIOS) {
     () async {
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
@@ -1595,9 +1601,684 @@ late FFI _globalFFI;
 
 FFI get gFFI => _globalFFI;
 
-Future<void> initGlobalFFI() async {
+/// Android: set in an engine that runs as an extra display panel (DisplayActivity):
+/// {id, sid, display, cache}.
+Map<String, dynamic>? kDisplayPanelArgs;
+bool get isDisplayPanel => kDisplayPanelArgs != null;
+
+/// Extra display panel: detach this panel's UI session and close its window. The connection
+/// stays: it belongs to the main panel.
+Future<void> closeDisplayPanel() async {
+  try {
+    await bind
+        .sessionClose(sessionId: gFFI.sessionId)
+        .timeout(const Duration(seconds: 1));
+  } catch (e) {
+    debugPrint('panel: sessionClose failed: $e');
+  }
+  platformFFI.invokeMethod('panel_finish');
+}
+
+/// Main engine only (Android): the extra Quest panels, one per remote display. Each is a
+/// second UI session on this connection, shown by its own activity and Flutter engine.
+///
+/// Two rules keep it sound: a display has one reader (the main window shows one display, the
+/// panels the others), and nobody switches displays while panels are open (a switch replaces
+/// the host's capture set), so every switch closes the panels first.
+///
+/// The session starts with the main window alone. "+" gives one more display a window (a new
+/// virtual display if every display has one), "-" takes the last one away again.
+class AndroidDisplayPanels {
+  static const _kSessionKey = 'quest-display-session';
+  static const _kAutoOrderKey = 'quest-panel-auto-order';
+
+  final _open = <int, String>{}; // display -> the panel's UI session id
+  final isOpenRx = false.obs;
+
+  /// Bumped on every change, for the toolbar and the overview.
+  final revision = 0.obs;
+  bool _busy = false;
+  // Displays asked from the host ("+", session restore) that have not arrived yet.
+  int _pendingAdds = 0;
+  int _addAskedMs = 0;
+  // Left-to-right order to apply once every pending display has its window.
+  List<int>? _orderAfterAdds;
+  int _lastAutoOrderMs = 0;
+
+  /// The restore question was asked on this connection.
+  bool restoreOffered = false;
+
+  bool get isOpen => _open.isNotEmpty;
+  bool isPanelOpen(int display) => _open.containsKey(display);
+  bool get _waitingForDisplay =>
+      _pendingAdds > 0 &&
+      DateTime.now().millisecondsSinceEpoch - _addAskedMs < 30000;
+
+  /// Follow the laser: when it goes from one window straight into another, the host's
+  /// displays are put in that order.
+  bool get autoOrder => bind.mainGetLocalOption(key: _kAutoOrderKey) != 'N';
+  set autoOrder(bool v) {
+    bind.mainSetLocalOption(key: _kAutoOrderKey, value: v ? '' : 'N');
+    revision.value++;
+  }
+
+  /// A new connection starts: nothing is open, nothing is pending.
+  void newConnection() {
+    _open.clear();
+    isOpenRx.value = false;
+    _pendingAdds = 0;
+    _orderAfterAdds = null;
+    restoreOffered = false;
+    revision.value++;
+  }
+
+  /// The display the main window shows.
+  int mainDisplay(FFI ffi) {
+    final pi = ffi.ffiModel.pi;
+    var d = pi.currentDisplay;
+    if (d < 0 || d >= pi.displays.length) d = pi.primaryDisplay;
+    if (d < 0 || d >= pi.displays.length) d = 0;
+    return d;
+  }
+
+  /// Display indices from left to right, as the host has them.
+  List<int> order(FFI ffi) {
+    final ds = ffi.ffiModel.pi.displays;
+    final l = List.generate(ds.length, (i) => i);
+    l.sort((a, b) {
+      final c = ds[a].x.compareTo(ds[b].x);
+      return c != 0 ? c : a.compareTo(b);
+    });
+    return l;
+  }
+
+  bool canPlug(FFI ffi) {
+    final m = ffi.ffiModel;
+    return m.pi.isAmyuniIdd &&
+        showVirtualDisplayMenu(ffi) &&
+        m.keyboard &&
+        !m.viewOnly &&
+        m.pi.amyuniVirtualDisplayCount < 4 &&
+        m.pi.displays.length < 4;
+  }
+
+  void _changed(FFI ffi, {bool save = true}) {
+    _poses.removeWhere((id, _) => id >= 0 && !_open.containsKey(id));
+    _lastLayoutSent = '';
+    isOpenRx.value = isOpen;
+    revision.value++;
+    if (save) _save(ffi);
+  }
+
+  // What to offer at the next connection: how many displays had a window, and their order.
+  void _save(FFI ffi) {
+    if (ffi.id.isEmpty) return;
+    try {
+      bind.mainSetPeerOptionSync(
+          id: ffi.id,
+          key: _kSessionKey,
+          value: _open.isEmpty
+              ? ''
+              : jsonEncode({
+                  'n': _open.length,
+                  'open': (_open.keys.toList()..sort()),
+                  'order': order(ffi),
+                }));
+    } catch (e) {
+      debugPrint('[panel] save failed: $e');
+    }
+  }
+
+  Future<void> _openPanels(FFI ffi, List<int> displays) async {
+    if (!isAndroid || isDisplayPanel || _busy || displays.isEmpty) return;
+    final pi = ffi.ffiModel.pi;
+    _busy = true;
+    try {
+      // The core's key for the connection can differ from ffi.id (id@server, relay suffix).
+      if (bind.peerGetSessionsCount(id: ffi.id, connType: ffi.connType.index) <
+          1) {
+        showToast('Separate windows are not available for this connection');
+        return;
+      }
+      var keep = pi.currentDisplay;
+      if (keep == kAllDisplayValue) {
+        keep = mainDisplay(ffi);
+        _openMonitorInTheSameTab(keep, ffi, pi);
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+      // With more than one UI session the core sends a display's frames only to a session
+      // that lists it: make sure the main view's display is on its list (no-op if it is).
+      if (keep >= 0 && keep < pi.displays.length) {
+        await bind.sessionSetSize(
+            sessionId: ffi.sessionId,
+            display: keep,
+            width: pi.displays[keep].width,
+            height: pi.displays[keep].height);
+      }
+      // Frames of the other displays that still reach the main view must not be shown.
+      ffi.imageModel.dropOtherDisplays();
+      final cache = ffi.ffiModel.cachedPeerData.toString();
+      for (final i in displays) {
+        if (i == keep ||
+            i < 0 ||
+            i >= pi.displays.length ||
+            _open.containsKey(i)) {
+          continue;
+        }
+        final sid = const Uuid().v4();
+        _open[i] = sid;
+        isOpenRx.value = true;
+        final ok = await platformFFI.invokeMethod('panel_open', {
+          'display': i,
+          'sid': sid,
+          'args': jsonEncode({
+            'id': ffi.id,
+            'sid': sid,
+            'display': i,
+            'cache': cache,
+            // The host announces this once per connection, before any panel exists.
+            'hostAnswersFocus': ffi.inputModel.quest.hostAnswersFocus,
+          }),
+        });
+        debugPrint('[panel] open display $i: $ok');
+        if (ok != true && _open[i] == sid) _open.remove(i);
+      }
+    } catch (e) {
+      debugPrint('[panel] open failed: $e');
+    } finally {
+      _busy = false;
+      _changed(ffi);
+    }
+  }
+
+  /// A window for one display that has none.
+  Future<void> openPanel(FFI ffi, int display) => _openPanels(ffi, [display]);
+
+  void _requestPlug(FFI ffi) {
+    _addAskedMs = DateTime.now().millisecondsSinceEpoch;
+    debugPrint('[panel] ask the host for one more display ($_pendingAdds pending)');
+    toggleAmyuniVirtualDisplay(ffi, true);
+  }
+
+  /// "+": one more display in a window of its own. A display without a window gets one;
+  /// otherwise the host is asked for a new virtual display, which gets its window when it
+  /// arrives ([onDisplaysGrown]).
+  Future<void> addOne(FFI ffi) async {
+    if (!isAndroid || isDisplayPanel || _busy || _waitingForDisplay) return;
+    final pi = ffi.ffiModel.pi;
+    final keep = mainDisplay(ffi);
+    for (var i = 0; i < pi.displays.length; i++) {
+      if (i != keep && !_open.containsKey(i)) {
+        await _openPanels(ffi, [i]);
+        return;
+      }
+    }
+    if (!canPlug(ffi)) {
+      showToast('No more displays can be added');
+      return;
+    }
+    _pendingAdds = 1;
+    _requestPlug(ffi);
+  }
+
+  /// The host's display list grew (FfiModel.handleSyncPeerInfo).
+  void onDisplaysGrown(FFI ffi, int oldCount, int newCount) {
+    if (!_waitingForDisplay) {
+      _pendingAdds = 0;
+      return;
+    }
+    final fresh = [for (var i = oldCount; i < newCount; i++) i];
+    _pendingAdds -= fresh.length;
+    if (_pendingAdds < 0) _pendingAdds = 0;
+    () async {
+      await _openPanels(ffi, fresh);
+      if (_pendingAdds > 0) {
+        if (canPlug(ffi)) {
+          _requestPlug(ffi);
+          return;
+        }
+        _pendingAdds = 0;
+      }
+      final o = _orderAfterAdds;
+      _orderAfterAdds = null;
+      if (o != null) {
+        // The host is still settling its new display.
+        await Future.delayed(const Duration(milliseconds: 1500));
+        applyOrder(ffi, o);
+      }
+    }();
+  }
+
+  /// The host's display list shrank: the windows of the displays that went away go too.
+  void onDisplaysShrunk(FFI ffi, int newCount) {
+    for (final d in _open.keys.where((d) => d >= newCount).toList()) {
+      closePanel(ffi, d);
+    }
+    // The next windowless display at the end, if any.
+    Future.delayed(const Duration(milliseconds: 1700), () {
+      if (!ffi.closed) trimTrailing(ffi);
+    });
+  }
+
+  /// Closes one display's window. The display itself stays on the host.
+  Future<void> closePanel(FFI ffi, int display) async {
+    final sid = _open.remove(display);
+    if (sid == null) return;
+    debugPrint('[panel] close display $display');
+    _changed(ffi);
+    try {
+      await bind.sessionClose(sessionId: UuidValue(sid));
+      await bind.setCurSessionId(sessionId: gFFI.sessionId);
+    } catch (e) {
+      debugPrint('[panel] close: $e');
+    }
+    platformFFI.invokeMethod('panel_close', sid);
+  }
+
+  /// Takes [display] away: its window, and the display itself when it is the host's last
+  /// virtual one (the driver can only remove the one added last).
+  Future<void> removeDisplay(FFI ffi, int display) async {
+    final pi = ffi.ffiModel.pi;
+    if (display == mainDisplay(ffi)) return;
+    await closePanel(ffi, display);
+    trimTrailing(ffi);
+  }
+
+  int _lastTrimMs = 0;
+
+  /// A virtual display exists only while it has a window: every display without one slows
+  /// the host's capture of the others. The host's last display is unplugged when it has no
+  /// window (the driver can only remove the one added last); the shorter list brings this
+  /// here again for the next one ([onDisplaysShrunk]).
+  void trimTrailing(FFI ffi) {
+    if (!isAndroid || isDisplayPanel || _busy || _waitingForDisplay) return;
+    final pi = ffi.ffiModel.pi;
+    final last = pi.displays.length - 1;
+    if (last < 1 || last == mainDisplay(ffi) || _open.containsKey(last)) return;
+    if (!pi.isAmyuniIdd ||
+        pi.amyuniVirtualDisplayCount < 1 ||
+        !ffi.ffiModel.keyboard ||
+        ffi.ffiModel.viewOnly) {
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastTrimMs < 1500) return;
+    _lastTrimMs = now;
+    debugPrint('[panel] display ${last + 1} has no window: ask the host to remove it');
+    toggleAmyuniVirtualDisplay(ffi, false);
+  }
+
+  /// "-": the display added last goes.
+  Future<void> removeLast(FFI ffi) async {
+    if (!isAndroid || isDisplayPanel || _busy) return;
+    final pi = ffi.ffiModel.pi;
+    final keep = mainDisplay(ffi);
+    final last = pi.displays.length - 1;
+    for (var d = last; d >= 0; d--) {
+      if (d == keep) continue;
+      final unplug = d == last &&
+          d > 0 &&
+          pi.isAmyuniIdd &&
+          pi.amyuniVirtualDisplayCount > 0 &&
+          ffi.ffiModel.keyboard &&
+          !ffi.ffiModel.viewOnly;
+      if (!_open.containsKey(d) && !unplug) continue;
+      await removeDisplay(ffi, d);
+      return;
+    }
+    showToast('Nothing to remove');
+  }
+
+  Future<void> closeAll() async {
+    if (!isOpen) return;
+    final sids = _open.values.toList();
+    _open.clear();
+    isOpenRx.value = false;
+    revision.value++;
+    _pendingAdds = 0;
+    _orderAfterAdds = null;
+    debugPrint('[panel] close all (${sids.length})');
+    try {
+      await Future.wait(
+          sids.map((s) => bind.sessionClose(sessionId: UuidValue(s))));
+      await bind.setCurSessionId(sessionId: gFFI.sessionId);
+    } catch (e) {
+      debugPrint('[panel] closeAll: $e');
+    }
+    platformFFI.invokeMethod('panel_close_all');
+  }
+
+  /// The window of a panel is gone (its own close button, or the system one).
+  void onPanelClosed(int display, String sid) {
+    debugPrint('[panel] closed display $display');
+    bind.sessionClose(sessionId: UuidValue(sid)); // no-op if the panel did it itself
+    if (_open[display] == sid) {
+      _open.remove(display);
+      _changed(gFFI);
+      // Closed with its own button: the display goes with its window if it is the last.
+      trimTrailing(gFFI);
+    }
+    if (gFFI.id.isNotEmpty) bind.setCurSessionId(sessionId: gFFI.sessionId);
+  }
+
+  /// Asks the host to put its displays in one row in this left-to-right order
+  /// (ToggleVirtualDisplay values from 9000 on, see connection.rs on the host).
+  Future<void> applyOrder(FFI ffi, List<int> order) async {
+    // Only a host of this fork knows the request (it says so); any other Windows host
+    // would plug in a virtual display instead.
+    if (ffi.ffiModel.pi.platformAdditions['display_row_layout'] != true) {
+      debugPrint('[panel] the host cannot arrange its displays');
+      return;
+    }
+    final n = ffi.ffiModel.pi.displays.length;
+    if (n < 2 ||
+        n > 4 ||
+        order.length != n ||
+        order.toSet().length != n ||
+        order.any((d) => d < 0 || d >= n)) {
+      return;
+    }
+    var code = 0;
+    for (var i = 0; i < n; i++) {
+      code |= order[i] << (2 * i);
+    }
+    debugPrint('[panel] order $order');
+    try {
+      // The toggle call also edits the stored list of displays to plug in again: undo it.
+      const key = 'virtual-display';
+      final before =
+          await bind.sessionGetPeerOption(sessionId: ffi.sessionId, name: key);
+      await bind.sessionToggleVirtualDisplay(
+          sessionId: ffi.sessionId, index: 9000 + n * 256 + code, on: true);
+      await bind.sessionPeerOption(
+          sessionId: ffi.sessionId, name: key, value: before);
+    } catch (e) {
+      debugPrint('[panel] order failed: $e');
+    }
+    // The host's new positions arrive with its next display list.
+    Future.delayed(const Duration(seconds: 2), () {
+      revision.value++;
+      if (isOpen) _save(ffi);
+    });
+  }
+
+  /// Overview: [display] one place to the left (-1) or right (+1).
+  void move(FFI ffi, int display, int by) {
+    final o = order(ffi);
+    final i = o.indexOf(display);
+    final j = i + by;
+    if (i < 0 || j < 0 || j >= o.length) return;
+    o[i] = o[j];
+    o[j] = display;
+    applyOrder(ffi, o);
+  }
+
+  // Where each window stands in space, from Horizon OS (PoseWatcher in DisplayActivity.kt):
+  // -1 = the main window, else the display a panel shows -> position x,y,z (m), orientation
+  // x,y,z,w, width and height (m).
+  final _poses = <int, List<double>>{};
+  Timer? _poseTimer;
+  String _lastLayoutSent = '';
+
+  void onPose(FFI ffi, int id, List<double> v) {
+    if (v.length < 9) return;
+    _poses[id] = v;
+    _poseTimer?.cancel();
+    _poseTimer =
+        Timer(const Duration(milliseconds: 600), () => _layoutFromPoses(ffi));
+  }
+
+  /// The host's displays arranged the way their windows stand in space: the main display
+  /// stays, every other one goes edge to edge against the nearest display already placed,
+  /// on the side its window is on, shifted along that edge as the window is (small shifts
+  /// are taken as none). This is what the system's own remote desktop app does.
+  void _layoutFromPoses(FFI ffi) {
+    if (!autoOrder || !isOpen || ffi.closed || _busy || _waitingForDisplay) {
+      return;
+    }
+    final pi = ffi.ffiModel.pi;
+    if (pi.platformAdditions['display_xy_layout'] != true) return;
+    final n = pi.displays.length;
+    if (n < 2 || n > 4) return;
+    final keep = mainDisplay(ffi);
+    final mp = _poses[-1];
+    if (mp == null || mp[7] <= 0) return;
+    // Every display needs a window whose place is known.
+    for (var i = 0; i < n; i++) {
+      if (i != keep && (!_open.containsKey(i) || _poses[i] == null)) return;
+    }
+    final ppm = pi.displays[keep].width / mp[7]; // remote pixels per metre
+    // The main window's right and up directions.
+    final qx = mp[3], qy = mp[4], qz = mp[5], qw = mp[6];
+    final rx = 1 - 2 * (qy * qy + qz * qz);
+    final ry = 2 * (qx * qy + qw * qz);
+    final rz = 2 * (qx * qz - qw * qy);
+    final ux = 2 * (qx * qy - qw * qz);
+    final uy = 1 - 2 * (qx * qx + qz * qz);
+    final uz = 2 * (qy * qz + qw * qx);
+    // Centre of each window in remote pixels, the main window's centre at 0,0, y down.
+    final cx = <int, double>{keep: 0};
+    final cy = <int, double>{keep: 0};
+    for (var i = 0; i < n; i++) {
+      if (i == keep) continue;
+      final p = _poses[i]!;
+      final dx = p[0] - mp[0], dy = p[1] - mp[1], dz = p[2] - mp[2];
+      cx[i] = (dx * rx + dy * ry + dz * rz) * ppm;
+      cy[i] = -(dx * ux + dy * uy + dz * uz) * ppm;
+    }
+    final pos = <int, List<int>>{
+      keep: [0, 0]
+    };
+    final rest = [
+      for (var i = 0; i < n; i++)
+        if (i != keep) i
+    ]..sort((a, b) => (cx[a]! * cx[a]! + cy[a]! * cy[a]!)
+        .compareTo(cx[b]! * cx[b]! + cy[b]! * cy[b]!));
+    for (final d in rest) {
+      var nb = keep;
+      var best = double.infinity;
+      for (final k in pos.keys) {
+        final ex = cx[d]! - cx[k]!, ey = cy[d]! - cy[k]!;
+        final dd = ex * ex + ey * ey;
+        if (dd < best) {
+          best = dd;
+          nb = k;
+        }
+      }
+      final wd = pi.displays[d].width, hd = pi.displays[d].height;
+      final wn = pi.displays[nb].width, hn = pi.displays[nb].height;
+      final ex = cx[d]! - cx[nb]!, ey = cy[d]! - cy[nb]!;
+      int x, y;
+      if (ex.abs() / (wd + wn) >= ey.abs() / (hd + hn)) {
+        // Beside it: left or right, and how far up or down along that edge.
+        x = pos[nb]![0] + (ex >= 0 ? wn : -wd);
+        var off = (ey - (hd - hn) / 2).round();
+        if (off.abs() < 60) off = 0;
+        off = off.clamp(-(hd - 120), hn - 120).toInt();
+        y = pos[nb]![1] + off;
+      } else {
+        // Above or below it.
+        y = pos[nb]![1] + (ey >= 0 ? hn : -hd);
+        var off = (ex - (wd - wn) / 2).round();
+        if (off.abs() < 60) off = 0;
+        off = off.clamp(-(wd - 120), wn - 120).toInt();
+        x = pos[nb]![0] + off;
+      }
+      pos[d] = [x, y];
+    }
+    final key = [
+      for (var i = 0; i < n; i++) '${pos[i]![0]},${pos[i]![1]}'
+    ].join(';');
+    if (key == _lastLayoutSent) return;
+    _lastLayoutSent = key;
+    // Already what the host has?
+    final ox = pi.displays[keep].x, oy = pi.displays[keep].y;
+    var same = true;
+    for (var i = 0; i < n; i++) {
+      if ((pi.displays[i].x - ox).round() != pos[i]![0] ||
+          (pi.displays[i].y - oy).round() != pos[i]![1]) {
+        same = false;
+      }
+    }
+    debugPrint('[panel] windows in space -> displays $key${same ? ' (as it is)' : ''}');
+    if (!same) _sendPositions(ffi, pos);
+  }
+
+  /// One ToggleVirtualDisplay value per display (bit 30, display index, x, y), then one that
+  /// says "apply": see toggle_virtual_display in the host's connection.rs.
+  Future<void> _sendPositions(FFI ffi, Map<int, List<int>> pos) async {
+    for (final v in pos.values) {
+      if (v[0] < -8192 || v[0] > 8191 || v[1] < -4096 || v[1] > 4095) return;
+    }
+    try {
+      // The toggle call also edits the stored list of displays to plug in again: undo it.
+      const key = 'virtual-display';
+      final before =
+          await bind.sessionGetPeerOption(sessionId: ffi.sessionId, name: key);
+      for (final e in pos.entries) {
+        await bind.sessionToggleVirtualDisplay(
+            sessionId: ffi.sessionId,
+            index: 0x40000000 |
+                (e.key << 27) |
+                ((e.value[0] + 8192) << 13) |
+                (e.value[1] + 4096),
+            on: true);
+      }
+      await bind.sessionToggleVirtualDisplay(
+          sessionId: ffi.sessionId, index: 0x40000000 | (7 << 27), on: true);
+      await bind.sessionPeerOption(
+          sessionId: ffi.sessionId, name: key, value: before);
+    } catch (e) {
+      debugPrint('[panel] positions failed: $e');
+    }
+    Future.delayed(const Duration(seconds: 2), () {
+      revision.value++;
+      if (isOpen) _save(ffi);
+    });
+  }
+
+  /// The laser left one window on its right edge and entered another on its left edge:
+  /// [right] stands to the right of [left] (-1 is the main window). Only used when the
+  /// windows' places are not known (see [onPose]).
+  void onNeighbor(FFI ffi, int left, int right) {
+    if (!autoOrder || !isOpen) return;
+    if (_poses.containsKey(-1) &&
+        ffi.ffiModel.pi.platformAdditions['display_xy_layout'] == true) {
+      return;
+    }
+    final keep = mainDisplay(ffi);
+    final l = left < 0 ? keep : left;
+    final r = right < 0 ? keep : right;
+    final o = order(ffi);
+    final il = o.indexOf(l);
+    final ir = o.indexOf(r);
+    if (il < 0 || ir < 0 || l == r || ir == il + 1) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastAutoOrderMs < 3000) return; // the last change is still on its way
+    _lastAutoOrderMs = now;
+    o.removeAt(ir);
+    o.insert(o.indexOf(l) + 1, r);
+    debugPrint('[panel] the laser went from $l to $r');
+    applyOrder(ffi, o);
+  }
+
+  /// At connect: a session with more windows was used on this host last time.
+  void maybeOfferRestore(FFI ffi) {
+    if (!isAndroid || isDisplayPanel || restoreOffered) return;
+    if (!ffi.inputModel.quest.isQuest.value) return;
+    restoreOffered = true;
+    int n = 0;
+    List<int>? ord;
+    List<int>? open;
+    try {
+      final raw = bind.mainGetPeerOptionSync(id: ffi.id, key: _kSessionKey);
+      if (raw.isEmpty) return;
+      final saved = jsonDecode(raw) as Map<String, dynamic>;
+      n = (saved['n'] as int?) ?? 0;
+      ord = (saved['order'] as List?)?.map((e) => e as int).toList();
+      open = (saved['open'] as List?)?.map((e) => e as int).toList();
+    } catch (e) {
+      debugPrint('[panel] saved session unreadable: $e');
+      return;
+    }
+    if (n < 1) {
+      // No session to bring back: displays left over on the host go.
+      Future.delayed(const Duration(seconds: 4), () {
+        if (!ffi.closed) trimTrailing(ffi);
+      });
+      return;
+    }
+    final count = n.clamp(1, 3);
+    void ask() {
+      if (ffi.closed || isOpen) return;
+      // The first picture closes every dialog: ask after it.
+      if (ffi.ffiModel.waitForFirstImage.isTrue) {
+        Future.delayed(const Duration(milliseconds: 300), ask);
+        return;
+      }
+      ffi.dialogManager.show((setState, close, context) {
+        return CustomAlertDialog(
+          title: const Text('Előző munkamenet'),
+          content: Text(
+              'Legutóbb $count további kijelző volt külön ablakban ezen a gépen. '
+              'Visszaállítsam?'),
+          actions: [
+            dialogButton('Nem', onPressed: () {
+              close();
+              bind.mainSetPeerOptionSync(
+                  id: ffi.id, key: _kSessionKey, value: '');
+              trimTrailing(ffi);
+            }, isOutline: true),
+            dialogButton('Igen', onPressed: () {
+              close();
+              restore(ffi, count, ord, open);
+            }),
+          ],
+        );
+      });
+    }
+
+    Future.delayed(const Duration(milliseconds: 1500), ask);
+  }
+
+  /// Opens [n] more displays in windows of their own (asking the host for the ones it does
+  /// not have), then puts the displays in the saved order.
+  Future<void> restore(FFI ffi, int n, List<int>? ord,
+      [List<int>? open]) async {
+    final pi = ffi.ffiModel.pi;
+    final keep = mainDisplay(ffi);
+    // The displays that had a window last time first, then any other.
+    final wanted = [
+      for (final i in open ?? const <int>[])
+        if (i != keep &&
+            i >= 0 &&
+            i < pi.displays.length &&
+            !_open.containsKey(i))
+          i
+    ];
+    final existing = [
+      ...wanted,
+      for (var i = 0; i < pi.displays.length; i++)
+        if (i != keep && !_open.containsKey(i) && !wanted.contains(i)) i
+    ].take(n).toList();
+    debugPrint('[panel] restore $n displays (order $ord), here already: $existing');
+    await _openPanels(ffi, existing);
+    final missing = n - existing.length;
+    if (missing > 0 && canPlug(ffi)) {
+      _orderAfterAdds = ord;
+      _pendingAdds = missing;
+      _requestPlug(ffi);
+    } else if (ord != null) {
+      applyOrder(ffi, ord);
+    }
+  }
+}
+
+final androidDisplayPanels = AndroidDisplayPanels();
+
+Future<void> initGlobalFFI([SessionID? sessionId]) async {
   debugPrint("_globalFFI init");
-  _globalFFI = FFI(null);
+  _globalFFI = FFI(sessionId);
   debugPrint("_globalFFI init end");
   // after `put`, can also be globally found by Get.find<FFI>();
   Get.put<FFI>(_globalFFI, permanent: true);
@@ -3387,7 +4068,25 @@ Future<List<Rect>> getScreenRectList() async {
 
 openMonitorInTheSameTab(int i, FFI ffi, PeerInfo pi,
     {bool updateCursorPos = true, bool recordSelection = true}) {
+  if (isDisplayPanel) return; // a panel shows one fixed display
+  if (isAndroid && androidDisplayPanels.isOpen) {
+    // A switch replaces the host's capture set: the panels go first.
+    androidDisplayPanels.closeAll().then((_) => _openMonitorInTheSameTab(
+        i, ffi, pi,
+        updateCursorPos: updateCursorPos, recordSelection: recordSelection));
+    return;
+  }
+  _openMonitorInTheSameTab(i, ffi, pi,
+      updateCursorPos: updateCursorPos, recordSelection: recordSelection);
+}
+
+_openMonitorInTheSameTab(int i, FFI ffi, PeerInfo pi,
+    {bool updateCursorPos = true, bool recordSelection = true}) {
   if (recordSelection) {
+    if (i == kAllDisplayValue && pi.currentDisplay != kAllDisplayValue) {
+      // Where the mobile toolbar's "all displays" button goes back to.
+      ffi.ffiModel.lastSingleDisplay = pi.currentDisplay;
+    }
     ffi.ffiModel.lastUserDisplay = i;
     ffi.ffiModel.cancelPendingRestoreTimer();
     ffi.ffiModel.pendingMonitorRestore = null;

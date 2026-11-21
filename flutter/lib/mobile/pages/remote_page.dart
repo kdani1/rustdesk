@@ -48,8 +48,15 @@ class RemotePage extends StatefulWidget {
       required this.id,
       this.password,
       this.isSharedPassword,
-      this.forceRelay})
+      this.forceRelay,
+      this.panelDisplay,
+      this.panelCachedPeerData})
       : super(key: key);
+
+  /// Android display panel (DisplayActivity): this page shows only this display of a
+  /// connection the main panel owns, attached with the main engine's cached peer data.
+  final int? panelDisplay;
+  final String? panelCachedPeerData;
 
   final String id;
   final String? password;
@@ -82,6 +89,17 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Worker? _questAutoKbdWorker;
   Timer? _questArmTimer;
   bool _questKbdArmed = false;
+  // A newer Windows host answers every click with what got the keyboard focus (see
+  // _onHostTextFocus). Known once its first message arrived; until then, and with older
+  // hosts, the remote cursor shape decides as before.
+  bool _hostAnswersFocus = false;
+  bool _questAwaitHost = false; // armed, waiting for the host's answer to this click
+  bool _questClickWasText = false; // the remote cursor was a caret when that click was made
+  bool _questLeftSpot = false; // the pointer left the click spot while waiting for the host
+  final Stopwatch _questArmClock = Stopwatch(); // since that click
+  // The host cannot answer a click sooner than its first sample (90 ms after it got the
+  // click): anything earlier is the late answer to an older click.
+  static const int _kHostAnswerMinMs = 80;
   Offset _questArmPos = Offset.zero;
   static const _kQuestKbdArmWindow = Duration(milliseconds: 1200);
   static const double _kQuestKbdArmSlop = 24.0; // same as input_model long-press slop
@@ -90,6 +108,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   InputModel get inputModel => gFFI.inputModel;
   SessionID get sessionId => gFFI.sessionId;
+  bool get _isPanel => widget.panelDisplay != null;
 
   final TextEditingController _textController =
       TextEditingController(text: initText);
@@ -100,18 +119,67 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     gFFI.dialogManager.loadMobileActionsOverlayVisible();
   }
 
+  /// Clean-up of the peer option "virtual-display" (one entry per virtual display that is
+  /// plugged in again at every connection). Older builds added an entry for every press of
+  /// "+", also when the host refused it, so a peer can hold more entries than displays that
+  /// ever existed, and all of them would be requested in a burst at the next connection. This
+  /// build stores the count the host confirms, never more than 4 (see toolbar.dart and
+  /// FfiModel.handlePlatformAdditions), so a longer list is such a leftover: cut it to two.
+  void _trimStoredVirtualDisplays() {
+    try {
+      final stored = bind
+          .mainGetPeerOptionSync(id: widget.id, key: 'virtual-display')
+          .split(',')
+          .where((e) => e.isNotEmpty)
+          .toList();
+      // Every entry is one more display on top of the host's own first one (a headless
+      // host plugs that one in by itself), and the core asks for them at the first frame.
+      // A session starts with the main display alone: none. The display windows of the last
+      // session are restored on request (AndroidDisplayPanels).
+      if (isAndroid && stored.isNotEmpty) {
+        bind.mainSetPeerOptionSync(
+            id: widget.id, key: 'virtual-display', value: '');
+      } else if (stored.length > 4) {
+        bind.mainSetPeerOptionSync(
+            id: widget.id,
+            key: 'virtual-display',
+            value: stored.take(2).join(','));
+      }
+    } catch (e) {
+      debugPrint('virtual-display clean-up failed: $e');
+    }
+  }
+
   @override
   void initState() {
     super.initState();
-    gFFI.ffiModel.updateEventListener(sessionId, widget.id);
-    gFFI.start(
-      widget.id,
-      password: widget.password,
-      isSharedPassword: widget.isSharedPassword,
-      forceRelay: widget.forceRelay,
-    );
+    if (_isPanel) {
+      _showBar = false; // only the small handle: the window is all picture
+      _hostAnswersFocus = kDisplayPanelArgs?['hostAnswersFocus'] == true;
+      gFFI.ffiModel.updateEventListener(sessionId, widget.id);
+      gFFI.start(widget.id,
+          tabWindowId: 0, // not null: attach to the existing connection
+          display: widget.panelDisplay,
+          displays: [widget.panelDisplay!],
+          cachedPeerDataJson: widget.panelCachedPeerData);
+    } else {
+      gFFI.inputModel.quest.hostAnswersFocus = false; // the next host may be an older one
+      androidDisplayPanels.newConnection();
+      // While the display windows are being tuned: the viewer's own timing lines
+      // ("LATENCY client ...", docs/LATENCY-METRICS.md) go to logcat.
+      bind.mainSetLocalOption(key: 'enable-latency-log', value: 'Y');
+      _trimStoredVirtualDisplays();
+      gFFI.ffiModel.updateEventListener(sessionId, widget.id);
+      gFFI.start(
+        widget.id,
+        password: widget.password,
+        isSharedPassword: widget.isSharedPassword,
+        forceRelay: widget.forceRelay,
+      );
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
+      if (_isPanel) return; // already connected
       gFFI.dialogManager
           .showLoading(translate('Connecting...'), onCancel: closeConnection);
     });
@@ -124,10 +192,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // while the pointer stays put, becomes) a text caret. Never auto-closed.
     _questAutoKbdWorker =
         ever<bool>(gFFI.cursorModel.remoteCursorIsText, (isText) {
-      if (isText && _questKbdArmed) _questKbdFire('shape');
+      if (isText && _questKbdArmed && !_questAwaitHost) _questKbdFire('shape');
     });
     gFFI.inputModel.quest.onLeftClick = _onQuestLeftClick;
     gFFI.inputModel.quest.onHover = _onQuestHover;
+    gFFI.inputModel.quest.onHostTextFocus = _onHostTextFocus;
     gFFI.qualityMonitorModel.checkShowQualityMonitor(sessionId);
     keyboardSubscription =
         keyboardVisibilityController.onChange.listen(onSoftKeyboardChanged);
@@ -144,6 +213,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           isKeyboardVisible: keyboardVisibilityController.isVisible);
     });
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _windowSize = MediaQueryData.fromView(View.of(context)).size;
+    });
 
     inputModel.keyboardInputAllowed = true;
 
@@ -163,6 +235,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   @override
   Future<void> dispose() async {
     WidgetsBinding.instance.removeObserver(this);
+    _windowResizeTimer?.cancel();
+    // The extra display windows belong to this connection.
+    if (!_isPanel) unawaited(androidDisplayPanels.closeAll());
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
     // after several awaits (canvas save, image update, the `enable_soft_keyboard`
     // platform call), so if the app is backgrounded while this page is disposing,
@@ -187,6 +262,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _questAutoKbdWorker?.dispose();
     gFFI.inputModel.quest.onLeftClick = null;
     gFFI.inputModel.quest.onHover = null;
+    gFFI.inputModel.quest.onHostTextFocus = null;
     _questArmTimer?.cancel();
     _kbdVisFocusTimer?.cancel();
     inputModel.keyboardInputAllowed = true;
@@ -203,6 +279,28 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // The inner logic of `on_voice_call_closed` will check if the voice call is active.
     // Only one client is considered here for now.
     gFFI.chatModel.onVoiceCallClosed("End connection");
+  }
+
+  // The window size the image was last fitted for (see didChangeMetrics).
+  Size? _windowSize;
+  Timer? _windowResizeTimer;
+
+  /// The window changed size without turning (a Quest panel was resized, e.g. made wider
+  /// for several displays side by side): fit the image again. Only the window's own size
+  /// counts, not the keyboard inset, which also arrives here. A turn of the device is
+  /// handled by the OrientationBuilder in build().
+  @override
+  void didChangeMetrics() {
+    _windowResizeTimer?.cancel();
+    _windowResizeTimer = Timer(const Duration(milliseconds: 150), () {
+      if (!mounted) return;
+      final size = MediaQueryData.fromView(View.of(context)).size;
+      final last = _windowSize;
+      _windowSize = size;
+      if (last == null || last == size) return;
+      final canvas = gFFI.canvasModel;
+      canvas.setMobileBottomBarHeight(canvas.mobileBottomBarHeight);
+    });
   }
 
   @override
@@ -447,6 +545,26 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       quest.log('autoKbd[click] -> $skip');
       return;
     }
+    if (_hostAnswersFocus) {
+      // The text cursor shows over any selectable text; the host knows whether the click
+      // really landed in a text field. Wait for its answer instead.
+      _questKbdArmed = true;
+      _questAwaitHost = true;
+      _questArmPos = pos;
+      _questClickWasText = gFFI.cursorModel.remoteCursorIsText.value;
+      _questLeftSpot = false;
+      _questArmClock
+        ..reset()
+        ..start();
+      _questArmTimer?.cancel();
+      _questArmTimer = Timer(_kQuestKbdArmWindow, () {
+        // A host that stays silent must never be worse than one that cannot answer.
+        if (_questAwaitHost) _questHostUnknown();
+        _questKbdDisarm(_questLeftSpot ? 'moved' : 'expired');
+      });
+      quest.log('autoKbd[click] -> waiting for the host');
+      return;
+    }
     if (gFFI.cursorModel.remoteCursorIsText.value) {
       _questKbdFire('click'); // laser hovered the caret before clicking
       return;
@@ -461,19 +579,61 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void _onQuestHover(Offset pos) {
-    if (_questKbdArmed && (pos - _questArmPos).distance > _kQuestKbdArmSlop) {
-      _questKbdDisarm('moved'); // a caret under a later hover is not the clicked field
+    if (!_questKbdArmed ||
+        (pos - _questArmPos).distance <= _kQuestKbdArmSlop) {
+      return;
     }
+    if (_questAwaitHost) {
+      // The host's answer is about the click, not about where the pointer is now: keep
+      // waiting. Only the cursor-shape fallback must not use a later hover.
+      _questLeftSpot = true;
+      return;
+    }
+    _questKbdDisarm('moved'); // a caret under a later hover is not the clicked field
+  }
+
+  /// The host's answer to the last click (Misc.text_input_focus), or its first message that
+  /// only announces that it answers at all (state 0, nothing armed yet).
+  void _onHostTextFocus(int state) {
+    if (!mounted) return;
+    _hostAnswersFocus = true;
+    inputModel.quest.hostAnswersFocus = true;
+    debugPrint('[quest] host text focus: $state '
+        '(armed=$_questKbdArmed waiting=$_questAwaitHost)');
+    if (!_questKbdArmed || !_questAwaitHost) return;
+    if (_questArmClock.elapsedMilliseconds < _kHostAnswerMinMs) return;
+    if (state == 2) {
+      _questKbdFire('host');
+    } else if (state == 1) {
+      _questKbdDisarm('host: not a text field');
+    } else {
+      _questHostUnknown();
+    }
+  }
+
+  /// The host could not tell (no accessibility data), or never answered: the cursor shape
+  /// decides, exactly as with a host that does not answer at all.
+  void _questHostUnknown() {
+    _questAwaitHost = false;
+    if (_questClickWasText ||
+        (!_questLeftSpot && gFFI.cursorModel.remoteCursorIsText.value)) {
+      _questKbdFire('host unknown, shape');
+    } else if (_questLeftSpot) {
+      _questKbdDisarm('moved');
+    }
+    // else it stays armed: the cursor may still turn into a caret within the window.
   }
 
   void _questKbdDisarm(String why) {
     if (_questKbdArmed) inputModel.quest.log('autoKbd armed -> $why');
     _questKbdArmed = false;
+    _questAwaitHost = false;
     _questArmTimer?.cancel();
   }
 
   void _questKbdFire(String from) {
     _questKbdArmed = false;
+    _questAwaitHost = false;
     _questArmTimer?.cancel();
     if (!mounted) return;
     inputModel.quest.log('autoKbd[$from] -> OPEN');
@@ -790,6 +950,147 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     });
   }
 
+  /// Toolbar buttons between the keys and the collapse arrow (Quest): the overview of the
+  /// displays, "-" (the display added last goes) and "+" (one more display in a window of
+  /// its own). See AndroidDisplayPanels.
+  List<Widget> _displayButtons(BuildContext context) {
+    if (_isPanel) return const [];
+    final ffiModel = gFFI.ffiModel;
+    final pi = ffiModel.pi;
+    if (!inputModel.quest.isQuest.value ||
+        _showGestureHelp ||
+        pi.displays.isEmpty) {
+      return const [];
+    }
+    final privacyModeState = PrivacyModeState.find(widget.id);
+    if (privacyModeState.isNotEmpty) return const [];
+    final panels = androidDisplayPanels;
+    return [
+      const SizedBox(width: 4),
+      Obx(() => _keyButton(
+          context,
+          _KeySpec('', _showDisplayOverview,
+              icon: Icons.grid_view, state: panels.isOpenRx.value ? 1 : 0))),
+      _keyButton(
+          context,
+          _KeySpec('', () => panels.removeLast(gFFI), icon: Icons.remove)),
+      _keyButton(
+          context, _KeySpec('', () => panels.addOne(gFFI), icon: Icons.add)),
+    ];
+  }
+
+  /// The displays in the host's left-to-right order: move one, give it a window, or take
+  /// it away.
+  void _showDisplayOverview() {
+    final panels = androidDisplayPanels;
+    gFFI.dialogManager.show((setState, close, context) {
+      return CustomAlertDialog(
+        title: const Text('Kijelzők'),
+        content: Obx(() {
+          panels.revision.value;
+          final pi = gFFI.ffiModel.pi;
+          pi.displays.length; // rebuild when the host's list or positions change
+          final order = panels.order(gFFI);
+          final keep = panels.mainDisplay(gFFI);
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (var k = 0; k < order.length; k++)
+                      _displayTile(context, order[k], k, order.length, keep),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                  'Balról jobbra, ahogy a Windows látja őket. '
+                  'A nyilakkal a sorrend állítható.',
+                  style: TextStyle(fontSize: 12)),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                      value: panels.autoOrder,
+                      onChanged: (v) => panels.autoOrder = v == true),
+                  const Flexible(
+                      child: Text(
+                          'A Windows kövesse az ablakok térbeli elrendezését',
+                          style: TextStyle(fontSize: 12))),
+                ],
+              ),
+            ],
+          );
+        }),
+        actions: [dialogButton('Close', onPressed: close)],
+        onCancel: close,
+      );
+    });
+  }
+
+  Widget _displayTile(
+      BuildContext context, int d, int pos, int count, int keep) {
+    final panels = androidDisplayPanels;
+    final pi = gFFI.ffiModel.pi;
+    if (d < 0 || d >= pi.displays.length) return const SizedBox.shrink();
+    final disp = pi.displays[d];
+    final isMain = d == keep;
+    final open = isMain || panels.isPanelOpen(d);
+    final isLast = d == pi.displays.length - 1;
+    Widget arrow(IconData icon, int by, bool enabled) => InkWell(
+        onTap: enabled ? () => panels.move(gFFI, d, by) : null,
+        child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Icon(icon,
+                size: 22,
+                color: enabled ? null : Theme.of(context).disabledColor)));
+    return Container(
+      width: 104,
+      margin: const EdgeInsets.all(3),
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+      decoration: BoxDecoration(
+          border: Border.all(color: Theme.of(context).hintColor),
+          borderRadius: BorderRadius.circular(6),
+          color: open ? MyTheme.accent.withOpacity(0.25) : null),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('${d + 1}',
+              style:
+                  const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Text('${disp.width}×${disp.height}',
+              style: const TextStyle(fontSize: 11)),
+          Text(isMain ? 'fő ablak' : (open ? 'saját ablak' : 'nincs ablaka'),
+              style: const TextStyle(fontSize: 11)),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              arrow(Icons.chevron_left, -1, pos > 0),
+              arrow(Icons.chevron_right, 1, pos < count - 1),
+            ],
+          ),
+          if (!isMain)
+            TextButton(
+              onPressed: () {
+                if (open) {
+                  panels.removeDisplay(gFFI, d);
+                } else {
+                  panels.openPanel(gFFI, d);
+                }
+              },
+              child: Text(open ? (isLast ? 'Eltávolít' : 'Bezár') : 'Megnyit',
+                  style: const TextStyle(fontSize: 12)),
+            )
+          else
+            const SizedBox(height: 40),
+        ],
+      ),
+    );
+  }
+
   /// The row that opens below the toolbar: the keys that did not fit into it, then F1..F12.
   Widget _extraKeys() {
     return Material(
@@ -871,7 +1172,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
     return WillPopScope(
       onWillPop: () async {
-        clientClose(sessionId, gFFI);
+        if (_isPanel) {
+          closeDisplayPanel();
+        } else {
+          clientClose(sessionId, gFFI);
+        }
         return false;
       },
       child: Scaffold(
@@ -966,7 +1271,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Widget getRawPointerAndKeyBody(Widget child) {
     final ffiModel = Provider.of<FfiModel>(context);
     return RawPointerMouseRegion(
-      cursor: ffiModel.keyboard ? SystemMouseCursors.none : MouseCursor.defer,
+      // Upstream hides the system pointer over the remote image (it draws the remote cursor
+      // itself). Never on a Quest: its own pointer is the only one the user aims with, and
+      // this app must not ask the system to take it away.
+      cursor: ffiModel.keyboard && !inputModel.quest.isQuest.value
+          ? SystemMouseCursors.none
+          : MouseCursor.defer,
       inputModel: inputModel,
       // Disable RawKeyFocusScope before the connecting is established.
       // The "Delete" key on the soft keyboard may be grabbed when inputting the password dialog.
@@ -994,10 +1304,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       color: Colors.white,
                       icon: Icon(Icons.clear),
                       onPressed: () {
-                        clientClose(sessionId, gFFI);
+                        if (_isPanel) {
+          closeDisplayPanel();
+        } else {
+          clientClose(sessionId, gFFI);
+        }
                       },
                     ),
-                    IconButton(
+                    if (!_isPanel) IconButton(
                       color: Colors.white,
                       icon: Icon(Icons.tv),
                       onPressed: () {
@@ -1035,7 +1349,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                     () => _showGestureHelp = !_showGestureHelp),
                               ),
                             ]) +
-                  (isWeb
+                  (isWeb || _isPanel
                       ? []
                       : <Widget>[
                           futureBuilder(
@@ -1055,8 +1369,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                                   ))
                         ]) +
                   [
-                    if (isAndroid) _questMenuButton(),
-                    if (isAndroid) Obx(() {
+                    if (_isPanel)
+                      Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          child: Text('${widget.panelDisplay! + 1}',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold))),
+                    if (isAndroid && !_isPanel) _questMenuButton(),
+                    if (isAndroid && !_isPanel) Obx(() {
                       final model = gFFI.ffiModel;
                       final active = model.microphoneForwardingState.value == 'active';
                       final pending = ['pending', 'capturing'].contains(model.microphoneForwardingState.value);
@@ -1069,7 +1390,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                         onPressed: model.toggleMicrophoneForwarding,
                       );
                     }),
-                    IconButton(
+                    if (!_isPanel) IconButton(
                       color: Colors.white,
                       icon: Icon(Icons.more_vert),
                       onPressed: () {
@@ -1079,6 +1400,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                     ),
                   ]),
           if (_keysVisible) Expanded(child: _inlineKeys()),
+          ..._displayButtons(context),
           Obx(() => IconButton(
                 color: Colors.white,
                 icon: Icon(Icons.expand_more),
@@ -1721,6 +2043,31 @@ class ImagePaint extends StatelessWidget {
     final m = Provider.of<ImageModel>(context);
     final c = Provider.of<CanvasModel>(context);
     var s = c.scale;
+    final allRect = ffiModel.rect;
+    if (ffiModel.pi.currentDisplay == kAllDisplayValue &&
+        m.displayImages.isNotEmpty &&
+        allRect != null) {
+      // All displays in one view: each picture at its Windows position.
+      final displays = ffiModel.pi.displays;
+      final tiles = <DisplayTile>[];
+      m.displayImages.forEach((i, image) {
+        if (i < 0 || i >= displays.length) return;
+        final d = displays[i];
+        // A Linux peer's rect is in scaled units (FfiModel._getDisplaysRect).
+        final k = ffiModel.isPeerLinux ? d.scale : 1.0;
+        tiles.add(DisplayTile(
+            image,
+            Rect.fromLTWH(d.x - allRect.left, d.y - allRect.top, d.width / k,
+                d.height / k)));
+      });
+      return CustomPaint(
+        painter: MultiImagePainter(
+            tiles: tiles,
+            x: c.x / s,
+            y: (c.y + c.getAdjustY()) / s,
+            scale: s),
+      );
+    }
     if (ffiModel.isPeerLinux) {
       final displays = ffiModel.pi.getCurDisplays();
       if (displays.isNotEmpty) {
@@ -1796,7 +2143,6 @@ void showOptions(
   }
   final privacyModeState = PrivacyModeState.find(id);
   if (pi.displays.length > 1 &&
-      pi.currentDisplay != kAllDisplayValue &&
       (privacyModeState.isEmpty ||
           allowDisplaySwitchInPrivacyMode(pi, privacyModeState.value))) {
     final cur = pi.currentDisplay;
@@ -1809,26 +2155,31 @@ void showOptions(
     // - dark theme: 0xff212121 (the canvas color?)
     final numBgSelected =
         Theme.of(context).colorScheme.primary.withOpacity(0.6);
+    Widget displayButton(int i, String label, {double? width}) => InkWell(
+        onTap: () {
+          if (i == cur) return;
+          openMonitorInTheSameTab(i, gFFI, pi);
+          gFFI.dialogManager.dismissAll();
+        },
+        child: Ink(
+            width: width,
+            height: 40,
+            padding: width == null
+                ? const EdgeInsets.symmetric(horizontal: 10)
+                : null,
+            decoration: BoxDecoration(
+                border: Border.all(color: Theme.of(context).hintColor),
+                borderRadius: BorderRadius.circular(2),
+                color: i == cur ? numBgSelected : null),
+            child: Center(
+                widthFactor: 1,
+                child: Text(label,
+                    style: TextStyle(
+                        color:
+                            i == cur ? numColorSelected : numColorUnselected,
+                        fontWeight: FontWeight.bold)))));
     for (var i = 0; i < pi.displays.length; ++i) {
-      children.add(InkWell(
-          onTap: () {
-            if (i == cur) return;
-            openMonitorInTheSameTab(i, gFFI, pi);
-            gFFI.dialogManager.dismissAll();
-          },
-          child: Ink(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                  border: Border.all(color: Theme.of(context).hintColor),
-                  borderRadius: BorderRadius.circular(2),
-                  color: i == cur ? numBgSelected : null),
-              child: Center(
-                  child: Text((i + 1).toString(),
-                      style: TextStyle(
-                          color:
-                              i == cur ? numColorSelected : numColorUnselected,
-                          fontWeight: FontWeight.bold))))));
+      children.add(displayButton(i, (i + 1).toString(), width: 40));
     }
     displays.add(Padding(
         padding: const EdgeInsets.only(top: 8),

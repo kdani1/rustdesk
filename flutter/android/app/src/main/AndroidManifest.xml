@@ -3,6 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.carriez.flutter_hbb">
 
+    <!-- Test: the window position call of Horizon OS (signature-level, so normally not granted). -->
+    <uses-permission android:name="horizonos.permission.MANAGE_APP_VOLUMETRIC_WINDOWS" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
@@ -81,6 +83,25 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="rustdesk" />
             </intent-filter>
+        </activity>
+
+        <!-- One extra Quest panel per remote display, opened from the remote page. -->
+        <activity
+            android:name=".DisplayActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|navigation"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="standard"
+            android:taskAffinity="com.carriez.flutter_hbb.display"
+            android:autoRemoveFromRecents="true"
+            android:resizeableActivity="true"
+            android:theme="@style/LaunchTheme"
+            android:windowSoftInputMode="adjustResize">
+            <layout
+                android:defaultWidth="1024dp"
+                android:defaultHeight="600dp"
+                android:minWidth="360dp"
+                android:minHeight="225dp" />
         </activity>
 
         <activity

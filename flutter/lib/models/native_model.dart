@@ -228,13 +228,16 @@ class PlatformFFI {
       if (desktopType == DesktopType.cm) {
         await _ffiBind.cmInit();
       }
-      await _ffiBind.mainDeviceId(id: id);
-      await _ffiBind.mainDeviceName(name: name);
-      await _ffiBind.mainSetHomeDir(home: _homeDir);
-      await _ffiBind.mainInit(
-        appDir: _dir,
-        customClientConfig: '',
-      );
+      // A display panel is a second engine in a process the main engine initialised.
+      if (!isDisplayPanel) {
+        await _ffiBind.mainDeviceId(id: id);
+        await _ffiBind.mainDeviceName(name: name);
+        await _ffiBind.mainSetHomeDir(home: _homeDir);
+        await _ffiBind.mainInit(
+          appDir: _dir,
+          customClientConfig: '',
+        );
+      }
     } catch (e) {
       debugPrintStack(label: 'initialize failed: $e');
     }

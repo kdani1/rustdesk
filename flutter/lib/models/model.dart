@@ -265,7 +265,13 @@ class FfiModel with ChangeNotifier {
 
   clear() {
     _pi = PeerInfo();
+    // Mobile reuses this object for the next connection: without this, a host whose first
+    // display has the same rectangle gets no sessionSetSize (updateCurDisplay), and the
+    // core then does not know which display this view shows.
+    _rect = null;
     lastUserDisplay = null;
+    lastSingleDisplay = kInvalidDisplayIndex;
+    showAllDisplaysUntil = null;
     _cancelPendingMonitorRestore();
     _secure = null;
     _direct = null;
@@ -347,6 +353,21 @@ class FfiModel with ChangeNotifier {
   StreamEventHandler startEventListener(SessionID sessionId, String peerId) {
     return (evt) async {
       var name = evt['name'];
+      // A display panel shows one display; what belongs to the whole connection is the
+      // main panel's (it gets the same events).
+      if (isDisplayPanel &&
+          const {
+            'clipboard',
+            'chat_client_mode',
+            'chat_server_mode',
+            'on_voice_call_started',
+            'on_voice_call_closed',
+            'on_voice_call_waiting',
+            'on_voice_call_incoming',
+            'toast',
+          }.contains(name)) {
+        return;
+      }
       if (name == 'msgbox') {
         handleMsgBox(evt, sessionId, peerId);
       } else if (name == 'toast') {
@@ -505,6 +526,10 @@ class FfiModel with ChangeNotifier {
         parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
       } else if (name == 'pointer_captured') {
         parent.target?.inputModel.onHostPointerCaptured(evt['captured'] == '1');
+      } else if (name == 'text_input_focus') {
+        // The host's answer to a click: 0 unknown, 1 not a text field, 2 editable text field.
+        parent.target?.inputModel.quest.onHostTextFocus
+            ?.call(int.tryParse('${evt['state']}') ?? 0);
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -876,7 +901,9 @@ class FfiModel with ChangeNotifier {
     newDisplay._scale = _pi.scaleOfDisplay(display);
     _pi.displays[display] = newDisplay;
 
-    if (!_pi.isSupportMultiUiSession || _pi.currentDisplay == display) {
+    if (!_pi.isSupportMultiUiSession ||
+        _pi.currentDisplay == display ||
+        _pi.currentDisplay == kAllDisplayValue) {
       updateCurDisplay(sessionId);
     }
 
@@ -922,6 +949,23 @@ class FfiModel with ChangeNotifier {
     final title = evt['title'];
     final text = evt['text'];
     final link = evt['link'];
+
+    final breaksConn = title == 'Connection Error' ||
+        (type is String &&
+            (type.startsWith('restarting') ||
+                type.contains('password') ||
+                type == 'input-2fa' ||
+                type.startsWith('relay-hint')));
+    if (isDisplayPanel) {
+      // The main panel owns login, errors and reconnect; a panel only shows a picture.
+      if (breaksConn) closeDisplayPanel();
+      return;
+    }
+    if (breaksConn && isAndroid && androidDisplayPanels.isOpen) {
+      androidDisplayPanels.closeAll();
+      // Offer them again when the connection is back.
+      androidDisplayPanels.restoreOffered = false;
+    }
 
     // The peer-gone detector reconnects under `restarting-show` rather than an error title, so
     // it needs naming here too. By its own title, not the type: an explicitly restarted remote
@@ -1409,6 +1453,8 @@ class FfiModel with ChangeNotifier {
     if (bind.peerGetSessionsCount(
             id: peerId, connType: parent.target!.connType.index) <=
         1) {
+      parent.target?.imageModel
+          .onSwitchDisplay(_pi.currentDisplay, currentDisplay);
       _pi.currentDisplay = currentDisplay;
     }
 
@@ -1470,10 +1516,22 @@ class FfiModel with ChangeNotifier {
               bind.sessionGetUseAllMyDisplaysForTheRemoteSession(
                       sessionId: sessionId) !=
                   'Y' &&
-              ((last == kAllDisplayValue && _pi.displays.isNotEmpty) ||
+              ((last == kAllDisplayValue &&
+                      _pi.displays.length > (isMobile ? 1 : 0)) ||
                   (last >= 0 && last < _pi.displays.length)))
           ? last
           : null;
+      if (isMobile && !isCache && parent.target != null) {
+        androidDisplayPanels.maybeOfferRestore(parent.target!);
+      }
+      if (isMobile &&
+          !isCache &&
+          last == kAllDisplayValue &&
+          _pi.displays.length == 1) {
+        // The virtual displays of the last session are asked for again at connect and
+        // arrive in a moment: go back to all displays then.
+        showAllDisplaysUntil = DateTime.now().add(const Duration(seconds: 30));
+      }
       // Fallback if the first image event never reaches this tab (multi-UI).
       _pendingRestoreTimer?.cancel();
       if (pendingMonitorRestore != null) {
@@ -1708,12 +1766,73 @@ class FfiModel with ChangeNotifier {
       for (int i = 0; i < displays.length; ++i) {
         newDisplays.add(evtToDisplay(displays[i]));
       }
+      final oldDisplayCount = _pi.displays.length;
       _pi.displays.value = newDisplays;
       _pi.displaysCount.value = _pi.displays.length;
 
+      if (isDisplayPanel) {
+        // A panel keeps its display while it exists, and goes with it.
+        if (_pi.currentDisplay >= 0 &&
+            _pi.currentDisplay < _pi.displays.length) {
+          updateCurDisplay(sessionId);
+          notifyListeners();
+        } else {
+          closeDisplayPanel();
+        }
+        return;
+      }
+      if (isAndroid && parent.target != null) {
+        if (newDisplays.length > oldDisplayCount) {
+          // A display asked for with "+" (or by a session restore) gets its window.
+          androidDisplayPanels.onDisplaysGrown(
+              parent.target!, oldDisplayCount, newDisplays.length);
+        } else if (newDisplays.length < oldDisplayCount) {
+          androidDisplayPanels.onDisplaysShrunk(
+              parent.target!, newDisplays.length);
+        }
+      }
+
+      // Mobile: a display that was asked for (toolbar "+", or the displays plugged in again
+      // after a reconnect) is here, show all of them.
+      var switchedToAll = false;
+      final until = showAllDisplaysUntil;
+      if (isMobile && until != null && newDisplays.length > oldDisplayCount) {
+        showAllDisplaysUntil = null;
+        if (DateTime.now().isBefore(until) &&
+            newDisplays.length > 1 &&
+            _pi.currentDisplay != kAllDisplayValue &&
+            parent.target != null) {
+          openMonitorInTheSameTab(kAllDisplayValue, parent.target!, _pi,
+              updateCursorPos: false);
+          switchedToAll = true;
+        }
+      }
+      // Mobile "all displays" view with one display left: there is nothing to show side by
+      // side, and only the single view has the resolution menu and a way to choose a
+      // display. A list that grows again right away (Windows re-arranging) brings it back.
+      if (isMobile &&
+          !switchedToAll &&
+          _pi.currentDisplay == kAllDisplayValue &&
+          _pi.displays.length == 1 &&
+          parent.target != null) {
+        parent.target!.imageModel.pruneDisplayImages(_pi.displays);
+        openMonitorInTheSameTab(0, parent.target!, _pi, updateCursorPos: false);
+        showAllDisplaysUntil = DateTime.now().add(const Duration(seconds: 10));
+      }
+
       if (_pi.currentDisplay == kAllDisplayValue) {
+        if (isMobile && _pi.displays.isNotEmpty && !switchedToAll) {
+          // Capture exactly the displays that exist now (a virtual display was plugged in
+          // or out), and drop the pictures that no longer fit.
+          parent.target?.imageModel.pruneDisplayImages(_pi.displays);
+          bind.sessionSwitchDisplay(
+            isDesktop: isDesktop,
+            sessionId: sessionId,
+            value: Int32List.fromList(
+                List.generate(_pi.displays.length, (i) => i)),
+          );
+        }
         updateCurDisplay(sessionId);
-        // to-do: What if the displays are changed?
       } else {
         if (_pi.currentDisplay >= 0 &&
             _pi.currentDisplay < _pi.displays.length) {
@@ -1782,7 +1901,42 @@ class FfiModel with ChangeNotifier {
 
     cachedPeerData.peerInfo['platform_additions'] =
         json.encode(_pi.platformAdditions);
+
+    // After a press of "+" / "-" in the virtual display menu: remember what the host now
+    // really has, so the next connection asks for exactly that many (see toolbar.dart).
+    final toggled = virtualDisplayToggledAt;
+    if (toggled != null &&
+        _pi.isAmyuniIdd &&
+        DateTime.now().difference(toggled) < const Duration(seconds: 10)) {
+      try {
+        await bind.sessionPeerOption(
+            sessionId: sessionId,
+            name: 'virtual-display',
+            // One at most: the next connection starts with the main display alone, and
+            // the display windows of a session are restored on request (AndroidDisplayPanels).
+            // Android: never any (see _trimStoredVirtualDisplays in the mobile remote page).
+            value: isAndroid
+                ? ''
+                : List.filled(_pi.amyuniVirtualDisplayCount.clamp(0, 4), '0')
+                    .join(','));
+      } catch (e) {
+        debugPrint('Failed to store the virtual display count: $e');
+      }
+    }
+    // The mobile toolbar shows whether one more virtual display can be added.
+    if (isMobile) notifyListeners();
   }
+
+  /// When the user last pressed "+" / "-" for a virtual display (Amyuni).
+  DateTime? virtualDisplayToggledAt;
+
+  /// Mobile: until then, the view changes to all displays as soon as the host reports one
+  /// more display (handleSyncPeerInfo). Set by "+" on the toolbar, and by a reconnect whose
+  /// displays are still being plugged in again.
+  DateTime? showAllDisplaysUntil;
+
+  /// Mobile: the display that was shown before the "all displays" view.
+  int lastSingleDisplay = kInvalidDisplayIndex;
 
   handleFollowCurrentDisplay(
       Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
@@ -1809,6 +1963,7 @@ class FfiModel with ChangeNotifier {
   switchToNewDisplay(int display, SessionID sessionId, String peerId,
       {bool updateCursorPos = false}) {
     // no need to wait for the response
+    parent.target?.imageModel.onSwitchDisplay(pi.currentDisplay, display);
     pi.currentDisplay = display;
     updateCurDisplay(sessionId, updateCursorPos: updateCursorPos);
     try {
@@ -1816,6 +1971,8 @@ class FfiModel with ChangeNotifier {
     } catch (e) {
       //
     }
+    // The mobile toolbar shows which view is on.
+    if (isMobile) notifyListeners();
   }
 
   updateBlockInputState(Map<String, dynamic> evt, String peerId) {
@@ -1946,8 +2103,110 @@ class VirtualMouseMode with ChangeNotifier {
 
 class ImageModel with ChangeNotifier {
   ui.Image? _image;
+  // The display _image is a picture of, when known. pi.currentDisplay is not enough: after a
+  // switch it names the new display while _image still shows the old one.
+  int? _imageDisplay;
 
-  ui.Image? get image => _image;
+  // Mobile "all displays" view (pi.currentDisplay == kAllDisplayValue): the last picture of
+  // each display, by display index. Empty in the single-display view, which uses _image.
+  final Map<int, ui.Image> _displayImages = {};
+  Map<int, ui.Image> get displayImages => _displayImages;
+  // Set when the "all displays" view is left: a frame of a display that is no longer shown
+  // can still be on its way and must not replace the shown display's picture.
+  bool _dropOtherDisplays = false;
+  // Counts the pictures set (single or per display): onRgba's latency sample needs to know
+  // whether its frame became a picture.
+  int _imageSeq = 0;
+
+  ui.Image? get image =>
+      _image ?? (_displayImages.isEmpty ? null : _displayImages.values.first);
+
+  bool get _allDisplays =>
+      isMobile &&
+      parent.target?.ffiModel.pi.currentDisplay == kAllDisplayValue;
+
+  bool _isOtherDisplay(int display) {
+    if (!isMobile || !_dropOtherDisplays) return false;
+    final cur = parent.target?.ffiModel.pi.currentDisplay;
+    return cur != null && cur != kAllDisplayValue && cur != display;
+  }
+
+  void _setDisplayImage(int display, ui.Image? image) {
+    if (image == null) return; // keep this display's last good picture
+    final count = parent.target?.ffiModel.pi.displays.length ?? 0;
+    if (display < 0 || display >= count) {
+      image.dispose();
+      return;
+    }
+    _displayImages.remove(display)?.dispose();
+    _displayImages[display] = image;
+    _imageSeq++;
+    notifyListeners();
+  }
+
+  /// Mobile: from now on only the shown display's frames become the picture (the other
+  /// displays are shown by display panels, or not at all).
+  void dropOtherDisplays() => _dropOtherDisplays = true;
+
+  void _disposeDisplayImages() {
+    for (final image in _displayImages.values) {
+      image.dispose();
+    }
+    _displayImages.clear();
+  }
+
+  /// Mobile: the shown display changes from [from] to [to] (called before pi.currentDisplay
+  /// is set). The picture already on screen is carried over: a display that is not changing
+  /// sends no new frame, and Android sends no refresh on a switch.
+  void onSwitchDisplay(int from, int to) {
+    if (!isMobile || from == to) return;
+    if (to == kAllDisplayValue) {
+      _dropOtherDisplays = false;
+      final image = _image;
+      final shown = _imageDisplay ?? from;
+      _image = null;
+      _imageDisplay = null;
+      if (image != null) {
+        final displays = parent.target?.ffiModel.pi.displays ?? const <Display>[];
+        if (shown >= 0 &&
+            shown < displays.length &&
+            image.width == displays[shown].width &&
+            image.height == displays[shown].height) {
+          _displayImages.remove(shown)?.dispose();
+          _displayImages[shown] = image;
+        } else {
+          image.dispose();
+        }
+      }
+    } else if (from == kAllDisplayValue) {
+      _dropOtherDisplays = true;
+      final keep = _displayImages.remove(to);
+      _disposeDisplayImages();
+      _image?.dispose();
+      _image = keep;
+      _imageDisplay = keep == null ? null : to;
+    }
+    notifyListeners();
+  }
+
+  /// Mobile "all displays" view: the host's displays changed. Drops the pictures of displays
+  /// that are gone or have another size now; the others stay until their next frame.
+  void pruneDisplayImages(List<Display> displays) {
+    final gone = <int>[];
+    _displayImages.forEach((i, image) {
+      if (i < 0 ||
+          i >= displays.length ||
+          image.width != displays[i].width ||
+          image.height != displays[i].height) {
+        gone.add(i);
+      }
+    });
+    if (gone.isEmpty) return;
+    for (final i in gone) {
+      _displayImages.remove(i)?.dispose();
+    }
+    notifyListeners();
+  }
 
   String id = '';
 
@@ -1967,7 +2226,10 @@ class ImageModel with ChangeNotifier {
 
   addCallbackOnFirstImage(Function(String) cb) => callbacksOnFirstImage.add(cb);
 
-  clearImage() => _image = null;
+  clearImage() {
+    _image = null;
+    _imageDisplay = null;
+  }
 
   bool _webDecodingRgba = false;
   final List<Uint8List> _webRgbaList = List.empty(growable: true);
@@ -1995,12 +2257,14 @@ class ImageModel with ChangeNotifier {
         _paintLatency.isActive(parent.target?.qualityMonitorModel)
             ? (Stopwatch()..start())
             : null;
-    final imageBefore = _image;
+    final seqBefore = _imageSeq;
+    final statWatch = Stopwatch()..start();
     try {
       await decodeAndUpdate(display, rgba);
-      if (imageWatch != null && !identical(_image, imageBefore)) {
+      _panelStat(display, statWatch.elapsedMicroseconds);
+      if (imageWatch != null && _imageSeq != seqBefore) {
         _paintLatency.addImage(imageWatch.elapsedMicroseconds);
-        _measurePaint();
+        _measurePaint(display);
       }
     } catch (e) {
       debugPrint('onRgba error: $e');
@@ -2008,9 +2272,45 @@ class ImageModel with ChangeNotifier {
     platformFFI.nextRgba(sessionId, display);
   }
 
+  // Display panels: one log line every 5 s per engine while several windows show one
+  // connection (how many pictures this engine set, how long a frame took from the event to
+  // the picture, and whether this window draws at all).
+  int _statFrames = 0;
+  int _statMicros = 0;
+  int _statMaxMicros = 0;
+  int _statSinceMs = 0;
+  void _panelStat(int display, int micros) {
+    if (!isAndroid) return;
+    if (!isDisplayPanel && !androidDisplayPanels.isOpen) {
+      _statSinceMs = 0;
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_statSinceMs == 0) {
+      _statSinceMs = now;
+      _statFrames = 0;
+      _statMicros = 0;
+      _statMaxMicros = 0;
+    }
+    _statFrames++;
+    _statMicros += micros;
+    if (micros > _statMaxMicros) _statMaxMicros = micros;
+    final span = now - _statSinceMs;
+    if (span < 5000) return;
+    debugPrint('[panel stat] ${isDisplayPanel ? 'panel' : 'main'} d=$display '
+        'fps=${(_statFrames * 1000 / span).toStringAsFixed(1)} '
+        'img_ms avg=${(_statMicros / _statFrames / 1000).toStringAsFixed(1)} '
+        'max=${(_statMaxMicros / 1000).toStringAsFixed(1)} '
+        'life=${WidgetsBinding.instance.lifecycleState?.name} '
+        'frames=${SchedulerBinding.instance.framesEnabled}');
+    _statSinceMs = 0;
+  }
+
   final _paintLatency = _PaintLatencyStats();
   bool _paintCallbackPending = false;
-  Stopwatch? _paintWatch;
+  // By display: in the mobile "all displays" view the pictures of several displays are set
+  // between two frames, and each has waited its own time.
+  final Map<int, Stopwatch> _paintWatches = {};
 
   // From the new ui.Image being set (just before nextRgba, where Rust's ui_take
   // ends) to the end of the frame that painted it. UI thread only:
@@ -2018,21 +2318,23 @@ class ImageModel with ChangeNotifier {
   // At most one callback is pending: addPostFrameCallback does not schedule a
   // frame, so while frames are off (app paused, headset off) callbacks would
   // pile up. An image replaced before any frame painted it is not counted.
-  void _measurePaint() {
+  void _measurePaint(int display) {
     final binding = SchedulerBinding.instance;
     if (!binding.framesEnabled) {
-      _paintWatch = null;
+      _paintWatches.clear();
       return;
     }
-    _paintWatch = Stopwatch()..start();
+    if (!_allDisplays) _paintWatches.clear();
+    _paintWatches[display] = Stopwatch()..start();
     if (_paintCallbackPending) return;
     _paintCallbackPending = true;
     binding.addPostFrameCallback((_) {
       _paintCallbackPending = false;
-      final watch = _paintWatch;
-      _paintWatch = null;
-      if (watch == null) return;
-      _paintLatency.add(watch.elapsedMicroseconds);
+      if (_paintWatches.isEmpty) return;
+      for (final watch in _paintWatches.values) {
+        _paintLatency.add(watch.elapsedMicroseconds);
+      }
+      _paintWatches.clear();
       _paintLatency.maybeReport(parent.target?.qualityMonitorModel);
     });
   }
@@ -2040,11 +2342,13 @@ class ImageModel with ChangeNotifier {
   // web only: image already created from a decoded WebCodecs frame
   Future<void> onImage(
       int display, ui.Image image, bool Function() isCurrentSession) async {
-    await update(image, isCurrentSession: isCurrentSession);
+    await update(image, isCurrentSession: isCurrentSession, display: display);
   }
 
   decodeAndUpdate(int display, Uint8List rgba) async {
     final pid = parent.target?.id;
+    // A late frame of a display that is not shown any more: not decoded at all.
+    if (_isOtherDisplay(display)) return;
     final rect = parent.target?.ffiModel.pi.getDisplayRect(display);
     final image = await img.decodeImageFromPixels(
       rgba,
@@ -2058,11 +2362,19 @@ class ImageModel with ChangeNotifier {
       image?.dispose();
       return;
     }
-    await update(image);
+    if (_allDisplays) {
+      _setDisplayImage(display, image);
+      return;
+    }
+    if (_isOtherDisplay(display)) {
+      image?.dispose();
+      return;
+    }
+    await update(image, display: display);
   }
 
   Future<void> update(ui.Image? image,
-      {bool Function()? isCurrentSession}) async {
+      {bool Function()? isCurrentSession, int? display}) async {
     if (_disposeIfStale(image, isCurrentSession)) return;
     if (_image == null && image != null) {
       if (isDesktop || isWebDesktop) {
@@ -2077,7 +2389,14 @@ class ImageModel with ChangeNotifier {
     if (_disposeIfStale(image, isCurrentSession)) return;
     _image?.dispose();
     _image = image;
-    if (image != null) notifyListeners();
+    _imageDisplay = image == null ? null : display;
+    if (image == null) {
+      // Session end (FFI.close): the per-display pictures go too.
+      _disposeDisplayImages();
+    } else {
+      _imageSeq++;
+      notifyListeners();
+    }
   }
 
   bool _disposeIfStale(ui.Image? image, bool Function()? isCurrentSession) {
@@ -2087,21 +2406,33 @@ class ImageModel with ChangeNotifier {
     return true;
   }
 
+  // mobile only: the size the canvas shows (all displays together, or the one picture).
+  Size? get _contentSize {
+    if (_displayImages.isNotEmpty) {
+      final r = parent.target?.ffiModel.rect;
+      if (r != null && r.width > 0 && r.height > 0) return r.size;
+    }
+    final i = _image;
+    return i == null ? null : Size(i.width.toDouble(), i.height.toDouble());
+  }
+
   // mobile only
   double get maxScale {
-    if (_image == null) return 1.5;
+    final content = _contentSize;
+    if (content == null) return 1.5;
     final size = parent.target!.canvasModel.getSize();
-    final xscale = size.width / _image!.width;
-    final yscale = size.height / _image!.height;
+    final xscale = size.width / content.width;
+    final yscale = size.height / content.height;
     return max(1.5, max(xscale, yscale));
   }
 
   // mobile only
   double get minScale {
-    if (_image == null) return 1.5;
+    final content = _contentSize;
+    if (content == null) return 1.5;
     final size = parent.target!.canvasModel.getSize();
-    final xscale = size.width / _image!.width;
-    final yscale = size.height / _image!.height;
+    final xscale = size.width / content.width;
+    final yscale = size.height / content.height;
     return min(xscale, yscale) / 1.5;
   }
 
@@ -2121,6 +2452,9 @@ class ImageModel with ChangeNotifier {
   void disposeImage() {
     _image?.dispose();
     _image = null;
+    _imageDisplay = null;
+    _disposeDisplayImages();
+    _dropOtherDisplays = false;
   }
 }
 
@@ -3426,6 +3760,19 @@ class CursorModel with ChangeNotifier {
         return null;
       }
     }
+    // Mobile "all displays" view: the empty area beside a smaller display is on no display.
+    final pi = parent.target?.ffiModel.pi;
+    if (isMobile &&
+        pi != null &&
+        pi.currentDisplay == kAllDisplayValue &&
+        pi.displays.isNotEmpty &&
+        !pi.displays.any((d) =>
+            newPos.dx >= d.x &&
+            newPos.dx < d.x + d.width &&
+            newPos.dy >= d.y &&
+            newPos.dy < d.y + d.height)) {
+      return null;
+    }
     return newPos;
   }
 
@@ -4413,6 +4760,9 @@ class FFI {
     int? tabWindowId,
     int? display,
     List<int>? displays,
+    // Android display panel: the main engine's cached peer data, which a desktop window
+    // asks its tab window for.
+    String? cachedPeerDataJson,
   }) {
     closed = false;
     if (isMobile) mobileReset();
@@ -4527,16 +4877,21 @@ class FFI {
     imageModel.updateUserTextureRender();
     final hasGpuTextureRender = bind.mainHasGpuTextureRender();
     final SimpleWrapper<bool> isToNewWindowNotified = SimpleWrapper(false);
+    // Android display panel: nothing is handled before the cached peer data is in (the
+    // first frame needs the display's size).
+    Future<void>? panelCacheHandled;
     // Preserved for the rgba data.
     stream.listen((message) {
       if (closed) return;
       if (tabWindowId != null && !isToNewWindowNotified.value) {
         // Session is read to be moved to a new window.
         // Get the cached data and handle the cached data.
-        Future.delayed(Duration.zero, () async {
-          final args = jsonEncode({'id': id, 'close': display == null});
-          final cachedData = await DesktopMultiWindow.invokeMethod(
-              tabWindowId, kWindowEventGetCachedSessionData, args);
+        final cacheHandled = Future.delayed(Duration.zero, () async {
+          final cachedData = cachedPeerDataJson ??
+              await DesktopMultiWindow.invokeMethod(
+                  tabWindowId,
+                  kWindowEventGetCachedSessionData,
+                  jsonEncode({'id': id, 'close': display == null}));
           if (cachedData == null) {
             // unreachable
             debugPrint('Unreachable, the cached data is empty.');
@@ -4550,16 +4905,29 @@ class FFI {
           ffiModel.setPermissions(data.permissions);
           await ffiModel.handleCachedPeerData(data, id);
           await sessionRefreshVideo(sessionId, ffiModel.pi);
-          await bind.sessionRequestNewDisplayInitMsgs(
-              sessionId: sessionId, display: ffiModel.pi.currentDisplay);
+          // Not for a display panel: the host's answer makes the viewer reset that
+          // display's decoder, and no key frame follows it.
+          if (cachedPeerDataJson == null) {
+            await bind.sessionRequestNewDisplayInitMsgs(
+                sessionId: sessionId, display: ffiModel.pi.currentDisplay);
+          }
         });
+        if (cachedPeerDataJson != null) panelCacheHandled = cacheHandled;
         isToNewWindowNotified.value = true;
       }
       () async {
+        if (panelCacheHandled != null) {
+          try {
+            await panelCacheHandled;
+          } catch (e) {
+            debugPrint('[panel] cached peer data failed: $e');
+          }
+        }
         if (message is EventToUI_Event) {
           if (message.field0 == "close") {
             closed = true;
             debugPrint('Exit session event loop');
+            if (isDisplayPanel) closeDisplayPanel();
             return;
           }
 
@@ -4638,7 +5006,8 @@ class FFI {
     if (restore == null || closed) return;
     // The display list may have changed since the restore was queued.
     final displays = ffiModel.pi.displays;
-    if ((restore == kAllDisplayValue && displays.isNotEmpty) ||
+    if ((restore == kAllDisplayValue &&
+            displays.length > (isMobile ? 1 : 0)) ||
         (restore >= 0 && restore < displays.length)) {
       openMonitorInTheSameTab(restore, this, ffiModel.pi,
           recordSelection: false, updateCursorPos: false);

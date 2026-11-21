@@ -1508,7 +1508,9 @@ class InputModel {
   // Drag to scroll (see dragScrollBy). The left press is already deferred until the pointer
   // leaves the long-press slop; that is where a quick, mostly vertical start is taken as a
   // scroll instead of a drag:
-  //  - leaving the slop sideways or diagonally: left drag, pressed at the down point;
+  //  - leaving the slop sideways or diagonally: left drag, pressed at the down point, but
+  //    not within the first _kQuestDragHoldoffMs unless it went _kQuestDragSureTravelPx
+  //    (a release before that is a click at the down point);
   //  - leaving it vertically within _kQuestScrollQuickMs of the press: nothing is sent until
   //    _kQuestScrollStartPx of vertical travel (pulling the trigger dips the ray: a sloppy
   //    click must stay a click), then the gesture scrolls until release;
@@ -1518,6 +1520,10 @@ class InputModel {
   static const int _kQuestScrollQuickMs = 300;
   static const double _kQuestScrollStartPx = 48.0; // logical px, vertical
   static const double _kQuestClickDragMaxPx = 48.0; // a drag this short is still a click
+  // A sideways move out of the slop becomes a drag only after this long, or at once when it
+  // went this far (a deliberate quick drag). Before that the press is still undecided.
+  static const int _kQuestDragHoldoffMs = 220;
+  static const double _kQuestDragSureTravelPx = 72.0;
   int _questDownMs = 0;
   bool _questLeftSlop = false; // travelled past the long-press slop, press still undecided
   bool _questQuickStart = false; // ...and did so within _kQuestScrollQuickMs
@@ -1534,7 +1540,7 @@ class InputModel {
     final pos = _pointerPositionForRemoteCanvas(e);
     switch (phase) {
       case 'hover':
-        if (_questPointer == null) {
+        if (_questPointer == null && !_overNoDisplay(pos)) {
           _questMoveTo(pos);
           quest.onHover?.call(e.localPosition);
         }
@@ -1544,6 +1550,8 @@ class InputModel {
         if (parent.target?.cursorModel.shouldBlock(pos.dx, pos.dy) ?? false) {
           break;
         }
+        // "All displays": the empty area beside a smaller display is not a click target.
+        if (_overNoDisplay(pos)) break;
         _questPointer = e.pointer;
         _questPointerButton = (e.kind == ui.PointerDeviceKind.mouse &&
                 (e.buttons & kSecondaryMouseButton) != 0)
@@ -1610,6 +1618,14 @@ class InputModel {
           quest.log('drag-scroll start '
               '(${travel.dx.toStringAsFixed(0)},${travel.dy.toStringAsFixed(0)}) '
               '${DateTime.now().millisecondsSinceEpoch - _questDownMs}ms');
+          break;
+        }
+        // Pulling the trigger jerks the ray: a pointer that left the slop this soon after
+        // the press, without going far, may still be a click. Send nothing yet; a release
+        // now is a click at the press point (see 'up'), and a hold turns into the drag below.
+        if (DateTime.now().millisecondsSinceEpoch - _questDownMs <
+                _kQuestDragHoldoffMs &&
+            travel.distance < _kQuestDragSureTravelPx) {
           break;
         }
         // A drag: press left at the point that was pressed, then catch up with the pointer.
@@ -1686,6 +1702,28 @@ class InputModel {
   void _questMoveTo(Offset pos) {
     handleMouse({'type': _kMouseEventMove, 'buttons': quest.heldButtonsMask}, pos,
         moveCanvas: false);
+  }
+
+  /// "All displays" view: [pos] (canvas coordinates) is inside the image but over none of
+  /// the displays. Always false with a single display.
+  bool _overNoDisplay(Offset pos) {
+    final ffi = parent.target;
+    if (ffi == null) return false;
+    final pi = ffi.ffiModel.pi;
+    final rect = ffi.ffiModel.rect;
+    if (pi.currentDisplay != kAllDisplayValue || rect == null) return false;
+    final c = ffi.canvasModel;
+    if (c.scale <= 0) return false;
+    // The same mapping as _handlePointerDevicePos.
+    final x = (pos.dx - c.x) / c.scale + rect.left;
+    final y = (pos.dy - c.y) / c.scale + rect.top;
+    if (!rect.contains(Offset(x, y))) return false;
+    for (final d in pi.displays) {
+      if (x >= d.x && x < d.x + d.width && y >= d.y && y < d.y + d.height) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void onPointCancelImage(PointerCancelEvent e) {
@@ -1963,6 +2001,8 @@ class InputModel {
             .sendRelativeMouseButton(_getMouseEvent(e, _kMouseEventDown));
       } else {
         final canvasPosition = _pointerPositionForRemoteCanvas(e);
+        // Mobile "all displays" view: no click on the empty area beside a smaller display.
+        if (isMobile && _overNoDisplay(canvasPosition)) return;
         handleMouse(_getMouseEvent(e, _kMouseEventDown), canvasPosition);
       }
     }
@@ -2471,10 +2511,40 @@ class InputModel {
       y = pos.dy;
     }
 
+    // Mobile, one display shown out of several, a mouse button held and the pointer past the
+    // edge of the picture: carry on onto the neighbouring display, so that a window can be
+    // dragged from one display to another. Only where a display really is.
+    if (isMobile &&
+        buttons != 0 &&
+        evtType == kMouseEventTypeDefault &&
+        !rect.contains(Offset(x, y))) {
+      final pi = parent.target?.ffiModel.pi;
+      if (pi != null &&
+          pi.currentDisplay != kAllDisplayValue &&
+          pi.displays.length > 1) {
+        for (final d in pi.displays) {
+          if (x >= d.x &&
+              x < d.x + d.width &&
+              y >= d.y &&
+              y < d.y + d.height) {
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (now - _pastEdgeLogMs > 2000) {
+              _pastEdgeLogMs = now;
+              debugPrint('[panel] drag past the edge -> '
+                  '${x.toStringAsFixed(0)},${y.toStringAsFixed(0)}');
+            }
+            return Point(x, y);
+          }
+        }
+      }
+    }
+
     return InputModel.getPointInRemoteRect(
         true, peerPlatform, kind, evtType, x, y, rect,
         buttons: buttons);
   }
+
+  int _pastEdgeLogMs = 0;
 
   static Point<double>? getPointInRemoteRect(
       bool isLocalDesktop,

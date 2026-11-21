@@ -269,6 +269,11 @@ class MainService : Service() {
     // to close them. Incoming connections are unaffected: the service keeps
     // running so the device stays reachable.
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // An extra display panel was closed: the connection belongs to the main panel.
+        if (rootIntent?.component?.className == DisplayActivity::class.java.name) {
+            super.onTaskRemoved(rootIntent)
+            return
+        }
         Log.d(logTag, "onTaskRemoved, closing outgoing sessions")
         FFI.closeAllSessions()
         super.onTaskRemoved(rootIntent)

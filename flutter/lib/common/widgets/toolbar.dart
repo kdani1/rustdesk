@@ -1250,6 +1250,20 @@ bool showVirtualDisplayMenu(FFI ffi) {
   return false;
 }
 
+/// Asks the host to plug in ([on]) or out one Amyuni virtual display. The stored list of
+/// displays to plug in again at the next connection is not changed by the request itself
+/// (see the comment in [getVirtualDisplayMenuChildren]).
+Future<void> toggleAmyuniVirtualDisplay(FFI ffi, bool on) async {
+  const key = 'virtual-display';
+  final before =
+      await bind.sessionGetPeerOption(sessionId: ffi.sessionId, name: key);
+  ffi.ffiModel.virtualDisplayToggledAt = DateTime.now();
+  await bind.sessionToggleVirtualDisplay(
+      sessionId: ffi.sessionId, index: 0, on: on);
+  await bind.sessionPeerOption(
+      sessionId: ffi.sessionId, name: key, value: before);
+}
+
 List<Widget> getVirtualDisplayMenuChildren(
     FFI ffi, String id, VoidCallback? clickCallBack) {
   if (!showVirtualDisplayMenu(ffi)) {
@@ -1294,6 +1308,17 @@ List<Widget> getVirtualDisplayMenuChildren(
   }
   if (pi.isAmyuniIdd) {
     final count = ffi.ffiModel.pi.amyuniVirtualDisplayCount;
+    // The peer option "virtual-display" holds one entry per display to plug in again at
+    // the next connection. The toggle only appends or drops one entry per press, even when
+    // the host refused the request, so the list can drift away from what the host really
+    // has (after failed presses every reconnect asked for more displays than were ever
+    // shown). Store the number the user is asking for instead.
+    // The request itself changes nothing in the list: the entry the toggle appends or drops
+    // is undone here, and FfiModel.handlePlatformAdditions stores the count the host reports
+    // back (the host answers within a second or two; a refused request brings no answer and
+    // leaves the list as it was).
+    Future<void> toggle(bool on) => toggleAmyuniVirtualDisplay(ffi, on);
+
     final children = <Widget>[
       Obx(() => Row(
             children: [
@@ -1301,8 +1326,7 @@ List<Widget> getVirtualDisplayMenuChildren(
                 onPressed: privacyModeState.isNotEmpty || count == 0
                     ? null
                     : () {
-                        bind.sessionToggleVirtualDisplay(
-                            sessionId: ffi.sessionId, index: 0, on: false);
+                        toggle(false);
                         clickCallBack?.call();
                       },
                 child: Icon(Icons.remove),
@@ -1312,8 +1336,7 @@ List<Widget> getVirtualDisplayMenuChildren(
                 onPressed: privacyModeState.isNotEmpty || count == 4
                     ? null
                     : () {
-                        bind.sessionToggleVirtualDisplay(
-                            sessionId: ffi.sessionId, index: 0, on: true);
+                        toggle(true);
                         clickCallBack?.call();
                       },
                 child: Icon(Icons.add),

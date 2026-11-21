@@ -75,10 +75,10 @@ class QuestInputModel {
   static const double kScrollHoldSeconds = 1.0;
   static const double kScrollRampSeconds = 8;
 
-  /// Where on that curve a push starts. Tuned on the headset: the speed the curve has after
-  /// 3 to 4 seconds (about 3 notches/s) is the wanted starting speed, and it should go on
-  /// accelerating from there as the curve does.
-  static const double kScrollRampLeadSeconds = 3.5;
+  /// Where on that curve a push starts. Tuned on the headset in two rounds: the wanted
+  /// starting speed is what the curve gives 5.5 s in (about 8 notches/s), and it goes on
+  /// accelerating from there as the curve does (25 notches/s after another 3.5 s).
+  static const double kScrollRampLeadSeconds = 5.5;
 
   /// Wheel units per notch (WHEEL_DELTA), and the smallest smooth step sent in one message.
   static const int _kNotchUnits = 120;
@@ -130,6 +130,13 @@ class QuestInputModel {
   void Function(Offset localPos)? onLeftClick;
   /// Hover while no button is held (auto-keyboard disarm when the pointer leaves the click spot).
   void Function(Offset localPos)? onHover;
+
+  /// The host's Misc.text_input_focus: what a click put the keyboard focus on (0 unknown,
+  /// 1 not a text field, 2 editable text field). Newer Windows hosts only.
+  void Function(int state)? onHostTextFocus;
+
+  /// The host of this connection sent Misc.text_input_focus (handed on to display panels).
+  bool hostAnswersFocus = false;
   final debugLines = <String>[].obs;
   final debugStatus = ''.obs;
 

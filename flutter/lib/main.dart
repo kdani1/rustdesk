@@ -26,6 +26,7 @@ import 'package:window_manager/window_manager.dart';
 import 'common.dart';
 import 'consts.dart';
 import 'mobile/pages/home_page.dart';
+import 'mobile/pages/remote_page.dart' as mobile_remote;
 import 'mobile/pages/server_page.dart';
 import 'mobile/widgets/deploy_dialog.dart';
 import 'models/platform_model.dart';
@@ -43,6 +44,16 @@ Future<void> main(List<String> args) async {
   kBootArgs = List.from(args);
 
   if (!isDesktop) {
+    if (isAndroid && args.length >= 2 && args.first == 'display_panel') {
+      // A second engine of this process, started by DisplayActivity.
+      try {
+        kDisplayPanelArgs = jsonDecode(args[1]) as Map<String, dynamic>;
+        runDisplayPanel();
+      } catch (e) {
+        debugPrint('[panel] bad arguments: $e');
+      }
+      return;
+    }
     runMobileApp();
     return;
   }
@@ -117,13 +128,13 @@ Future<void> main(List<String> args) async {
   }
 }
 
-Future<void> initEnv(String appType) async {
+Future<void> initEnv(String appType, {SessionID? sessionId}) async {
   // global shared preference
   await platformFFI.init(appType);
   // global FFI, use this **ONLY** for global configuration
   // for convenience, use global FFI on mobile platform
   // focus on multi-ffi on desktop first
-  await initGlobalFFI();
+  await initGlobalFFI(sessionId);
   // await Firebase.initializeApp();
   _registerEventHandler();
   // Update the system theme.
@@ -183,6 +194,35 @@ void runMobileApp() async {
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
   await initUniLinks();
+}
+
+/// Android: an extra Quest panel showing one remote display of the main panel's connection
+/// (DisplayActivity). No home page, no service, no connect: it attaches a UI session.
+void runDisplayPanel() async {
+  final a = kDisplayPanelArgs!;
+  final display = a['display'] as int;
+  final id = a['id'] as String;
+  kWindowId = 1000 + display; // only names this engine's global event stream
+  await initEnv(kAppTypeDesktopRemote,
+      sessionId: SessionID(a['sid'] as String));
+  final sessions = bind.peerGetSessionsCount(id: id, connType: 0);
+  debugPrint('[panel $display] start, sessions on the connection: $sessions');
+  if (sessions < 1) {
+    platformFFI.invokeMethod('panel_finish'); // the main connection is gone
+    return;
+  }
+  gFFI.setMethodCallHandler((method, arguments) {
+    if (method == 'quest_input') {
+      gFFI.inputModel.quest.onPlatformEvent(arguments);
+    }
+    return '';
+  });
+  draggablePositions.load();
+  runApp(App(
+      home: mobile_remote.RemotePage(
+          id: id,
+          panelDisplay: display,
+          panelCachedPeerData: a['cache'] as String)));
 }
 
 void runMultiWindow(
@@ -419,6 +459,10 @@ WindowOptions getHiddenTitleBarWindowOptions(
 }
 
 class App extends StatefulWidget {
+  /// Shown instead of the home page (Android display panel).
+  final Widget? home;
+  App({this.home});
+
   @override
   State<App> createState() => _AppState();
 }
@@ -501,11 +545,12 @@ class _AppState extends State<App> with WidgetsBindingObserver {
           theme: MyTheme.lightTheme,
           darkTheme: MyTheme.darkTheme,
           themeMode: MyTheme.currentThemeMode(),
-          home: isDesktop
-              ? const DesktopTabPage()
-              : isWeb
-                  ? WebHomePage()
-                  : HomePage(),
+          home: widget.home ??
+              (isDesktop
+                  ? const DesktopTabPage()
+                  : isWeb
+                      ? WebHomePage()
+                      : HomePage()),
           localizationsDelegates: const [
             GlobalMaterialLocalizations.delegate,
             GlobalWidgetsLocalizations.delegate,

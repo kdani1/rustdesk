@@ -1746,6 +1746,9 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn on_microphone_forwarding(&self, _state: &str, _error: &str) {}
     /// The peer's foreground app took (or released) the pointer; drives automatic game mode.
     fn on_pointer_captured(&self, _captured: bool) {}
+    /// The peer's answer to a left click: is the keyboard focus in an editable text field
+    /// (Misc.text_input_focus: 0 unknown, 1 no, 2 yes); drives the touch viewer's soft keyboard.
+    fn on_text_input_focus(&self, _state: i32) {}
     fn on_voice_call_started(&self);
     fn on_voice_call_closed(&self, reason: &str);
     fn on_voice_call_waiting(&self);

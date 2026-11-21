@@ -243,6 +243,7 @@ class MainActivity : FlutterActivity() {
         // for recreation (configuration change, "don't keep activities"),
         // which must not tear down a live session.
         if (isFinishing) {
+            DisplayActivity.closeAll()
             FFI.closeAllSessions()
         }
         mainService?.let {
@@ -655,6 +656,25 @@ class MainActivity : FlutterActivity() {
                 "quest_input_config" -> {
                     result.success(QuestInput.configure(call.arguments))
                 }
+                "panel_open" -> {
+                    // One more Quest panel for one remote display (see DisplayActivity).
+                    val a = call.arguments as? Map<*, *>
+                    val d = a?.get("display") as? Int
+                    val sid = a?.get("sid") as? String
+                    val args = a?.get("args") as? String
+                    result.success(
+                        if (d == null || sid == null || args == null) false
+                        else DisplayActivity.open(this, d, sid, args)
+                    )
+                }
+                "panel_close" -> {
+                    (call.arguments as? String)?.let { DisplayActivity.close(it) }
+                    result.success(true)
+                }
+                "panel_close_all" -> {
+                    DisplayActivity.closeAll()
+                    result.success(true)
+                }
                 else -> {
                     result.error("-1", "No such method", null)
                 }
@@ -1003,7 +1023,10 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private val poseWatcher = PoseWatcher(this) { -1 }
+
     override fun onStop() {
+        poseWatcher.stop()
         super.onStop()
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
         if (!disableFloatingWindow && MainService.isReady) {
@@ -1013,6 +1036,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onStart() {
         super.onStart()
+        poseWatcher.start()
         stopService(Intent(this, FloatingWindowService::class.java))
     }
 
@@ -1024,6 +1048,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        DisplayActivity.onHover(-1, ev, window.decorView.width)
         if (QuestInput.onGenericMotion(flutterMethodChannel, ev)) return true
         return super.dispatchGenericMotionEvent(ev)
     }

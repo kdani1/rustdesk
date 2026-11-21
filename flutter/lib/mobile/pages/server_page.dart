@@ -902,6 +902,22 @@ void androidChannelInit() {
     debugPrint("flutter got android msg,$method,$arguments");
     try {
       switch (method) {
+        case "panel_pose":
+          androidDisplayPanels.onPose(
+              gFFI,
+              arguments["id"] as int,
+              (arguments["v"] as List)
+                  .map((e) => (e as num).toDouble())
+                  .toList());
+          break;
+        case "panel_neighbor":
+          androidDisplayPanels.onNeighbor(
+              gFFI, arguments["left"] as int, arguments["right"] as int);
+          break;
+        case "panel_closed":
+          androidDisplayPanels.onPanelClosed(
+              arguments["display"] as int, arguments["sid"] as String);
+          break;
         case "start_capture":
           {
             gFFI.dialogManager.dismissAll();
