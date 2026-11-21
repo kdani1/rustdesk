@@ -628,6 +628,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   /// All keys, most used first: the toolbar row takes as many as fit from the front.
   List<_KeySpec> _keySpecs() {
     final isMac = gFFI.ffiModel.pi.platform == kPeerPlatformMacOS;
+    final isWin = gFFI.ffiModel.pi.platform == kPeerPlatformWindows;
     _KeySpec mod(String label, String name) => _KeySpec(
         label, () => inputModel.cycleModifier(name),
         state: inputModel.modifierState(name));
@@ -644,17 +645,24 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       k('Esc', 'VK_ESCAPE'),
       k('Tab', 'VK_TAB'),
       k('Del', 'VK_DELETE'),
+      // Copy, and paste through the Windows clipboard history (Win+V); plain paste for
+      // other hosts. They come before the cursor keys: used far more often here.
+      combo('C', 'VK_C'),
+      if (isWin)
+        _KeySpec('Win+V',
+            () => inputModel.inputShortcut('VK_V', isMac: false, modifier: 'command'))
+      else
+        combo('V', 'VK_V'),
+      k('Enter', 'VK_ENTER'),
+      k('Home', 'VK_HOME'),
+      k('End', 'VK_END'),
       k('', 'VK_LEFT', icon: Icons.keyboard_arrow_left),
       k('', 'VK_UP', icon: Icons.keyboard_arrow_up),
       k('', 'VK_DOWN', icon: Icons.keyboard_arrow_down),
       k('', 'VK_RIGHT', icon: Icons.keyboard_arrow_right),
-      k('Enter', 'VK_ENTER'),
-      k('Home', 'VK_HOME'),
-      k('End', 'VK_END'),
       k('PgUp', 'VK_PRIOR'),
       k('PgDn', 'VK_NEXT'),
-      combo('C', 'VK_C'),
-      combo('V', 'VK_V'),
+      if (isWin) combo('V', 'VK_V'),
       combo('X', 'VK_X'),
       combo('Z', 'VK_Z'),
       combo('A', 'VK_A'),

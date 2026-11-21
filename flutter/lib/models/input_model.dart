@@ -1120,9 +1120,10 @@ class InputModel {
     modifiersRevision.value++;
   }
 
-  /// Ctrl+[key] (Cmd on a Mac peer) without disturbing a locked modifier.
-  void inputShortcut(String key, {required bool isMac}) {
-    final name = isMac ? 'command' : 'ctrl';
+  /// Ctrl+[key] (Cmd on a Mac peer), or [modifier]+[key] when given, without disturbing a
+  /// locked modifier.
+  void inputShortcut(String key, {required bool isMac, String? modifier}) {
+    final name = modifier ?? (isMac ? 'command' : 'ctrl');
     final locked = modifierState(name) == 2;
     _setModifier(name, true);
     inputKey(key);
@@ -1516,6 +1517,7 @@ class InputModel {
   //    long press. Tune with the debug readout: it logs when each gesture was decided.
   static const int _kQuestScrollQuickMs = 300;
   static const double _kQuestScrollStartPx = 48.0; // logical px, vertical
+  static const double _kQuestClickDragMaxPx = 48.0; // a drag this short is still a click
   int _questDownMs = 0;
   bool _questLeftSlop = false; // travelled past the long-press slop, press still undecided
   bool _questQuickStart = false; // ...and did so within _kQuestScrollQuickMs
@@ -1646,7 +1648,12 @@ class InputModel {
         } else if (_questLeftPressed) {
           _questLeftPressed = false;
           quest.button(MouseButtons.left, 'pointer', false);
-          quest.onLeftClick?.call(e.localPosition);
+          // Only a sloppy click (a short drag) may open the auto-keyboard. A real drag is a
+          // selection or a move: the text cursor under it must not bring the keyboard up.
+          if ((e.localPosition - _questDownLocal).distance <=
+              _kQuestClickDragMaxPx) {
+            quest.onLeftClick?.call(e.localPosition);
+          }
         } else if (phase == 'up') {
           // Quick tap, never moved far: a normal left click.
           quest.button(MouseButtons.left, 'pointer', true);
