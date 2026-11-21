@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:get/get.dart';
 
 import '../common.dart';
+import '../consts.dart';
 import 'input_model.dart';
 import 'platform_model.dart';
 
@@ -16,7 +17,8 @@ import 'platform_model.dart';
 /// are mapped here onto the existing mouse and key senders of [InputModel]:
 ///
 ///   right stick ........ move the remote cursor (frame-timed, ~60 Hz)
-///   left stick ......... scroll wheel (vertical, or horizontal when pushed sideways)
+///   left stick ......... scroll wheel (vertical, or horizontal when pushed sideways);
+///                        starts slowly and speeds up the longer it is held
 ///   triggers (L2/R2) ... left mouse button (held while held: drag works)
 ///   grips (L1/R1) ...... right mouse button
 ///   A .................. left mouse button      B ... right mouse button
@@ -40,6 +42,7 @@ class QuestInputModel {
   static const kOptionDebug = 'quest-input-debug';
   static const kOptionCursorOverlay = 'quest-cursor-overlay';
   static const kOptionAutoKeyboard = 'quest-auto-keyboard';
+  static const kOptionKeyBar = 'quest-key-bar';
 
   // Android KeyEvent key codes.
   static const _kDpadUp = 19;
@@ -61,8 +64,41 @@ class QuestInputModel {
   /// Cursor speed at full stick deflection, in logical screen pixels per second.
   static const double kCursorSpeed = 900;
 
-  /// Wheel ticks per second at full stick deflection.
-  static const double kScrollTicksPerSec = 14;
+  /// Thumbstick scrolling, in wheel notches per second at full deflection. It starts very
+  /// slowly and speeds up only over several seconds of holding the stick in one direction
+  /// (like shuttle seeking in a video): [kScrollStartNotchesPerSec] for the first
+  /// [kScrollHoldSeconds], then a quadratic ramp that reaches [kScrollMaxNotchesPerSec]
+  /// [kScrollRampSeconds] later. Less deflection scales it down further. One notch is about
+  /// 100 px in a browser, so the start is about 50 px per second.
+  static const double kScrollStartNotchesPerSec = 0.5;
+  static const double kScrollMaxNotchesPerSec = 25;
+  static const double kScrollHoldSeconds = 1.0;
+  static const double kScrollRampSeconds = 8;
+
+  /// Where on that curve a push starts. Tuned on the headset: the speed the curve has after
+  /// 3 to 4 seconds (about 3 notches/s) is the wanted starting speed, and it should go on
+  /// accelerating from there as the curve does.
+  static const double kScrollRampLeadSeconds = 3.5;
+
+  /// Wheel units per notch (WHEEL_DELTA), and the smallest smooth step sent in one message.
+  static const int _kNotchUnits = 120;
+  /// An eighth of a notch: small enough to look continuous in applications that scroll by
+  /// the amount, few enough messages (4 a second at the start) for applications that
+  /// scroll one step per wheel message whatever its amount.
+  static const int _kScrollMinUnits = 15;
+
+  // The Quest also turns a thumbstick push over a 2D panel into system scroll events
+  // (Flutter PointerScrollEvents), many per second. They used to be sent on as one whole
+  // wheel notch each, with no speed control at all. A stream of them now only says "the
+  // stick is held in this direction" and drives the same ramp; a lone event (a real mouse
+  // wheel click) is still one notch.
+  /// A second event in the same direction within this window makes it a stream (held stick);
+  /// a lone event is sent as one notch when the window ends.
+  static const int _kSysScrollStreamGapUs = 250000;
+
+  /// A stream ends when no event came for three times its last gap, within these bounds.
+  static const int _kSysScrollIdleMinUs = 100000;
+  static const int _kSysScrollIdleMaxUs = 400000;
   static const double _kStickDeadzone = 0.12;
 
   final InputModel input;
@@ -85,6 +121,10 @@ class QuestInputModel {
   /// (see CursorModel.remoteCursorIsText). On by default; toggleable.
   final autoKeyboard = true.obs;
 
+  /// Row of extra keys below the remote image (Ctrl, Alt, Tab, Esc, arrows...): the Quest
+  /// system keyboard has none of them. On by default; toggled from the toolbar.
+  final keyBar = true.obs;
+
   /// Called after a Quest pointer left click/drag is released (auto-keyboard hook), with the
   /// release position in local logical px.
   void Function(Offset localPos)? onLeftClick;
@@ -106,7 +146,22 @@ class QuestInputModel {
   bool _lt = false, _rt = false;
   Timer? _timer;
   int _lastTickUs = 0;
-  double _scrollAccum = 0;
+  double _scrollAccum = 0; // wheel units not sent yet
+  double _scrollHeldSec = 0; // how long the stick has been held in _scrollDir
+  int _scrollDir = 0; // +-1 vertical, +-2 horizontal, 0 = not scrolling
+  int _sysScrollLastUs = 0; // time of the last system scroll event
+  int _sysScrollDir = 0; // its direction, coded like _scrollDir
+  bool _sysScrollStream = false; // the events come as a stream (held stick)
+  int _sysScrollIdleUs = _kSysScrollIdleMaxUs; // silence that ends the current stream
+  // The left-stick axes drove this scroll: the event stream must not take it over when the
+  // stick drops back into its dead zone (it would continue at full speed).
+  bool _stickOwnsScroll = false;
+  Timer? _sysNotchTimer; // pending single notch for a lone event
+  // One summary line per scroll in the device log, to tell what a stick push really does.
+  int _dbgUnits = 0, _dbgMsgs = 0, _dbgSysEvents = 0;
+  int _dbgSysGapMinUs = 0, _dbgSysGapMaxUs = 0;
+  double _dbgStickMax = 0;
+  bool _dbgFromStick = false;
   int _lastStatusUs = 0;
   int _lastPointerLogUs = 0;
 
@@ -120,6 +175,7 @@ class QuestInputModel {
         bind.mainGetLocalOption(key: kOptionCursorOverlay) == 'Y';
     autoKeyboard.value =
         bind.mainGetLocalOption(key: kOptionAutoKeyboard) != 'N';
+    keyBar.value = bind.mainGetLocalOption(key: kOptionKeyBar) != 'N';
     String model = '';
     try {
       final info = await platformFFI.invokeMethod('quest_get_info');
@@ -140,6 +196,7 @@ class QuestInputModel {
     if (!_attached) return;
     _attached = false;
     _stopTimer();
+    _resetSystemScroll();
     _lx = _ly = _rx = _ry = 0;
     _setHat(0, 0);
     _lt = _rt = false;
@@ -177,6 +234,13 @@ class QuestInputModel {
   void setAutoKeyboard(bool v) {
     autoKeyboard.value = v;
     bind.mainSetLocalOption(key: kOptionAutoKeyboard, value: v ? 'Y' : 'N');
+  }
+
+  void setKeyBar(bool v) {
+    keyBar.value = v;
+    // The bar is the only place a locked modifier is shown and released.
+    if (!v) input.resetModifiers();
+    bind.mainSetLocalOption(key: kOptionKeyBar, value: v ? 'Y' : 'N');
   }
 
   void setDebug(bool v) {
@@ -407,15 +471,109 @@ class QuestInputModel {
   void _stopTimer() {
     _timer?.cancel();
     _timer = null;
+    _resetScroll();
+  }
+
+  /// The app is no longer in front (system menu, headset taken off): no stick event will
+  /// arrive to say the stick was let go, so stop moving and scrolling now. Otherwise the
+  /// last stick position would keep scrolling the host, faster and faster.
+  void releaseSticks() {
+    _lx = _ly = _rx = _ry = 0;
+    _resetSystemScroll();
+    _stopTimer();
+  }
+
+  void _resetSystemScroll() {
+    _sysNotchTimer?.cancel();
+    _sysNotchTimer = null;
+    _sysScrollStream = false;
+    _sysScrollDir = 0;
+    _stickOwnsScroll = false;
+  }
+
+  /// A system scroll event (PointerScrollEvent) on a Quest. Returns true when it was taken
+  /// over here, so the caller must not send it as a wheel notch itself.
+  bool onSystemScroll(Offset delta) {
+    if (!_attached || !isQuest.value) return false;
+    final vertical = delta.dy.abs() >= delta.dx.abs();
+    final v = vertical ? delta.dy : delta.dx;
+    if (v == 0) return true;
+    // Same sign convention as InputModel.onPointerSignalImage: down/right = negative wheel.
+    final sign = v > 0 ? -1 : 1;
+    final dir = (vertical ? 1 : 2) * sign;
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
+    final gapUs = nowUs - _sysScrollLastUs;
+    _sysScrollLastUs = nowUs;
+    _dbgSysEvents++;
+    if (_sysScrollStream && gapUs < _sysScrollIdleUs) {
+      // The stream goes on; a new direction restarts the ramp in _tick.
+      _sysScrollDir = dir;
+      _noteStreamGap(gapUs);
+      _ensureTimer();
+      return true;
+    }
+    if (dir == _sysScrollDir && _sysNotchTimer != null) {
+      // A second event before the first one's notch went out: a held stick, not a click.
+      _sysNotchTimer?.cancel();
+      _sysNotchTimer = null;
+      _sysScrollStream = true;
+      _noteStreamGap(gapUs);
+      log('scroll: system event stream, gap ${gapUs ~/ 1000} ms');
+      _ensureTimer();
+      return true;
+    }
+    // First event after a pause. Wait to see whether more follow; if none does it was a
+    // single wheel click and goes out as one notch.
+    _sysScrollStream = false;
+    _stickOwnsScroll = false;
+    _sysScrollDir = dir;
+    _sysNotchTimer?.cancel();
+    _sysNotchTimer =
+        Timer(const Duration(microseconds: _kSysScrollStreamGapUs), () {
+      _sysNotchTimer = null;
+      if (!_attached || _sysScrollStream) return;
+      _sysScrollDir = 0;
+      if (!input.keyboardPerm || input.isViewCamera) return;
+      debugPrint('[quest] scroll: lone system event -> 1 notch');
+      _wheel('wheel', vertical ? 0 : sign, vertical ? sign : 0);
+    });
+    return true;
+  }
+
+  void _noteStreamGap(int gapUs) {
+    _sysScrollIdleUs =
+        (3 * gapUs).clamp(_kSysScrollIdleMinUs, _kSysScrollIdleMaxUs);
+    if (_dbgSysGapMinUs == 0 || gapUs < _dbgSysGapMinUs) _dbgSysGapMinUs = gapUs;
+    if (gapUs > _dbgSysGapMaxUs) _dbgSysGapMaxUs = gapUs;
+  }
+
+  void _resetScroll() {
+    if (_scrollDir != 0) {
+      debugPrint('[quest] scroll end: ${_dbgFromStick ? 'stick axes' : 'system events'} '
+          'dir=$_scrollDir held=${_scrollHeldSec.toStringAsFixed(2)}s '
+          'sent=$_dbgUnits units in $_dbgMsgs msgs, stickMax=${_dbgStickMax.toStringAsFixed(2)}, '
+          'sysEvents=$_dbgSysEvents gap=${_dbgSysGapMinUs ~/ 1000}..${_dbgSysGapMaxUs ~/ 1000} ms');
+    }
+    _dbgUnits = _dbgMsgs = _dbgSysEvents = 0;
+    _dbgSysGapMinUs = _dbgSysGapMaxUs = 0;
+    _dbgStickMax = 0;
     _scrollAccum = 0;
+    _scrollHeldSec = 0;
+    _scrollDir = 0;
   }
 
   void _tick() {
-    if (!_attached || (_lx == 0 && _ly == 0 && _rx == 0 && _ry == 0)) {
+    final nowUs = DateTime.now().microsecondsSinceEpoch;
+    if (_sysScrollStream && nowUs - _sysScrollLastUs >= _sysScrollIdleUs) {
+      // The system scroll events stopped: the stick was let go.
+      _sysScrollStream = false;
+      _sysScrollDir = 0;
+    }
+    if (!_attached ||
+        (_lx == 0 && _ly == 0 && _rx == 0 && _ry == 0 && !_sysScrollStream)) {
       _stopTimer();
       return;
     }
-    final nowUs = DateTime.now().microsecondsSinceEpoch;
     final dt = ((nowUs - _lastTickUs) / 1e6).clamp(0.0, 0.05);
     _lastTickUs = nowUs;
     final ffi = input.parent.target;
@@ -431,25 +589,91 @@ class QuestInputModel {
     }
 
     // Left stick: wheel. Dominant axis only, so a slightly diagonal push does not scroll sideways.
-    final vertical = _ly.abs() >= _lx.abs();
+    // Keep the axis already being scrolled unless the other one clearly dominates, so a
+    // diagonal hold does not flip axes (and restart the ramp) on thumb tremor.
+    final ax = _lx.abs(), ay = _ly.abs();
+    final cur = _scrollDir.abs(); // 1 = vertical, 2 = horizontal, 0 = not scrolling
+    final vertical = cur == 1
+        ? ay * 1.5 >= ax
+        : cur == 2
+            ? ay > ax * 1.5
+            : ay >= ax;
     final v = vertical ? _ly : _lx;
-    if (v != 0) {
-      _scrollAccum += _curve(v).abs() * kScrollTicksPerSec * dt;
-      if (_scrollAccum >= 1) {
-        _scrollAccum -= 1;
-        // Same sign convention as InputModel.onPointerSignalImage: stick down/right = scroll
-        // down/right = negative wheel value.
-        final tick = v > 0 ? -1 : 1;
-        _wheel(vertical ? 0 : tick, vertical ? tick : 0);
+    final stick = _curve(v).abs(); // 0 inside the dead zone
+    // The stick's own axes win (they carry how far it is pushed). A stream of system scroll
+    // events counts as full deflection in its direction, but only for a scroll the axes
+    // never drove.
+    if (stick > 0) {
+      _stickOwnsScroll = true;
+    } else if (!_sysScrollStream) {
+      _stickOwnsScroll = false;
+    }
+    final deflection =
+        stick > 0 ? stick : (_sysScrollStream && !_stickOwnsScroll ? 1.0 : 0.0);
+    // Smooth (partial notches) where the host takes high-resolution wheel input; a Linux
+    // host turns every unit into a whole wheel click and an Android host swipes per
+    // notch, so those get whole notches. Follows the "smooth scrolling" switch.
+    final peer = input.peerPlatform;
+    final smooth = input.dragScrollSmooth.value &&
+        peer != kPeerPlatformLinux &&
+        peer != kPeerPlatformAndroid;
+    if (deflection > 0) {
+      // Same sign convention as InputModel.onPointerSignalImage: stick down/right = scroll
+      // down/right = negative wheel value.
+      final int dir;
+      if (stick > 0) {
+        dir = (vertical ? 1 : 2) * (v > 0 ? -1 : 1);
+      } else {
+        dir = _sysScrollDir;
+      }
+      final sign = dir > 0 ? 1 : -1;
+      final dirVertical = dir.abs() == 1;
+      if (dir != _scrollDir) {
+        // New direction or axis: start slowly again.
+        _resetScroll();
+        _scrollDir = dir;
+        _dbgFromStick = stick > 0;
+        // One small step at once, so a push answers immediately; the rest follows the ramp.
+        if (smooth) _scrollAccum = _kScrollMinUnits.toDouble();
+      }
+      if (stick > _dbgStickMax) _dbgStickMax = stick;
+      _scrollHeldSec += dt;
+      final ramp = ((_scrollHeldSec +
+                  kScrollRampLeadSeconds -
+                  kScrollHoldSeconds) /
+              kScrollRampSeconds)
+          .clamp(0.0, 1.0);
+      final notchesPerSec = kScrollStartNotchesPerSec +
+          (kScrollMaxNotchesPerSec - kScrollStartNotchesPerSec) * ramp * ramp;
+      _scrollAccum += deflection * notchesPerSec * dt * _kNotchUnits;
+      if (smooth) {
+        final units = _scrollAccum.truncate();
+        if (units >= _kScrollMinUnits) {
+          _scrollAccum -= units;
+          _dbgUnits += units;
+          _dbgMsgs++;
+          final n = sign * units;
+          _wheel('trackpad', dirVertical ? 0 : n, dirVertical ? n : 0);
+        }
+      } else {
+        final notches = (_scrollAccum / _kNotchUnits).truncate();
+        if (notches > 0) {
+          _scrollAccum -= notches * _kNotchUnits;
+          _dbgUnits += notches * _kNotchUnits;
+          _dbgMsgs++;
+          final n = sign * notches;
+          _wheel('wheel', dirVertical ? 0 : n, dirVertical ? n : 0);
+        }
       }
     } else {
-      _scrollAccum = 0;
+      _resetScroll();
     }
   }
 
-  void _wheel(int x, int y) {
+  /// [type] 'wheel' = whole notches, 'trackpad' = 1/120 notch units (see InputModel.dragScrollBy).
+  void _wheel(String type, int x, int y) {
     unawaited(bind.sessionSendMouse(
         sessionId: input.sessionId,
-        msg: json.encode(input.modify({'type': 'wheel', 'x': '$x', 'y': '$y'}))));
+        msg: json.encode(input.modify({'type': type, 'x': '$x', 'y': '$y'}))));
   }
 }

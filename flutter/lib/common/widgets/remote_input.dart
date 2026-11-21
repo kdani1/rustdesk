@@ -102,6 +102,11 @@ class _RawTouchGestureDetectorRegionState
   // `onDoubleTap()` does not provide the position of the tap event.
   Offset _lastPosOfDoubleTapDown = Offset.zero;
   bool _touchModePanStarted = false;
+  // Drag to scroll (mobile touch mode): the current one-finger pan scrolls, and the
+  // touch-down timestamp of the touch that was last classified.
+  bool _dragScrolling = false;
+  bool _holdDragScrolling = false; // ...and it arrives through the hold-drag callbacks
+  int _dragScrollClassifiedTs = 0;
   Offset _doubleFinerTapPosition = Offset.zero;
 
   // For mouse mode, we need to block the events when the cursor is in a blocked area.
@@ -340,10 +345,27 @@ class _RawTouchGestureDetectorRegionState
     if (!handleTouch) {
       if (isSpecialHoldDragActive) return;
       await ffi.cursorModel.updatePan(d.delta, d.localPosition, handleTouch);
+      return;
+    }
+    // Touch mode: a swipe right after a tap or a short flick (inside the double-tap window)
+    // is owned by the hold-drag recogniser, so no one-finger pan callbacks arrive for it.
+    // Without this, repeated scroll flicks would be lost now and then.
+    if (_holdDragScrolling || _tryStartDragScroll(d.localPosition)) {
+      _holdDragScrolling = true;
+      inputModel.dragScrollBy(d.delta.dy);
     }
   }
 
+  // Separate from _endDragScroll: the recogniser also calls its cancel hook from the
+  // first-tap timer, which can fire in the middle of an ordinary one-finger pan scroll.
+  void _endHoldDragScroll() {
+    if (!_holdDragScrolling) return;
+    _holdDragScrolling = false;
+    _endDragScroll();
+  }
+
   onHoldDragEnd(DragEndDetails d) async {
+    _endHoldDragScroll();
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -352,11 +374,51 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
+  // Mobile touch mode, drag to scroll (see InputModel.dragScrollBy): a one-finger drag that
+  // starts mostly vertically scrolls the remote content instead of dragging with the left
+  // button. Decided once per touch, from the touch-down point to where the pan is recognised.
+  bool get _dragScrollEligible =>
+      isMobile && ffiModel.touchMode && inputModel.dragScrollAllowed;
+
+  /// Classifies the current touch (the one that set `_cacheLongPressPosition`). Returns true
+  /// when it starts a scroll; a touch is classified only once.
+  bool _tryStartDragScroll(Offset localPosition) {
+    final downTs = _cacheLongPressPositionTs;
+    if (_dragScrollClassifiedTs == downTs) return false;
+    _dragScrollClassifiedTs = downTs;
+    if (!_dragScrollEligible) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // Same window as the "use the touch-down position" workaround below: older than this and
+    // the cached position belongs to an earlier touch.
+    if (now - downTs >= 500) return false;
+    final down = _cacheLongPressPosition;
+    if (ffi.cursorModel.shouldBlock(down.dx, down.dy) ||
+        !ffi.cursorModel.isInRemoteRect(down)) {
+      return false;
+    }
+    if (!InputModel.isDragScrollDirection(localPosition - down)) return false;
+    _dragScrolling = true;
+    inputModel.dragScrollBegin();
+    // Park the cursor (no button) on what was touched, so the wheel goes to that pane.
+    ffi.cursorModel.move(down.dx, down.dy);
+    return true;
+  }
+
+  void _endDragScroll() {
+    if (!_dragScrolling) return;
+    _dragScrolling = false;
+    inputModel.dragScrollEnd();
+  }
+
   onOneFingerPanStart(BuildContext context, DragStartDetails d) async {
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     lastDeviceKind = d.kind ?? lastDeviceKind;
     if (isNotTouchBasedDevice()) {
+      return;
+    }
+    // Before the first await: the updates that follow must already see the decision.
+    if (_tryStartDragScroll(d.localPosition)) {
       return;
     }
     if (handleTouch) {
@@ -408,10 +470,20 @@ class _RawTouchGestureDetectorRegionState
     if (isNotTouchBasedDevice()) {
       return;
     }
+    if (_dragScrolling) {
+      inputModel.dragScrollBy(d.delta.dy);
+      return;
+    }
     if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
       return;
     }
     if (handleTouch && !_touchModePanStarted) {
+      // A swipe that follows the previous one within the recogniser's 200 ms debounce gets
+      // updates without a start (see CustomTouchGestureRecognizer): classify it here, or
+      // every second flick of a scroll would be lost.
+      if (_tryStartDragScroll(d.localPosition)) {
+        inputModel.dragScrollBy(d.delta.dy);
+      }
       return;
     }
     // In relative mouse mode, send delta directly without position tracking.
@@ -423,6 +495,12 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onOneFingerPanEnd(DragEndDetails d) async {
+    if (_dragScrolling) {
+      // A scroll never pressed the left button: nothing to release.
+      _endDragScroll();
+      _touchModePanStarted = false;
+      return;
+    }
     _touchModePanStarted = false;
     if (isNotTouchBasedDevice()) {
       return;
@@ -444,11 +522,14 @@ class _RawTouchGestureDetectorRegionState
   // double-click problem on iPad with magic mouse.
   onOneFingerPanCancel() {
     _touchModePanStarted = false;
+    _endDragScroll();
   }
 
   // scale + pan event
   onTwoFingerScaleStart(ScaleStartDetails d) {
     _lastTapDownDetails = null;
+    // A second finger takes over without a pan end.
+    _endDragScroll();
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -516,7 +597,7 @@ class _RawTouchGestureDetectorRegionState
     }
   }
 
-  get onHoldDragCancel => null;
+  get onHoldDragCancel => _endHoldDragScroll;
   get onThreeFingerVerticalDragUpdate => ffi.ffiModel.isPeerAndroid
       ? null
       : (d) {

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
 import 'package:flutter_hbb/common/widgets/toolbar.dart';
@@ -117,6 +118,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     WakelockManager.enable(_uniqueKey);
     _physicalFocusNode.requestFocus();
     gFFI.inputModel.listenToMouse(true);
+    gFFI.inputModel.loadDragScrollOptions();
     unawaited(gFFI.inputModel.quest.attach());
     // Quest auto-keyboard: a left click arms one open, fired when the remote cursor is (or,
     // while the pointer stays put, becomes) a text caret. Never auto-closed.
@@ -172,6 +174,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
+    gFFI.canvasModel.mobileBottomBarHeight = 0;
     gFFI.inputModel.listenToMouse(false);
     unawaited(gFFI.inputModel.quest.detach());
     gFFI.imageModel.disposeImage();
@@ -204,6 +207,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) inputModel.quest.releaseSticks();
     if (state == AppLifecycleState.resumed) {
       trySyncClipboard();
     } else if (inputModel.quest.isQuest.value) {
@@ -387,10 +391,14 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 content == '【】')) {
           // can not only input content[0], because when input ], [ are also auo insert, which cause ] never be input
           bind.sessionInputString(sessionId: sessionId, value: content);
+          inputModel.releaseOneShotModifiers();
           if (!inputModel.quest.isQuest.value) _openKeyboardUnlocked();
           return;
         }
         bind.sessionInputString(sessionId: sessionId, value: content);
+        // Dictation, swipe or a suggestion: no modifiers go with a string, but it is still
+        // the "next key press" for a one-shot modifier.
+        inputModel.releaseOneShotModifiers();
       } else {
         inputChar(content);
       }
@@ -563,17 +571,295 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     });
   }
 
-  Widget _bottomWidget() => _showGestureHelp
-      ? getGestureHelp()
-      : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
-          ? getBottomAppBar()
-          : Offstage());
+  /// The collapsed toolbar is a thin strip below the remote image (see
+  /// [_collapsedBarHandle]) instead of a button floating over the picture.
+  bool get _collapsedHandleShown =>
+      !_showBar &&
+      !_showGestureHelp &&
+      !isWebDesktop &&
+      gFFI.ffiModel.pi.displays.isNotEmpty;
+
+  Widget _bottomWidget() {
+    final bar = _showGestureHelp
+        ? getGestureHelp()
+        : (_showBar && gFFI.ffiModel.pi.displays.isNotEmpty
+            ? getBottomAppBar()
+            : (_collapsedHandleShown ? _collapsedBarHandle() : Offstage()));
+    if (!_keysVisible) return bar;
+    // The same tree shape whether the row below is open or not: swapping the toolbar for
+    // a Column on every arrow tap would rebuild the whole toolbar from scratch.
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [bar, if (_keysExpanded || !_arrowFits) _extraKeys()],
+    );
+  }
+
+  /// Quest: the system keyboard has no Ctrl, Tab, Esc or arrows. The most used of them sit in
+  /// the toolbar row itself, after its icons (as many as fit: [_inlineKeys]); a small arrow
+  /// next to them opens one more row below the toolbar with the rest and F1..F12
+  /// ([_extraKeys]). Nothing is drawn over the remote image.
+  bool get _keyBarShown {
+    final quest = inputModel.quest;
+    return quest.isQuest.value &&
+        quest.keyBar.value &&
+        !_showGestureHelp &&
+        gFFI.ffiModel.pi.displays.isNotEmpty &&
+        gFFI.ffiModel.keyboard &&
+        !gFFI.ffiModel.viewOnly;
+  }
+
+  /// ...and the toolbar that carries the keys is open.
+  bool get _keysVisible => _keyBarShown && _showBar;
+
+  bool _keysExpanded = false; // the row below the toolbar is open
+  int _inlineKeyCount = 0; // how many of _keySpecs() fitted into the toolbar row
+  // The toolbar row has room for at least the arrow. If not (a very narrow window), the
+  // row below is shown with every key, so none is lost.
+  bool _arrowFits = true;
+
+  static const double _kKeyHeight = 34;
+  static const double _kKeyMinWidth = 36;
+  static const double _kKeyPadH = 6;
+  static const double _kKeyMarginH = 1.5;
+  static const double _kKeyFontSize = 12;
+  static const double _kKeyIconSize = 18;
+
+  /// All keys, most used first: the toolbar row takes as many as fit from the front.
+  List<_KeySpec> _keySpecs() {
+    final isMac = gFFI.ffiModel.pi.platform == kPeerPlatformMacOS;
+    _KeySpec mod(String label, String name) => _KeySpec(
+        label, () => inputModel.cycleModifier(name),
+        state: inputModel.modifierState(name));
+    _KeySpec k(String label, String vk, {IconData? icon}) =>
+        _KeySpec(label, () => inputModel.inputKey(vk), icon: icon);
+    _KeySpec combo(String label, String vk) => _KeySpec(
+        '${isMac ? 'Cmd' : 'Ctrl'}+$label',
+        () => inputModel.inputShortcut(vk, isMac: isMac));
+    return [
+      mod('Ctrl', 'ctrl'),
+      mod('Alt', 'alt'),
+      mod('Shift', 'shift'),
+      mod(isMac ? 'Cmd' : 'Win', 'command'),
+      k('Esc', 'VK_ESCAPE'),
+      k('Tab', 'VK_TAB'),
+      k('Del', 'VK_DELETE'),
+      k('', 'VK_LEFT', icon: Icons.keyboard_arrow_left),
+      k('', 'VK_UP', icon: Icons.keyboard_arrow_up),
+      k('', 'VK_DOWN', icon: Icons.keyboard_arrow_down),
+      k('', 'VK_RIGHT', icon: Icons.keyboard_arrow_right),
+      k('Enter', 'VK_ENTER'),
+      k('Home', 'VK_HOME'),
+      k('End', 'VK_END'),
+      k('PgUp', 'VK_PRIOR'),
+      k('PgDn', 'VK_NEXT'),
+      combo('C', 'VK_C'),
+      combo('V', 'VK_V'),
+      combo('X', 'VK_X'),
+      combo('Z', 'VK_Z'),
+      combo('A', 'VK_A'),
+    ];
+  }
+
+  List<_KeySpec> _fnKeySpecs() => [
+        for (var i = 1; i <= 12; ++i)
+          _KeySpec('F$i', () => inputModel.inputKey('VK_F$i')),
+      ];
+
+  TextStyle _keyTextStyle(BuildContext context) =>
+      (Theme.of(context).textTheme.bodyMedium ?? const TextStyle())
+          .copyWith(color: Colors.white, fontSize: _kKeyFontSize);
+
+  /// Laid-out width of [_keyButton] for [k], margins included.
+  double _keyWidth(BuildContext context, _KeySpec k) {
+    double inner = _kKeyIconSize;
+    if (k.icon == null) {
+      final painter = TextPainter(
+          text: TextSpan(text: k.label, style: _keyTextStyle(context)),
+          textDirection: TextDirection.ltr,
+          textScaler: MediaQuery.textScalerOf(context),
+          maxLines: 1)
+        ..layout();
+      inner = painter.width;
+      painter.dispose();
+    }
+    final w = inner + 2 * _kKeyPadH;
+    return (w < _kKeyMinWidth ? _kKeyMinWidth : w) + 2 * _kKeyMarginH;
+  }
+
+  Widget _keyButton(BuildContext context, _KeySpec k) {
+    return Padding(
+      padding:
+          const EdgeInsets.symmetric(horizontal: _kKeyMarginH, vertical: 2),
+      child: Material(
+        color: k.state == 2
+            ? MyTheme.accent
+            : (k.state == 1 ? MyTheme.accent80 : const Color(0xFF3A3A3A)),
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          canRequestFocus: false, // the soft keyboard's text field keeps the focus
+          onTap: k.onTap,
+          child: Container(
+            height: _kKeyHeight,
+            constraints: const BoxConstraints(minWidth: _kKeyMinWidth),
+            padding: const EdgeInsets.symmetric(horizontal: _kKeyPadH),
+            // widthFactor: shrink to the label. A plain alignment would take all the width
+            // it is offered (a whole line inside a Wrap).
+            child: Center(
+              widthFactor: 1.0,
+              child: k.icon != null
+                  ? Icon(k.icon, size: _kKeyIconSize, color: Colors.white)
+                  : Text(k.label,
+                      maxLines: 1,
+                      softWrap: false,
+                      style: _keyTextStyle(context).copyWith(
+                          decoration: k.state == 2
+                              ? TextDecoration.underline
+                              : TextDecoration.none)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The keys inside the toolbar row: the first keys of [_keySpecs] that fit into the space
+  /// left by the icons, then the arrow that opens [_extraKeys].
+  Widget _inlineKeys() {
+    return Obx(() {
+      inputModel.modifiersRevision.value; // repaint when a one-shot modifier is used up
+      return LayoutBuilder(builder: (context, constraints) {
+        const leadGap = 8.0;
+        void toggle() => setState(() => _keysExpanded = !_keysExpanded);
+        // Every icon key has the same width, whatever its icon or state.
+        // 1 px of slack per key for rounding in text layout.
+        var used = leadGap +
+            _keyWidth(context,
+                _KeySpec('', toggle, icon: Icons.keyboard_double_arrow_down)) +
+            1;
+        final fits = used <= constraints.maxWidth;
+        final specs = _keySpecs();
+        var n = 0;
+        if (fits) {
+          for (final k in specs) {
+            final w = _keyWidth(context, k) + 1;
+            if (used + w > constraints.maxWidth) break;
+            used += w;
+            n++;
+          }
+        }
+        if (n != _inlineKeyCount || fits != _arrowFits) {
+          // The row below shows the keys that did not fit here.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && (n != _inlineKeyCount || fits != _arrowFits)) {
+              setState(() {
+                _inlineKeyCount = n;
+                _arrowFits = fits;
+              });
+            }
+          });
+        }
+        if (!fits) return const SizedBox.shrink();
+        // A modifier that is on but sits in the closed row below must still show here.
+        final hiddenHeld =
+            !_keysExpanded && specs.skip(n).any((k) => k.state != 0);
+        // Double chevrons: the single ones are the Up / Down cursor keys in this same row.
+        final more = _KeySpec('', toggle,
+            icon: _keysExpanded
+                ? Icons.keyboard_double_arrow_up
+                : Icons.keyboard_double_arrow_down,
+            state: _keysExpanded ? 2 : (hiddenHeld ? 1 : 0));
+        return Row(
+          mainAxisSize: MainAxisSize.max,
+          children: [
+            const SizedBox(width: leadGap),
+            for (final k in specs.take(n)) _keyButton(context, k),
+            _keyButton(context, more),
+          ],
+        );
+      });
+    });
+  }
+
+  /// The row that opens below the toolbar: the keys that did not fit into it, then F1..F12.
+  Widget _extraKeys() {
+    return Material(
+      color: _kBottomBarColor,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(8, 0, 8, 5),
+        child: Obx(() {
+          inputModel.modifiersRevision.value;
+          return Builder(builder: (context) {
+            return Wrap(
+              alignment: WrapAlignment.center,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                for (final k in _keySpecs().skip(_inlineKeyCount))
+                  _keyButton(context, k),
+                const SizedBox(width: 8),
+                for (final k in _fnKeySpecs()) _keyButton(context, k),
+              ],
+            );
+          });
+        }),
+      ),
+    );
+  }
+
+  static const double _kCollapsedBarHeight = 28;
+
+  /// The toolbar sits right under the remote desktop, so it is dark like a Windows taskbar
+  /// in dark mode instead of the accent blue.
+  static const Color _kBottomBarColor = Color(0xFF1C1C1C);
+  static const Color _kBottomBarHandleColor = Color(0xFF3A3A3A);
+
+  Widget _collapsedBarHandle() {
+    return Material(
+      color: _kBottomBarColor,
+      child: SizedBox(
+        height: _kCollapsedBarHeight,
+        child: Align(
+          alignment: Alignment.centerRight,
+          child: Padding(
+            padding: const EdgeInsets.only(right: 16),
+            // Not gated on waitForFirstImage: during a slow reconnect this handle is the
+            // only way back to the toolbar (close, display, actions).
+            child: InkWell(
+              onTap: () => setState(() => _showBar = true),
+              child: Container(
+                width: 72,
+                height: _kCollapsedBarHeight,
+                decoration: const BoxDecoration(
+                  color: _kBottomBarHandleColor,
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
+                ),
+                child:
+                    const Icon(Icons.expand_less, color: Colors.white, size: 22),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The body is laid out above the bottom bar; tell the canvas how tall the bar is so the
+  /// remote image is fitted into what is left, not into the whole window.
+  void _onBottomBarHeight(double height) {
+    if (!mounted) return;
+    final canvas = gFFI.canvasModel;
+    if ((canvas.mobileBottomBarHeight - height).abs() < 0.5) return;
+    canvas.setMobileBottomBarHeight(height);
+  }
 
   @override
   Widget build(BuildContext context) {
     final keyboardIsVisible =
         keyboardVisibilityController.isVisible && _showEdit;
-    final showActionButton = !_showBar || keyboardIsVisible || _showGestureHelp;
+    final showActionButton = keyboardIsVisible ||
+        _showGestureHelp ||
+        (!_showBar && !_collapsedHandleShown);
 
     return WillPopScope(
       onWillPop: () async {
@@ -620,7 +906,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                           gFFI.ffiModel.tryShowAndroidActionsOverlay();
                           return Offstage();
                         }(),
-                  _bottomWidget(),
+                  _HeightReporter(
+                      onHeight: _onBottomBarHeight, child: _bottomWidget()),
                   gFFI.ffiModel.pi.isSet.isFalse
                       ? emptyOverlay(MyTheme.canvasColor)
                       : Offstage(),
@@ -688,7 +975,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final ffiModel = Provider.of<FfiModel>(context);
     return BottomAppBar(
       elevation: 10,
-      color: MyTheme.accent,
+      color: _kBottomBarColor,
       child: Row(
         mainAxisSize: MainAxisSize.max,
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -783,12 +1070,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                       },
                     ),
                   ]),
+          if (_keysVisible) Expanded(child: _inlineKeys()),
           Obx(() => IconButton(
                 color: Colors.white,
                 icon: Icon(Icons.expand_more),
                 onPressed: gFFI.ffiModel.waitForFirstImage.isTrue
                     ? null
                     : () {
+                        // The keys go away with the toolbar: do not leave a modifier
+                        // held with nothing on screen to show or release it.
+                        if (_keyBarShown) inputModel.resetModifiers();
                         setState(() => _showBar = !_showBar);
                       },
               )),
@@ -846,6 +1137,13 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             quest.setAutoKeyboard(!quest.autoKeyboard.value);
           }
           if (v == 'debug') quest.setDebug(!quest.debug.value);
+          if (v == 'keybar') quest.setKeyBar(!quest.keyBar.value);
+          if (v == 'dragscroll') {
+            inputModel.setDragScroll(!inputModel.dragScroll.value);
+          }
+          if (v == 'smoothscroll') {
+            inputModel.setDragScrollSmooth(!inputModel.dragScrollSmooth.value);
+          }
         },
         itemBuilder: (_) => [
           CheckedPopupMenuItem(
@@ -862,6 +1160,21 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             value: 'autokbd',
             checked: quest.autoKeyboard.value,
             child: const Text('Auto-open keyboard on text fields'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'keybar',
+            checked: quest.keyBar.value,
+            child: const Text('Extra keys in the toolbar (Ctrl, Tab, Esc...)'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'dragscroll',
+            checked: inputModel.dragScroll.value,
+            child: const Text('Vertical drag scrolls (sideways drag selects)'),
+          ),
+          CheckedPopupMenuItem(
+            value: 'smoothscroll',
+            checked: inputModel.dragScrollSmooth.value,
+            child: const Text('Smooth scrolling (off: wheel notches)'),
           ),
           CheckedPopupMenuItem(
             value: 'debug',
@@ -892,7 +1205,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
             ),
             KeyHelpTools(
                 keyboardIsVisible: keyboardIsVisible,
-                showGestureHelp: _showGestureHelp),
+                showGestureHelp: _showGestureHelp,
+                keyBarShown: _keysVisible),
             SizedBox(
               width: 0,
               height: 0,
@@ -1164,11 +1478,17 @@ class KeyHelpTools extends StatefulWidget {
   final bool keyboardIsVisible;
   final bool showGestureHelp;
 
+  /// The Quest's keys in the toolbar are shown: they replace this panel, and only one of the
+  /// two may drive the modifier flags.
+  final bool keyBarShown;
+
   /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
   bool get requestShow => keyboardIsVisible || showGestureHelp;
 
   KeyHelpTools(
-      {required this.keyboardIsVisible, required this.showGestureHelp});
+      {required this.keyboardIsVisible,
+      required this.showGestureHelp,
+      this.keyBarShown = false});
 
   @override
   State<KeyHelpTools> createState() => _KeyHelpToolsState();
@@ -1225,7 +1545,8 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
         inputModel.shift ||
         inputModel.command;
 
-    if (!_pin && !hasModifierOn && !widget.requestShow) {
+    if (widget.keyBarShown ||
+        (!_pin && !hasModifierOn && !widget.requestShow)) {
       gFFI.cursorModel
           .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
       return Offstage();
@@ -1749,17 +2070,55 @@ TTextMenu? getResolutionMenu(FFI ffi, String id) {
 }
 
 void sendPrompt(bool isMac, String key) {
-  final old = isMac ? gFFI.inputModel.command : gFFI.inputModel.ctrl;
-  if (isMac) {
-    gFFI.inputModel.command = true;
-  } else {
-    gFFI.inputModel.ctrl = true;
+  // Keeps a locked modifier, uses up a one-shot one (see InputModel.cycleModifier).
+  gFFI.inputModel.inputShortcut(key, isMac: isMac);
+}
+
+/// One key of the Quest toolbar keys (see _RemotePageState._keySpecs).
+class _KeySpec {
+  const _KeySpec(this.label, this.onTap, {this.icon, this.state = 0});
+
+  final String label;
+  final VoidCallback onTap;
+  final IconData? icon;
+
+  /// 0 = plain key, 1 = modifier on for the next key, 2 = modifier locked / toggle on.
+  final int state;
+}
+
+/// Reports the laid-out height of [child] after each layout that changes it.
+class _HeightReporter extends SingleChildRenderObjectWidget {
+  const _HeightReporter({required this.onHeight, super.child});
+
+  final ValueChanged<double> onHeight;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderHeightReporter(onHeight);
+
+  @override
+  void updateRenderObject(
+      BuildContext context, covariant _RenderHeightReporter renderObject) {
+    renderObject.onHeight = onHeight;
   }
-  gFFI.inputModel.inputKey(key);
-  if (isMac) {
-    gFFI.inputModel.command = old;
-  } else {
-    gFFI.inputModel.ctrl = old;
+}
+
+class _RenderHeightReporter extends RenderProxyBox {
+  _RenderHeightReporter(this.onHeight);
+
+  ValueChanged<double> onHeight;
+  double? _reported;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final h = size.height;
+    if (_reported == h) return;
+    _reported = h;
+    // Not during layout: the callback rebuilds what depends on the canvas size.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (attached && _reported == h) onHeight(h);
+    });
   }
 }
 

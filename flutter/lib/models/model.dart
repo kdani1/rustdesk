@@ -2313,6 +2313,9 @@ class CanvasModel with ChangeNotifier {
   bool _locked = false;
   double _devicePixelRatio = 1.0;
   Size _size = Size.zero;
+  // Mobile: height of the remote page's bottom bar (toolbar, gesture help or the
+  // collapsed handle strip), measured by the page. See getSize().
+  double mobileBottomBarHeight = 0;
   // the tabbar over the image
   // double tabBarHeight = 0.0;
   // the window border's width
@@ -2414,8 +2417,11 @@ class CanvasModel with ChangeNotifier {
       w = w - mediaData.padding.left - mediaData.padding.right;
       // Vertically, subtract the bottom keyboard inset (viewInsets.bottom) and any
       // bottom overlay (e.g. key-help tools) so the canvas is not covered.
+      // The Scaffold lays the body out above whichever is taller: the keyboard or the
+      // bottom bar (mobileBottomBarHeight, measured by the remote page), so the remote
+      // image is fitted above the bar instead of running under it.
       h = h -
-          mediaData.viewInsets.bottom -
+          max(mediaData.viewInsets.bottom, mobileBottomBarHeight) -
           (parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ??
               0);
       // Orientation-specific handling:
@@ -2448,6 +2454,32 @@ class CanvasModel with ChangeNotifier {
   }
 
   updateSize() => _size = getSize();
+
+  /// Mobile only: the remote page's bottom bar changed height (opened, collapsed, gesture
+  /// help). Fit the image into the new space while it is still at the fitted scale;
+  /// a view the user zoomed or panned, and the styles that do not fit the image
+  /// (original, custom), keep their scale and offset.
+  Future<void> setMobileBottomBarHeight(double height) async {
+    mobileBottomBarHeight = height;
+    final last = _lastViewStyle;
+    final fitted = last.style == kRemoteViewStyleAdaptive &&
+        (_scale - last.scale).abs() < 1e-6;
+    if (fitted) {
+      await updateViewStyle();
+      return;
+    }
+    updateSize();
+    // Keep _lastViewStyle in step with the size, so a later updateViewStyle() with
+    // unchanged geometry still returns early instead of resetting the zoom.
+    _lastViewStyle = ViewStyle(
+      style: last.style,
+      width: size.width,
+      height: size.height,
+      displayWidth: last.displayWidth,
+      displayHeight: last.displayHeight,
+    );
+    notifyListeners();
+  }
 
   updateViewStyle({refreshMousePos = true, notify = true}) async {
     final style = await bind.sessionGetViewStyle(sessionId: sessionId);

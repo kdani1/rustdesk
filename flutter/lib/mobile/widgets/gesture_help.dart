@@ -121,6 +121,33 @@ class _GestureHelpState extends State<GestureHelp> {
                           });
                         },
                       ),
+                      // Drag to scroll (see InputModel.dragScrollBy). Touch mode only: in
+                      // mouse mode a one-finger drag is how the cursor moves.
+                      if (_touchMode && widget.inputModel != null)
+                        Transform.translate(
+                          offset: const Offset(-10.0, 0.0),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Checkbox(
+                                value: widget.inputModel!.dragScroll.value,
+                                onChanged: (value) {
+                                  if (value == null) return;
+                                  widget.inputModel!.setDragScroll(value);
+                                  setState(() {});
+                                },
+                              ),
+                              InkWell(
+                                onTap: () {
+                                  final m = widget.inputModel!;
+                                  m.setDragScroll(!m.dragScroll.value);
+                                  setState(() {});
+                                },
+                                child: Text(translate('Vertical drag scrolls')),
+                              ),
+                            ],
+                          ),
+                        ),
                       Transform.translate(
                         offset: const Offset(-10.0, 0.0),
                         child: Row(

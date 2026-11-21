@@ -859,10 +859,16 @@ class InputModel {
 
     // Update cached modifier state before sending the event. The stale mobile
     // Shift release check below relies on this cached state.
+    final modifiersBefore = '$ctrl$alt$shift$command';
     if (e is KeyUpEvent) {
       handleKeyUpEventModifiers(e);
     } else if (e is KeyDownEvent) {
       handleKeyDownEventModifiers(e);
+    }
+    if (modifiersBefore != '$ctrl$alt$shift$command') {
+      // A hardware modifier key changed a flag: keep the Quest toolbar keys in step.
+      _oneShotModifiers.removeWhere((name) => !_modifier(name));
+      modifiersRevision.value++;
     }
 
     bool isMobileAndMapMode = false;
@@ -1042,6 +1048,87 @@ class InputModel {
         ctrl: ctrl,
         shift: shift,
         command: command);
+    // A click, or the down of a down/up pair (controller buttons, D-pad, hardware keys),
+    // uses up the one-shot modifiers: the host presses modifiers only for a key-down. A
+    // modifier key going down does not count.
+    if (((press ?? true) || (down ?? false)) &&
+        !_kModifierKeyNames.contains(name)) {
+      _releaseOneShotModifiers();
+    }
+  }
+
+  // ---- One-shot modifiers (the docked key bar on a Quest) ----
+  // A modifier tapped on the key bar applies to the next key press only (typed on the soft
+  // keyboard or tapped on the bar) and is then released; a second tap locks it until it is
+  // tapped again. Names: 'ctrl', 'alt', 'shift', 'command'.
+  final Set<String> _oneShotModifiers = {};
+  static const _kModifierKeyNames = {
+    'VK_CONTROL', 'RControl', 'VK_SHIFT', 'RShift', 'VK_MENU', 'RAlt', 'Meta', 'RWin',
+  };
+
+  /// Bumped whenever a modifier changes through this API, so the key bar can repaint.
+  final modifiersRevision = 0.obs;
+
+  bool _modifier(String name) => name == 'ctrl'
+      ? ctrl
+      : name == 'alt'
+          ? alt
+          : name == 'shift'
+              ? shift
+              : command;
+
+  void _setModifier(String name, bool v) {
+    if (name == 'ctrl') {
+      ctrl = v;
+    } else if (name == 'alt') {
+      alt = v;
+    } else if (name == 'shift') {
+      shift = v;
+    } else {
+      command = v;
+    }
+  }
+
+  /// 0 = off, 1 = on for the next key press, 2 = locked on.
+  int modifierState(String name) =>
+      !_modifier(name) ? 0 : (_oneShotModifiers.contains(name) ? 1 : 2);
+
+  /// off -> next key only -> locked -> off.
+  void cycleModifier(String name) {
+    final state = modifierState(name);
+    if (state == 0) {
+      _setModifier(name, true);
+      _oneShotModifiers.add(name);
+    } else if (state == 1) {
+      _oneShotModifiers.remove(name);
+    } else {
+      _setModifier(name, false);
+    }
+    modifiersRevision.value++;
+  }
+
+  /// Also for input that carries no modifiers but counts as the next key press (a string
+  /// from the soft keyboard).
+  void releaseOneShotModifiers() => _releaseOneShotModifiers();
+
+  void _releaseOneShotModifiers() {
+    if (_oneShotModifiers.isEmpty) return;
+    for (final name in _oneShotModifiers) {
+      _setModifier(name, false);
+    }
+    _oneShotModifiers.clear();
+    modifiersRevision.value++;
+  }
+
+  /// Ctrl+[key] (Cmd on a Mac peer) without disturbing a locked modifier.
+  void inputShortcut(String key, {required bool isMac}) {
+    final name = isMac ? 'command' : 'ctrl';
+    final locked = modifierState(name) == 2;
+    _setModifier(name, true);
+    inputKey(key);
+    _setModifier(name, locked);
+    _oneShotModifiers.remove(name);
+    modifiersRevision.value++;
   }
 
   static Map<String, dynamic> getMouseEventMove() => {
@@ -1109,9 +1196,111 @@ class InputModel {
             .encode(modify({'id': id, 'type': 'wheel', 'y': y.toString()})));
   }
 
+  // ---- Drag to scroll ----
+  // A quick, mostly vertical one-finger drag (phone touch mode) or laser/touch drag (Quest
+  // pointer mode) scrolls the remote content like a touchscreen instead of pressing the left
+  // button. A drag that starts sideways stays a left-button drag (text selection, moving
+  // things). The gesture code decides; this part only turns finger travel into wheel input.
+  static const kOptionDragScroll = 'drag-scroll';
+  static const kOptionDragScrollSmooth = 'drag-scroll-smooth';
+
+  /// Wheel units (1/120 notch on a Windows host) per remote pixel of finger travel. One notch
+  /// scrolls about 100 px in browsers, so 1.2 keeps the content under the finger there.
+  static const double _kDragScrollUnitsPerRemotePx = 1.2;
+
+  /// Smooth mode: smallest amount sent in one message. Hides laser tremor (a few px back and
+  /// forth never reaches the host) and keeps the message rate down.
+  static const int _kDragScrollMinUnits = 6;
+  static const int _kWheelNotchUnits = 120;
+
+  /// Feature switch (local option, default on).
+  final dragScroll = true.obs;
+
+  /// Smooth = high-resolution wheel ('trackpad' units, the content follows the finger).
+  /// Off = whole wheel notches, for applications that ignore partial notches.
+  final dragScrollSmooth = true.obs;
+
+  double _dragScrollAcc = 0;
+  bool _dragScrollReversed = false;
+
+  void loadDragScrollOptions() {
+    dragScroll.value = bind.mainGetLocalOption(key: kOptionDragScroll) != 'N';
+    dragScrollSmooth.value =
+        bind.mainGetLocalOption(key: kOptionDragScrollSmooth) != 'N';
+  }
+
+  void setDragScroll(bool v) {
+    dragScroll.value = v;
+    bind.mainSetLocalOption(key: kOptionDragScroll, value: v ? 'Y' : 'N');
+  }
+
+  void setDragScrollSmooth(bool v) {
+    dragScrollSmooth.value = v;
+    bind.mainSetLocalOption(key: kOptionDragScrollSmooth, value: v ? 'Y' : 'N');
+  }
+
+  /// Whether a drag may become a scroll at all in this session.
+  bool get dragScrollAllowed =>
+      dragScroll.value &&
+      keyboardPerm &&
+      !isViewCamera &&
+      !_relativeMouse.enabled.value &&
+      !(parent.target?.ffiModel.isPeerAndroid ?? false);
+
+  /// The direction test shared by the phone and the Quest path: within about 27 degrees of
+  /// vertical, measured from the touch-down point (never from the last delta: tremor).
+  static bool isDragScrollDirection(Offset travel) =>
+      travel.dy.abs() >= 2 * travel.dx.abs();
+
+  void dragScrollBegin() {
+    _dragScrollAcc = 0;
+    // "Reverse mouse wheel" flips every wheel message on a mobile client (Rust side); the
+    // content must follow the finger either way, so undo it here.
+    _dragScrollReversed =
+        bind.sessionGetReverseMouseWheelSync(sessionId: sessionId) == 'Y';
+  }
+
+  /// [localDy]: finger travel since the last call, in local logical px (down = positive).
+  void dragScrollBy(double localDy) {
+    final scale = parent.target?.canvasModel.scale ?? 1.0;
+    if (scale <= 0 || !localDy.isFinite) return;
+    _dragScrollAcc += localDy / scale * _kDragScrollUnitsPerRemotePx;
+    // A Linux host turns every unit into a whole wheel click (xdo/uinput), so it only gets
+    // whole notches.
+    if (dragScrollSmooth.value && peerPlatform != kPeerPlatformLinux) {
+      final units = _dragScrollAcc.truncate();
+      if (units.abs() < _kDragScrollMinUnits) return;
+      _dragScrollAcc -= units;
+      _dragScrollSend('trackpad', units);
+    } else {
+      final notches = (_dragScrollAcc / _kWheelNotchUnits).truncate();
+      if (notches == 0) return;
+      _dragScrollAcc -= notches * _kWheelNotchUnits;
+      _dragScrollSend('wheel', notches);
+    }
+  }
+
+  void dragScrollEnd() {
+    _dragScrollAcc = 0;
+  }
+
+  // Finger down = positive y = wheel up on the host: the content follows the finger (same
+  // sign as the three-finger scroll). All values are strings: the Rust side parses a
+  // Map<String, String> and drops the message otherwise.
+  void _dragScrollSend(String type, int y) {
+    if (y == 0 || !keyboardPerm || isViewCamera) return;
+    if (_dragScrollReversed) y = -y;
+    unawaited(bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: json.encode(modify({'id': id, 'type': type, 'y': '$y'}))));
+  }
+
   /// Reset key modifiers to false, including [shift], [ctrl], [alt] and [command].
   void resetModifiers() {
+    final any = shift || ctrl || alt || command;
     shift = ctrl = alt = command = false;
+    _oneShotModifiers.clear();
+    if (any) modifiersRevision.value++;
   }
 
   /// Modify the given modifier map [evt] based on current modifier key status.
@@ -1315,6 +1504,24 @@ class InputModel {
   bool _questLeftPressed = false;
   bool _questLongPressFired = false;
 
+  // Drag to scroll (see dragScrollBy). The left press is already deferred until the pointer
+  // leaves the long-press slop; that is where a quick, mostly vertical start is taken as a
+  // scroll instead of a drag:
+  //  - leaving the slop sideways or diagonally: left drag, pressed at the down point;
+  //  - leaving it vertically within _kQuestScrollQuickMs of the press: nothing is sent until
+  //    _kQuestScrollStartPx of vertical travel (pulling the trigger dips the ray: a sloppy
+  //    click must stay a click), then the gesture scrolls until release;
+  //  - leaving it later than that: left drag, as before. So a vertical drag (scrollbar thumb,
+  //    slider, selecting downwards) is: press, rest a moment, then move, before the 500 ms
+  //    long press. Tune with the debug readout: it logs when each gesture was decided.
+  static const int _kQuestScrollQuickMs = 300;
+  static const double _kQuestScrollStartPx = 48.0; // logical px, vertical
+  int _questDownMs = 0;
+  bool _questLeftSlop = false; // travelled past the long-press slop, press still undecided
+  bool _questQuickStart = false; // ...and did so within _kQuestScrollQuickMs
+  bool _questScrolling = false;
+  double _questScrollLastY = 0;
+
   /// Returns true when Quest pointer mode handled the event.
   bool _questPointerEvent(PointerEvent e, String phase) {
     if (!quest.pointerModeActive || !quest.attached) return false;
@@ -1344,8 +1551,12 @@ class InputModel {
         if (_questPointerButton == MouseButtons.left) {
           _questDownPos = pos;
           _questDownLocal = e.localPosition;
+          _questDownMs = DateTime.now().millisecondsSinceEpoch;
           _questLeftPressed = false;
           _questLongPressFired = false;
+          _questLeftSlop = false;
+          _questQuickStart = false;
+          _questScrolling = false;
           _questLongPressTimer?.cancel();
           _questLongPressTimer = Timer(
               const Duration(milliseconds: _kQuestLongPressMs),
@@ -1357,25 +1568,76 @@ class InputModel {
         break;
       case 'move':
         if (_questPointer != e.pointer) break;
-        _questMoveTo(pos);
-        if (_questPointerButton == MouseButtons.left &&
-            !_questLeftPressed &&
-            !_questLongPressFired &&
-            (e.localPosition - _questDownLocal).distance >
-                _kQuestLongPressSlop) {
-          // Moved before the long-press fired: it's a drag -> press left now.
+        if (_questScrolling) {
+          // The remote cursor stays parked at the press point, so the wheel keeps going to
+          // the pane that was pressed.
+          dragScrollBy(e.localPosition.dy - _questScrollLastY);
+          _questScrollLastY = e.localPosition.dy;
+          break;
+        }
+        if (_questPointerButton != MouseButtons.left ||
+            _questLeftPressed ||
+            _questLongPressFired) {
+          _questMoveTo(pos);
+          break;
+        }
+        // Left press still undecided.
+        final travel = e.localPosition - _questDownLocal;
+        if (!_questLeftSlop) {
+          if (travel.distance <= _kQuestLongPressSlop) {
+            _questMoveTo(pos);
+            break;
+          }
+          // Moved before the long-press fired: not a right click any more.
+          _questLeftSlop = true;
           _questLongPressTimer?.cancel();
           _questLongPressTimer = null;
-          _questLeftPressed = true;
-          quest.button(MouseButtons.left, 'pointer', true);
+          _questQuickStart = dragScrollAllowed &&
+              (quest.heldButtonsMask & kPrimaryMouseButton) == 0 &&
+              DateTime.now().millisecondsSinceEpoch - _questDownMs <=
+                  _kQuestScrollQuickMs;
         }
+        if (_questQuickStart && isDragScrollDirection(travel)) {
+          if (travel.dy.abs() < _kQuestScrollStartPx) {
+            break; // could still be a click with a trigger dip: send nothing yet
+          }
+          _questScrolling = true;
+          _questScrollLastY = e.localPosition.dy;
+          _questMoveTo(_questDownPos);
+          dragScrollBegin();
+          quest.log('drag-scroll start '
+              '(${travel.dx.toStringAsFixed(0)},${travel.dy.toStringAsFixed(0)}) '
+              '${DateTime.now().millisecondsSinceEpoch - _questDownMs}ms');
+          break;
+        }
+        // A drag: press left at the point that was pressed, then catch up with the pointer.
+        _questMoveTo(_questDownPos);
+        _questLeftPressed = true;
+        quest.button(MouseButtons.left, 'pointer', true);
+        _questMoveTo(pos);
+        quest.log('drag start '
+            '(${travel.dx.toStringAsFixed(0)},${travel.dy.toStringAsFixed(0)}) '
+            '${DateTime.now().millisecondsSinceEpoch - _questDownMs}ms');
         break;
       case 'up':
       case 'cancel':
         if (_questPointer != e.pointer) break;
         _questLongPressTimer?.cancel();
         _questLongPressTimer = null;
-        if (phase == 'up') _questMoveTo(pos);
+        if (_questScrolling) {
+          // End of a scroll: no click, and the auto-keyboard is not armed.
+          _questScrolling = false;
+          _questPointer = null;
+          dragScrollEnd();
+          break;
+        }
+        // Released in the "could still be a click" zone: click where it was pressed, not
+        // where the ray drifted to.
+        final clickAtDown = _questPointerButton == MouseButtons.left &&
+            !_questLeftPressed &&
+            !_questLongPressFired &&
+            _questLeftSlop;
+        if (phase == 'up') _questMoveTo(clickAtDown ? _questDownPos : pos);
         _questPointer = null;
         if (_questPointerButton == MouseButtons.right) {
           quest.button(MouseButtons.right, 'pointer', false);
@@ -1389,6 +1651,7 @@ class InputModel {
           // Quick tap, never moved far: a normal left click.
           quest.button(MouseButtons.left, 'pointer', true);
           quest.button(MouseButtons.left, 'pointer', false);
+          // The auto-keyboard arms around where the pointer is now (its hover test).
           quest.onLeftClick?.call(e.localPosition);
         }
         break;
@@ -1398,7 +1661,11 @@ class InputModel {
 
   void _questLongPressFire() {
     _questLongPressTimer = null;
-    if (_questPointer == null || _questLeftPressed || _questLongPressFired) {
+    if (_questPointer == null ||
+        _questLeftPressed ||
+        _questLongPressFired ||
+        _questLeftSlop ||
+        _questScrolling) {
       return;
     }
     if (!quest.pointerModeActive || !quest.attached) return;
@@ -1803,6 +2070,8 @@ class InputModel {
     if (isViewOnly) return;
     if (isViewCamera) return;
     if (e is PointerScrollEvent) {
+      // Quest: a held thumbstick arrives as a stream of these; QuestInputModel paces it.
+      if (quest.onSystemScroll(e.scrollDelta)) return;
       final rawDx = e.scrollDelta.dx;
       final rawDy = e.scrollDelta.dy;
       final dominantDelta = rawDx.abs() > rawDy.abs() ? rawDx.abs() : rawDy.abs();
