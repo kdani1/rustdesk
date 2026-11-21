@@ -903,6 +903,12 @@ message Misc {
     // Fork-only, viewer -> host (M23): sent only to a host that advertised
     // Features.video_feedback; a stock host never advertises, so it never gets one.
     VideoFeedback video_feedback = 1005;
+    // Fork-only, host -> viewer: what has the keyboard focus after the viewer's left click, so
+    // a touch viewer opens its soft keyboard only for a real text field (the remote cursor is
+    // a text I-beam over any selectable text). 0 = unknown (also sent once to announce that
+    // this host answers at all), 1 = not an editable text field, 2 = editable text field.
+    // A Windows host sends it to Android viewers only; older peers ignore it. Next free 1007.
+    int32 text_input_focus = 1006;
   }
 }
 

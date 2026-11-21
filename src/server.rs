@@ -77,6 +77,10 @@ pub mod portable_service;
 mod service;
 mod latency_stats;
 #[cfg(windows)]
+mod text_focus;
+#[cfg(windows)]
+mod cursor_hider;
+#[cfg(windows)]
 mod key_refresh;
 #[cfg(windows)]
 mod virtual_fps;

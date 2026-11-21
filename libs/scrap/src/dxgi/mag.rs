@@ -113,6 +113,55 @@ pub type MagImageScalingCallback = ::std::option::Option<
 extern "C" {
     pub fn MagShowSystemCursor(fShowCursor: BOOL) -> BOOL;
 }
+
+/// Shows or hides the system cursor through the Magnification API, loading the library and
+/// initialising it on first use (kept for the life of the process: the hide ends with the
+/// process, and MagUninitialize is never called here because the magnifier capturer uses the
+/// same API). The cursor disappears from the image of displays that have it drawn in software;
+/// `GetCursorInfo` keeps reporting it as showing.
+pub fn show_system_cursor(show: bool) -> Result<()> {
+    type InitFn = unsafe extern "system" fn() -> BOOL;
+    type ShowFn = unsafe extern "system" fn(BOOL) -> BOOL;
+    static FUNCS: std::sync::OnceLock<std::result::Result<usize, String>> =
+        std::sync::OnceLock::new();
+    let show_fn = FUNCS.get_or_init(|| unsafe {
+        let name = match CString::new("Magnification.dll") {
+            Ok(n) => n,
+            Err(e) => return Err(e.to_string()),
+        };
+        let lib = LoadLibraryExA(name.as_ptr() as _, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if lib.is_null() {
+            return Err(format!(
+                "LoadLibraryExA Magnification.dll: {}",
+                Error::last_os_error()
+            ));
+        }
+        let init = match MagInterface::load_func(lib, "MagInitialize") {
+            Ok(f) => f,
+            Err(e) => return Err(e.to_string()),
+        };
+        let show = match MagInterface::load_func(lib, "MagShowSystemCursor") {
+            Ok(f) => f,
+            Err(e) => return Err(e.to_string()),
+        };
+        let init: InitFn = std::mem::transmute(init);
+        if init() == FALSE {
+            return Err(format!("MagInitialize: {}", Error::last_os_error()));
+        }
+        Ok(show as usize)
+    });
+    match show_fn {
+        Ok(f) => unsafe {
+            let f: ShowFn = std::mem::transmute(*f);
+            if f(if show { TRUE } else { FALSE }) == FALSE {
+                Err(Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        Err(e) => Err(Error::new(ErrorKind::Other, e.clone())),
+    }
+}
 pub type MagInitializeFunc = ::std::option::Option<unsafe extern "C" fn() -> BOOL>;
 pub type MagUninitializeFunc = ::std::option::Option<unsafe extern "C" fn() -> BOOL>;
 pub type MagSetWindowSourceFunc =

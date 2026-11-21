@@ -2694,6 +2694,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     Some(misc::Union::PointerCaptured(captured)) => {
                         self.handler.on_pointer_captured(captured);
                     }
+                    Some(misc::Union::TextInputFocus(state)) => {
+                        self.handler.on_text_input_focus(state);
+                    }
                     Some(misc::Union::UdpVideoOffer(offer)) => {
                         if let Some(msg) = self.udp_video.on_offer(&offer) {
                             allow_err!(peer.send(&msg).await);

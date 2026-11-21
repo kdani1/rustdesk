@@ -1069,6 +1069,10 @@ impl InvokeUiSession for FlutterHandler {
         self.push_event("pointer_captured", &[("captured", captured)], &[]);
     }
 
+    fn on_text_input_focus(&self, state: i32) {
+        self.push_event("text_input_focus", &[("state", &state.to_string())], &[]);
+    }
+
     fn on_voice_call_started(&self) {
         self.push_event::<&str>("on_voice_call_started", &[], &[]);
     }
@@ -1239,8 +1243,10 @@ impl FlutterHandler {
         let mut is_sent = false;
         let is_multi_sessions = self.is_multi_ui_session();
         for h in self.session_handlers.read().unwrap().values() {
-            // The soft renderer does not support multi-displays session for now.
-            if h.displays.len() > 1 {
+            // On desktop a multi-displays session is drawn by the texture renderer, not here.
+            // Mobile has no texture renderer: its "all displays" view is painted by Flutter
+            // from these per-display buffers, one `EventToUI::Rgba(display)` per display.
+            if cfg!(not(any(target_os = "android", target_os = "ios"))) && h.displays.len() > 1 {
                 continue;
             }
             // If there're multiple ui sessions, we only notify the ui session that has the display.
@@ -2222,6 +2228,11 @@ pub mod sessions {
             if k == session_id {
                 continue;
             }
+            // Mobile has no texture registration, so map_display_sessions is only ever
+            // filled there: the displays a UI session shows are in `displays`.
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            remains_displays.extend(h.displays.iter().cloned());
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             remains_displays.extend(
                 h.renderer
                     .map_display_sessions
@@ -2244,6 +2255,21 @@ pub mod sessions {
         for s in SESSIONS.read().unwrap().values() {
             let mut write_lock = s.ui_handler.session_handlers.write().unwrap();
             if let Some(h) = write_lock.get_mut(&session_id) {
+                // Mobile "all displays" view left for one display that is already streaming:
+                // the host answers the switch (the viewer then resets that display's decoder)
+                // but sends no key frame, as it is subscribed already. Without a refresh the
+                // fresh decoder fails on the next P-frame and the codec is marked unsupported.
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                let displays_before = h.displays.clone();
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                let refresh_after_switch = if value.len() == 1
+                    && h.displays.len() > 1
+                    && h.displays.contains(&(value[0] as usize))
+                {
+                    Some(value[0])
+                } else {
+                    None
+                };
                 h.displays = value.iter().map(|x| *x as usize).collect::<_>();
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let displays_refresh = value.clone();
@@ -2269,6 +2295,15 @@ pub mod sessions {
                         }
                     }
                 } else {
+                    // Displays this view did not show before had another reader (a display
+                    // panel, closed by now) or none: a frame left unread there would make
+                    // every later frame of that display be dropped.
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    for d in value.iter() {
+                        if !displays_before.contains(&(*d as usize)) {
+                            s.next_rgba(*d as usize);
+                        }
+                    }
                     // Try capture all displays.
                     s.capture_displays(vec![], vec![], value);
                 }
@@ -2288,6 +2323,10 @@ pub mod sessions {
                             s.refresh_video(*display);
                         }
                     }
+                }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                if let Some(display) = refresh_after_switch {
+                    s.refresh_video(display);
                 }
                 break;
             }

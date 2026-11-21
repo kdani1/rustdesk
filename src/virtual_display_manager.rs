@@ -730,6 +730,14 @@ pub mod amyuni_idd {
         windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING)).len()
     }
 
+    /// (active Amyuni virtual displays, all active displays).
+    pub fn display_counts() -> (usize, usize) {
+        (
+            get_monitor_count(),
+            windows::get_device_names(None).len(),
+        )
+    }
+
     #[inline]
     pub fn is_my_display(name: &str) -> bool {
         windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING))

@@ -137,21 +137,39 @@ const DXGI_RECOVERY_FRAME_GRACE: Duration = Duration::from_secs(2);
 const NO_IMAGE_GDI_AFTER: Duration = Duration::from_secs(2);
 // After a fallback to GDI (not forced by option or portable service), DXGI is tried again after
 // these delays, per display; a DXGI run that lasts `DXGI_RETRY_RESET_AFTER` resets the backoff.
+// Every failed try costs the viewer `NO_IMAGE_GDI_AFTER` of frozen picture (the stream stops
+// while DXGI is given its chance), so a display that keeps failing is asked less and less often.
 #[cfg(windows)]
-const DXGI_RETRY_BACKOFF: [Duration; 4] = [
+const DXGI_RETRY_BACKOFF: [Duration; 6] = [
     Duration::from_secs(3),
     Duration::from_secs(10),
     Duration::from_secs(30),
     Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
 ];
+// With no monitor attached at all (a headless PC: monitor switched off or unplugged) DXGI has
+// no output that delivers images, so retrying only freezes the picture: measured, one 2.3 s
+// gap every 64 s for a whole session. While headless, DXGI is not retried; the monitor count
+// is looked at again this often, and a monitor that appears is tried at once.
+#[cfg(windows)]
+const DXGI_HEADLESS_RECHECK: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const DXGI_RETRY_RESET_AFTER: Duration = Duration::from_secs(30);
 
-// display name -> index into `DXGI_RETRY_BACKOFF`.
+// display name -> index into `DXGI_RETRY_BACKOFF`. A display has an entry from its first
+// DXGI failure (level 0) until a DXGI run that lasts `DXGI_RETRY_RESET_AFTER`.
 #[cfg(windows)]
 fn dxgi_retry_level() -> &'static Mutex<HashMap<String, usize>> {
     static LEVEL: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
     LEVEL.get_or_init(Default::default)
+}
+
+// Displays that had a "dxgi_vram" restart and no DXGI run lasting `DXGI_RETRY_RESET_AFTER` since.
+#[cfg(all(windows, feature = "vram"))]
+fn dxgi_vram_tried() -> &'static Mutex<HashSet<String>> {
+    static TRIED: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    TRIED.get_or_init(Default::default)
 }
 
 #[cfg(windows)]
@@ -737,6 +755,27 @@ fn run(vs: VideoService) -> ResultType<()> {
         log::info!("disable dxgi with option, fall back to gdi");
         c.set_gdi();
     }
+    // Headless and DXGI already failed on this display since the service started: do not make
+    // the viewer wait `NO_IMAGE_GDI_AFTER` for an image that cannot come (see
+    // DXGI_HEADLESS_RECHECK). The first run after a start still tries DXGI once.
+    #[cfg(windows)]
+    let started_headless = !c.is_gdi()
+        && !last_portable_service_running
+        && scrap::codec::enable_directx_capture()
+        && Config::get_option(base::config::keys::OPTION_ENABLE_DXGI_RETRY) != "N"
+        && vs.source.is_monitor()
+        && dxgi_retry_level()
+            .lock()
+            .unwrap()
+            .contains_key(sp.name().as_str())
+        && crate::platform::windows::present_monitor_count() == 0;
+    #[cfg(windows)]
+    if started_headless {
+        log::info!("no monitor attached and dxgi failed before, start on gdi");
+        c.set_gdi();
+        #[cfg(feature = "vram")]
+        VRamEncoder::set_fallback_gdi(sp.name(), true);
+    }
     // GPU scheduling priority for capture and encode (enable-host-gpu-priority, roadmap M17).
     // Before the encoder is opened: hwcodec reads the priority for devices it creates itself.
     #[cfg(windows)]
@@ -840,15 +879,25 @@ fn run(vs: VideoService) -> ResultType<()> {
     #[cfg(windows)]
     log::info!("gdi: {}", c.is_gdi());
     // When this run fell back from DXGI to GDI (`set_gdi` below or the recovery fallback above),
-    // for the periodic DXGI retry. Not for GDI forced by option or the portable service.
+    // for the periodic DXGI retry. Not for GDI forced by option or the portable service, and not
+    // for a camera (its capturer always reports is_gdi, and a "retry" would only restart it).
     #[cfg(windows)]
-    let dxgi_retry = !last_portable_service_running
+    let dxgi_retry = vs.source.is_monitor()
+        && !last_portable_service_running
         && scrap::codec::enable_directx_capture()
         && Config::get_option(base::config::keys::OPTION_ENABLE_DXGI_RETRY) != "N";
     #[cfg(windows)]
     let mut gdi_fallback_at: Option<Instant> = (dxgi_retry && c.is_gdi()).then(Instant::now);
     #[cfg(windows)]
     let mut dxgi_retry_reset = false;
+    // Last look at the monitor count for the DXGI retry, and whether it found none.
+    #[cfg(windows)]
+    let mut dxgi_headless_checked: Option<Instant> = started_headless.then(Instant::now);
+    #[cfg(windows)]
+    let mut dxgi_headless = started_headless;
+    // Set when the first DXGI image of this run cleared the display's GDI mark (see the loop).
+    #[cfg(all(windows, feature = "vram"))]
+    let mut dxgi_vram_restore = false;
     #[cfg(windows)]
     start_uac_elevation_check();
 
@@ -1096,7 +1145,30 @@ fn run(vs: VideoService) -> ResultType<()> {
         if let Some(at) = gdi_fallback_at {
             let level = *dxgi_retry_level().lock().unwrap().get(sp.name().as_str()).unwrap_or(&0);
             let delay = DXGI_RETRY_BACKOFF[level.min(DXGI_RETRY_BACKOFF.len() - 1)];
-            if at.elapsed() >= delay {
+            let waited = at.elapsed() >= delay;
+            // Look at the monitor count before a retry that is due, and every
+            // DXGI_HEADLESS_RECHECK while headless. A retry needs the backoff to have passed and
+            // a monitor on two looks in a row: the look that first sees one only notes it, so an
+            // output that is still coming up, or a monitor whose presence flaps, is not tried
+            // the moment it arrives.
+            let mut monitor_confirmed = false;
+            if (waited || dxgi_headless)
+                && dxgi_headless_checked
+                    .map_or(true, |checked| checked.elapsed() >= DXGI_HEADLESS_RECHECK)
+            {
+                dxgi_headless_checked = Some(Instant::now());
+                let headless = crate::platform::windows::present_monitor_count() == 0;
+                monitor_confirmed = !headless && !dxgi_headless;
+                if headless != dxgi_headless {
+                    dxgi_headless = headless;
+                    if headless {
+                        log::info!("no monitor attached: staying on gdi, dxgi is not retried until one appears");
+                    } else {
+                        log::info!("a monitor is attached again, dxgi is retried at the next look");
+                    }
+                }
+            }
+            if waited && monitor_confirmed {
                 dxgi_retry_level()
                     .lock()
                     .unwrap()
@@ -1109,6 +1181,28 @@ fn run(vs: VideoService) -> ResultType<()> {
         } else if !dxgi_retry_reset && !c.is_gdi() && start.elapsed() >= DXGI_RETRY_RESET_AFTER {
             dxgi_retry_reset = true;
             dxgi_retry_level().lock().unwrap().remove(sp.name().as_str());
+            #[cfg(feature = "vram")]
+            dxgi_vram_tried().lock().unwrap().remove(sp.name().as_str());
+        }
+        // After a GDI spell (headless start, failed DXGI try) the mark that keeps every display
+        // off the texture encoder was still set when this run's encoder was created. The first
+        // DXGI image cleared it; restart so the encoder is chosen again without it, but only if
+        // that choice would now be the texture encoder (same test as get_encoder_config), and
+        // only once per display until a DXGI run has lasted DXGI_RETRY_RESET_AFTER: if the
+        // texture run falls back to GDI, "gdi_vram" below sets the mark again, and the two
+        // restarts would otherwise alternate.
+        #[cfg(all(windows, feature = "vram"))]
+        if dxgi_vram_restore {
+            dxgi_vram_restore = false;
+            if !c.is_gdi() && !encoder.input_texture() {
+                Encoder::update(scrap::codec::EncodingUpdate::Check);
+                if VRamEncoder::try_get(&c.device(), Encoder::negotiated_codec()).is_some()
+                    && dxgi_vram_tried().lock().unwrap().insert(sp.name())
+                {
+                    log::info!("dxgi delivers again, restart for the texture encoder");
+                    bail_switch!("dxgi_vram");
+                }
+            }
         }
         #[cfg(all(windows, feature = "vram"))]
         if c.is_gdi() && encoder.input_texture() {
@@ -1254,7 +1348,14 @@ fn run(vs: VideoService) -> ResultType<()> {
                 #[cfg(windows)]
                 {
                     #[cfg(feature = "vram")]
-                    if try_gdi == 1 && !c.is_gdi() {
+                    if try_gdi > 0 && !c.is_gdi() {
+                        // DXGI delivers again (the first image of this run, also when empty
+                        // waits came before it). If this display was marked for GDI, the
+                        // encoder of this run was created without the texture path: note it,
+                        // so the loop restarts once and gets the texture encoder back.
+                        if VRamEncoder::is_fallback_gdi(sp.name().as_str()) {
+                            dxgi_vram_restore = true;
+                        }
                         VRamEncoder::set_fallback_gdi(sp.name(), false);
                     }
                     try_gdi = 0;
@@ -1283,6 +1384,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                             try_gdi = 0;
                             if dxgi_retry {
                                 gdi_fallback_at = Some(Instant::now());
+                                // Remembered across restarts of this loop (see started_headless).
+                                dxgi_retry_level().lock().unwrap().entry(sp.name()).or_insert(0);
                             }
                             log::info!("No image for {:?}, fall back to gdi", start.elapsed());
                         } else {
@@ -1460,6 +1563,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     c.set_gdi();
                     if dxgi_retry {
                         gdi_fallback_at = Some(Instant::now());
+                        dxgi_retry_level().lock().unwrap().entry(sp.name()).or_insert(0);
                     }
                     log::info!("dxgi error, fall back to gdi: {:?}", err);
                     continue;

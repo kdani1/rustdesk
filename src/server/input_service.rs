@@ -1423,6 +1423,9 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         MOUSE_TYPE_UP => match buttons {
             MOUSE_BUTTON_LEFT => {
                 en.mouse_up(MouseButton::Left);
+                // Where the click landed, for the text focus answer (see text_focus.rs).
+                #[cfg(windows)]
+                super::text_focus::note_left_up_injected();
             }
             MOUSE_BUTTON_RIGHT => {
                 en.mouse_up(MouseButton::Right);

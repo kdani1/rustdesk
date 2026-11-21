@@ -517,6 +517,40 @@ pub fn is_pointer_captured() -> bool {
     }
 }
 
+/// Number of monitor devices that are present (plugged in and answering), as
+/// `Get-PnpDevice -Class Monitor -PresentOnly` counts them. 0 means the PC runs headless: the
+/// desktop still exists and GDI can grab it, but DXGI duplication never delivers an image.
+/// A virtual display or a dummy plug counts as a monitor. On an API failure this says 1, so a
+/// caller that asks "is there none?" keeps its normal behaviour.
+pub fn present_monitor_count() -> usize {
+    use winapi::{
+        shared::devguid::GUID_DEVCLASS_MONITOR,
+        um::setupapi::{
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+            DIGCF_PRESENT, SP_DEVINFO_DATA,
+        },
+    };
+    unsafe {
+        let set = SetupDiGetClassDevsW(
+            &GUID_DEVCLASS_MONITOR,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT,
+        );
+        if set.is_null() || set as isize == -1 {
+            return 1;
+        }
+        let mut data: SP_DEVINFO_DATA = mem::zeroed();
+        data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as _;
+        let mut count = 0u32;
+        while SetupDiEnumDeviceInfo(set, count, &mut data) != FALSE {
+            count += 1;
+        }
+        SetupDiDestroyDeviceInfoList(set);
+        count as usize
+    }
+}
+
 struct IconInfo(ICONINFO);
 
 impl IconInfo {
@@ -3385,6 +3419,86 @@ pub(super) fn change_resolution_directly(
                 res,
                 io::Error::last_os_error()
             );
+        }
+        Ok(())
+    }
+}
+
+/// Puts the named displays next to each other in one row, left to right in the given order,
+/// tops aligned (see [arrange_displays]).
+pub fn arrange_displays_in_row(names: &[String]) -> ResultType<()> {
+    let mut wanted = Vec::new();
+    let mut x = 0i32;
+    for name in names {
+        let r = current_resolution(name)?;
+        wanted.push((name.clone(), x, 0));
+        x += r.width as i32;
+    }
+    arrange_displays(&wanted)
+}
+
+/// Moves the named displays to the given positions (pixels). The primary display (the one at
+/// 0,0 now) stays where it is: all positions are shifted by the one asked for it. Sizes,
+/// scaling and the primary are not changed; Windows itself closes gaps it does not accept.
+pub fn arrange_displays(wanted: &[(String, i32, i32)]) -> ResultType<()> {
+    unsafe {
+        let mut modes = Vec::new();
+        for (name, x, y) in wanted {
+            let device_name = str_to_device_name(name);
+            let mut dm: DEVMODEW = std::mem::zeroed();
+            dm.dmSize = std::mem::size_of::<DEVMODEW>() as _;
+            if EnumDisplaySettingsW(device_name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm) == 0 {
+                bail!(
+                    "failed to read the mode of {}, error {}",
+                    name,
+                    io::Error::last_os_error()
+                );
+            }
+            modes.push((device_name, dm, *x, *y));
+        }
+        let (mut shift_x, mut shift_y) = (0, 0);
+        for (_, dm, x, y) in modes.iter() {
+            let pos = dm.u1.s2().dmPosition;
+            if pos.x == 0 && pos.y == 0 {
+                shift_x = *x;
+                shift_y = *y;
+                break;
+            }
+        }
+        let mut changed = false;
+        for (device_name, dm, x, y) in modes.iter_mut() {
+            let (new_x, new_y) = (*x - shift_x, *y - shift_y);
+            let pos = dm.u1.s2().dmPosition;
+            if pos.x == new_x && pos.y == new_y {
+                continue;
+            }
+            dm.u1.s2_mut().dmPosition.x = new_x;
+            dm.u1.s2_mut().dmPosition.y = new_y;
+            dm.dmFields = DM_POSITION;
+            let res = ChangeDisplaySettingsExW(
+                device_name.as_ptr(),
+                dm,
+                NULL as _,
+                CDS_UPDATEREGISTRY | CDS_NORESET,
+                NULL,
+            );
+            if res != DISP_CHANGE_SUCCESSFUL {
+                bail!("ChangeDisplaySettingsExW (position) failed, res={}", res);
+            }
+            changed = true;
+        }
+        if changed {
+            // Apply what was staged with CDS_NORESET.
+            let res = ChangeDisplaySettingsExW(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                NULL as _,
+                0,
+                NULL,
+            );
+            if res != DISP_CHANGE_SUCCESSFUL {
+                bail!("ChangeDisplaySettingsExW (apply) failed, res={}", res);
+            }
         }
         Ok(())
     }

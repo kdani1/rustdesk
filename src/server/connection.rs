@@ -398,6 +398,9 @@ pub struct Connection {
     // by peer
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     show_my_cursor: bool,
+    // Misc.text_input_focus was announced to this (Android) viewer; see text_focus.rs.
+    #[cfg(windows)]
+    text_focus_announced: bool,
     // by peer
     disable_clipboard: bool,
     // by peer
@@ -822,6 +825,8 @@ impl Connection {
             disable_keyboard: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             show_my_cursor: false,
+            #[cfg(windows)]
+            text_focus_announced: false,
             tx_input,
             video_ack_required: false,
             server_audit_conn: "".to_owned(),
@@ -1144,6 +1149,11 @@ impl Connection {
                             log::info!("Change permission {} -> {}", name, enabled);
                             if &name == "keyboard" {
                                 conn.keyboard = enabled;
+                                #[cfg(windows)]
+                                if !conn.peer_keyboard_enabled() {
+                                    // No longer in control of the mouse (see cursor_hider.rs).
+                                    super::cursor_hider::release(conn.inner.id());
+                                }
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 if let Some(s) = conn.server.upgrade() {
                                     s.write().unwrap().subscribe(
@@ -2413,6 +2423,11 @@ impl Connection {
                 "is_installed".into(),
                 json!(crate::platform::is_installed()),
             );
+            // Fork: ToggleVirtualDisplay values from 9000 on arrange the displays in a row
+            // (toggle_virtual_display). A viewer sends them only to a host that says this.
+            platform_additions.insert("display_row_layout".into(), json!(true));
+            // ... and values with bit 30 set place each display (same function).
+            platform_additions.insert("display_xy_layout".into(), json!(true));
             if crate::platform::is_installed() {
                 platform_additions.extend(virtual_display_manager::get_platform_additions());
             }
@@ -3650,6 +3665,28 @@ impl Connection {
                     }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if self.peer_keyboard_enabled() {
+                        // A touch viewer asks what its click put the keyboard focus on
+                        // (see text_focus.rs). The first mouse event announces that this
+                        // host answers, so the viewer waits for it from its first click on.
+                        #[cfg(windows)]
+                        if self.lr.my_platform == hbb_common::whoami::Platform::Android.to_string() {
+                            // Its own pointer shows where the mouse is: keep the cursor out
+                            // of the picture of a virtual display (see cursor_hider.rs).
+                            super::cursor_hider::hold(self.inner.id());
+                            if let Some(tx) = self.inner.tx.as_ref() {
+                                if !self.text_focus_announced {
+                                    self.text_focus_announced = true;
+                                    tx.send((
+                                        Instant::now(),
+                                        Arc::new(super::text_focus::message(super::text_focus::UNKNOWN)),
+                                    ))
+                                    .ok();
+                                }
+                                if is_left_up(&me) {
+                                    super::text_focus::on_left_up(tx.clone());
+                                }
+                            }
+                        }
                         if is_left_up(&me) {
                             CLICK_TIME.store(get_time(), Ordering::SeqCst);
                         } else {
@@ -5245,6 +5282,92 @@ impl Connection {
             msg_out
         };
 
+        // Fork: values with bit 30 set carry one display's wanted position each (bits 27-29
+        // the display index, 14 bits x + 8192, 13 bits y + 4096); index 7 means "apply". A
+        // viewer whose windows stand in space sends them so that Windows has the displays
+        // where the windows are.
+        #[cfg(windows)]
+        if t.on && t.display >= 0x4000_0000 {
+            lazy_static::lazy_static! {
+                static ref PENDING: std::sync::Mutex<std::collections::HashMap<i32, Vec<(usize, i32, i32)>>> =
+                    Default::default();
+            }
+            let v = t.display as u32;
+            let idx = ((v >> 27) & 7) as usize;
+            let conn_id = self.inner.id();
+            let list = {
+                let mut pending = PENDING.lock().unwrap();
+                if idx < 7 {
+                    let x = ((v >> 13) & 0x3FFF) as i32 - 8192;
+                    let y = (v & 0x1FFF) as i32 - 4096;
+                    let list = pending.entry(conn_id).or_default();
+                    list.retain(|e| e.0 != idx);
+                    list.push((idx, x, y));
+                    return;
+                }
+                pending.remove(&conn_id).unwrap_or_default()
+            };
+            match super::display_service::try_get_displays() {
+                Ok(displays)
+                    if !list.is_empty()
+                        && list.len() == displays.len()
+                        && list.iter().all(|e| e.0 < displays.len()) =>
+                {
+                    let wanted: Vec<(String, i32, i32)> = list
+                        .iter()
+                        .map(|&(i, x, y)| (displays[i].name(), x, y))
+                        .collect();
+                    match crate::platform::windows::arrange_displays(&wanted) {
+                        Ok(()) => log::info!("LATENCY layout: positions {:?}", list),
+                        Err(e) => log::error!("LATENCY layout {:?} failed: {}", list, e),
+                    }
+                }
+                Ok(displays) => log::warn!(
+                    "LATENCY layout ignored: {} displays here, {} positions",
+                    displays.len(),
+                    list.len()
+                ),
+                Err(e) => log::warn!("LATENCY layout ignored: {}", e),
+            }
+            return;
+        }
+
+        // Fork: display values from 9000 on do not plug anything in. They carry a left-to-right
+        // order for the displays (9000 + count * 256 + two bits of display index per place),
+        // sent by a viewer that shows every display in a window of its own, so that Windows
+        // has them in the order the windows stand in.
+        #[cfg(windows)]
+        if t.on && t.display >= 9000 {
+            let v = (t.display - 9000) as usize;
+            let (n, code) = (v / 256, v % 256);
+            match super::display_service::try_get_displays() {
+                Ok(displays) if (2..=4).contains(&n) && displays.len() == n => {
+                    let order: Vec<usize> = (0..n).map(|i| (code >> (2 * i)) & 3).collect();
+                    let mut seen = [false; 4];
+                    let valid = order
+                        .iter()
+                        .all(|&d| d < n && !std::mem::replace(&mut seen[d], true));
+                    if valid {
+                        let names: Vec<String> =
+                            order.iter().map(|&d| displays[d].name()).collect();
+                        match crate::platform::windows::arrange_displays_in_row(&names) {
+                            Ok(()) => log::info!("LATENCY layout: row {:?} {:?}", order, names),
+                            Err(e) => log::error!("LATENCY layout {:?} failed: {}", order, e),
+                        }
+                    } else {
+                        log::warn!("LATENCY layout ignored: bad order {:?}", order);
+                    }
+                }
+                Ok(displays) => log::warn!(
+                    "LATENCY layout ignored: {} displays here, the viewer counts {}",
+                    displays.len(),
+                    n
+                ),
+                Err(e) => log::warn!("LATENCY layout ignored: {}", e),
+            }
+            return;
+        }
+
         if t.on {
             if !virtual_display_manager::is_virtual_display_supported() {
                 self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))
@@ -5574,6 +5697,10 @@ impl Connection {
         if let Ok(q) = o.disable_keyboard.enum_value() {
             if q != BoolOption::NotSet {
                 self.disable_keyboard = q == BoolOption::Yes;
+                #[cfg(windows)]
+                if !self.peer_keyboard_enabled() {
+                    super::cursor_hider::release(self.inner.id());
+                }
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
                         super::clipboard_service::NAME,
@@ -8052,6 +8179,8 @@ mod raii {
             // Clear per-connection state to avoid stale behavior if conn ids are reused.
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             clear_relative_mouse_active(self.0);
+            #[cfg(windows)]
+            crate::server::cursor_hider::release(self.0);
             AUTHED_CONNS.lock().unwrap().retain(|c| c.conn_id != self.0);
             let remote_count = AUTHED_CONNS
                 .lock()

@@ -482,6 +482,14 @@ impl VRamEncoder {
             .insert(video_service_name, not_use);
     }
 
+    /// Whether this display is marked as captured through GDI (no texture encoder for anyone).
+    pub fn is_fallback_gdi(video_service_name: &str) -> bool {
+        FALLBACK_GDI_DISPLAYS
+            .lock()
+            .unwrap()
+            .contains(video_service_name)
+    }
+
     pub fn set_fallback_gdi(video_service_name: String, fallback: bool) {
         if fallback {
             FALLBACK_GDI_DISPLAYS
