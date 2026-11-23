@@ -204,11 +204,16 @@ class DisplayActivity : FlutterActivity() {
     }
 
     private var channel: MethodChannel? = null
+
+    // Hardware decoding into Flutter textures of this panel's engine (see VideoTextures).
+    private var videoTextures: VideoTextures? = null
     private val display get() = intent.getIntExtra(EXTRA_DISPLAY, -1)
     private val poseWatcher = PoseWatcher(this) { display }
 
     override fun onStart() {
         super.onStart()
+        // The stop before this start took the textures' Surfaces (see VideoTextures.reattach).
+        videoTextures?.reattach()
         poseWatcher.start()
     }
 
@@ -216,6 +221,10 @@ class DisplayActivity : FlutterActivity() {
 
     // Read before the engine starts: decides whether there is anything to show.
     private var args: String? = null
+
+    // Why the panel closed itself ("user", "gone": its display left the host's list, "conn":
+    // the session ended), for the main panel. A close by the system's own button is "user".
+    private var finishReason = "user"
 
     override fun getDartEntrypointArgs(): List<String> =
         listOf("display_panel", args ?: "{}")
@@ -243,6 +252,7 @@ class DisplayActivity : FlutterActivity() {
         flutterEngine.plugins.add(dev.fluttercommunity.plus.packageinfo.PackageInfoPlugin())
         flutterEngine.plugins.add(dev.fluttercommunity.plus.wakelock.WakelockPlusPlugin())
         flutterEngine.plugins.add(com.jrai.flutter_keyboard_visibility.FlutterKeyboardVisibilityPlugin())
+        videoTextures = VideoTextures(flutterEngine, "panel$display")
         channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "mChannel").also {
             it.setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -267,14 +277,47 @@ class DisplayActivity : FlutterActivity() {
                         else result.success(QuestInput.configure(call.arguments))
                     }
                     "panel_finish" -> {
+                        ((call.arguments as? Map<*, *>)?.get("reason") as? String)?.let {
+                            finishReason = it
+                        }
                         result.success(true)
                         wanted.remove(sid)
                         finishAndRemoveTask()
+                    }
+                    "video_texture_create" -> {
+                        val a = call.arguments as? Map<*, *>
+                        val s = a?.get("sid") as? String
+                        val d = a?.get("display") as? Int
+                        val w = a?.get("w") as? Int
+                        val h = a?.get("h") as? Int
+                        result.success(
+                            if (s == null || d == null || w == null || h == null) -1L
+                            else videoTextures?.create(s, d, w, h) ?: -1L
+                        )
+                    }
+                    "video_texture_dispose" -> {
+                        (call.arguments as? Int)?.let { videoTextures?.dispose(it) }
+                        result.success(true)
                     }
                     else -> result.success(false)
                 }
             }
         }
+    }
+
+    // At background level the engine closes the buffers behind its textures: the decoders
+    // must have let go of them first.
+    override fun onTrimMemory(level: Int) {
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            videoTextures?.beforeTrim()
+        }
+        super.onTrimMemory(level)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        videoTextures?.disposeAll()
+        videoTextures = null
+        super.cleanUpFlutterEngine(flutterEngine)
     }
 
     override fun onResume() {
@@ -301,7 +344,8 @@ class DisplayActivity : FlutterActivity() {
             // The main panel detaches this panel's UI session if the panel itself did not get
             // to it (closed with the system's own close button).
             MainActivity.flutterMethodChannel?.invokeMethod(
-                "panel_closed", mapOf("display" to display, "sid" to sid)
+                "panel_closed",
+                mapOf("display" to display, "sid" to sid, "reason" to finishReason)
             )
         }
         super.onDestroy()

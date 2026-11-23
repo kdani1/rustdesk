@@ -3,6 +3,7 @@
 package ffi
 
 import android.content.Context
+import android.view.Surface
 import java.nio.ByteBuffer
 
 import com.carriez.flutter_hbb.RdClipboardManager
@@ -28,4 +29,10 @@ object FFI {
     external fun getBuildinOption(key: String): String
     external fun onClipboardUpdate(clips: ByteBuffer)
     external fun isServiceClipboardEnabled(): Boolean
+    // Hardware decoding into a Flutter texture (VideoTextures.kt): the Surface of UI session
+    // [sid]'s texture [texture] for [display], null when it is gone; [hevc] / [avc]: decoder
+    // names.
+    external fun setVideoSurface(sid: String, display: Int, surface: Surface?, texture: Long, width: Int, height: Int, hevc: String, avc: String)
+    // Buffers rendered to that Surface so far, -1 without one.
+    external fun videoSurfaceRendered(sid: String, display: Int): Long
 }

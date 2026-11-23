@@ -262,7 +262,8 @@ class QuestInputModel {
 
   void log(String line) {
     if (!debug.value) return;
-    if (kQuestDebug) debugPrint('[quest] $line');
+    // While the readout is shown its lines go to logcat too, so a test can be read back.
+    if (kQuestDebug || debug.value) debugPrint('[quest] $line');
     debugLines.add(line);
     if (debugLines.length > 7) debugLines.removeRange(0, debugLines.length - 7);
   }

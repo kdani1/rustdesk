@@ -1253,13 +1253,16 @@ bool showVirtualDisplayMenu(FFI ffi) {
 /// Asks the host to plug in ([on]) or out one Amyuni virtual display. The stored list of
 /// displays to plug in again at the next connection is not changed by the request itself
 /// (see the comment in [getVirtualDisplayMenuChildren]).
-Future<void> toggleAmyuniVirtualDisplay(FFI ffi, bool on) async {
+/// [index] 1..4 names one RustDesk IDD display (hosts that announce
+/// virtual_display_targeted_unplug); 0 is Amyuni's "one more" / "the last one".
+Future<void> toggleAmyuniVirtualDisplay(FFI ffi, bool on,
+    {int index = 0}) async {
   const key = 'virtual-display';
   final before =
       await bind.sessionGetPeerOption(sessionId: ffi.sessionId, name: key);
   ffi.ffiModel.virtualDisplayToggledAt = DateTime.now();
   await bind.sessionToggleVirtualDisplay(
-      sessionId: ffi.sessionId, index: 0, on: on);
+      sessionId: ffi.sessionId, index: index, on: on);
   await bind.sessionPeerOption(
       sessionId: ffi.sessionId, name: key, value: before);
 }

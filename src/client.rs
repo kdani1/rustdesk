@@ -109,6 +109,8 @@ pub mod helper;
 pub mod io_loop;
 pub mod latency;
 pub mod screenshot;
+#[cfg(all(target_os = "android", feature = "surface-decode"))]
+mod surface;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
@@ -3189,6 +3191,9 @@ pub struct VideoHandler {
     _display: usize, // useful for debug
     fail_counter: usize,
     first_frame: bool,
+    // Android: MediaCodec decoding into the view's texture, with `decoder` as the fallback.
+    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+    surf: surface::SurfaceState,
 }
 
 impl VideoHandler {
@@ -3223,6 +3228,8 @@ impl VideoHandler {
             _display,
             fail_counter: 0,
             first_frame: true,
+            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+            surf: surface::SurfaceState::new(_display),
         }
     }
 
@@ -3239,6 +3246,13 @@ impl VideoHandler {
         chroma: &mut Option<Chroma>,
         want_output: bool,
     ) -> ResultType<DecodeOutput> {
+        // Android surface decoding: the frame goes to MediaCodec, and neither the software
+        // decoder nor its failure counter sees it (a surface failure must not mark the codec
+        // unsupported). `surface_sync` already matched the decoder to the frame's codec.
+        #[cfg(all(target_os = "android", feature = "surface-decode"))]
+        if self.surface_active() {
+            return Ok(self.surface_handle_frame(&vf, pixelbuffer, want_output));
+        }
         let format = CodecFormat::from(&vf);
         if format != self.decoder.format() {
             self.reset(Some(format));
@@ -3293,6 +3307,8 @@ impl VideoHandler {
 
     /// Reset the decoder, change format if it is Some
     pub fn reset(&mut self, format: Option<CodecFormat>) {
+        #[cfg(all(target_os = "android", feature = "surface-decode"))]
+        self.surface_on_reset();
         log::info!(
             "reset video handler for display #{}, format: {format:?}",
             self._display
@@ -4763,6 +4779,19 @@ pub fn is_present_pacing_thread() -> bool {
     PRESENT_PACING_THREAD.with(|p| p.get())
 }
 
+/// Option `enable-android-surface-newest-only` ("Y" = skip every frame that has a newer one
+/// waiting while decoding to a surface), read once per process.
+#[cfg(all(target_os = "android", feature = "surface-decode"))]
+fn surface_newest_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = hbb_common::config::LocalConfig::get_option("enable-android-surface-newest-only")
+            == "Y";
+        log::info!("LATENCY client surface pacing newest_only={v}");
+        v
+    })
+}
+
 /// The video thread's present decision. A decoded frame is shown unless a newer frame is
 /// already waiting and either the backlog has lasted 1.5 frame intervals or the newest waiting
 /// frame is at least 1.5 frame intervals newer than this one (Moonlight-style window: two frames
@@ -4782,6 +4811,11 @@ struct PresentPacer {
     interval_ms: f64,
     // The last `should_present` accepted the frame by the stale-frame rule (not forced).
     recheck: bool,
+    // Android surface decoding: a frame is shown only when no newer one is waiting (or the
+    // backlog has lasted `PACING_MAX_BACKLOG`). Flutter's texture queue shows the older of two
+    // pictures that arrive within one of its frames and leaves the newer one waiting for the
+    // next picture, so two frames of a burst must not both be rendered.
+    newest_only: bool,
 }
 
 impl PresentPacer {
@@ -4793,6 +4827,7 @@ impl PresentPacer {
             last_pts: None,
             interval_ms: 1000.0 / 60.0,
             recheck: false,
+            newest_only: false,
         }
     }
 
@@ -4875,6 +4910,9 @@ impl PresentPacer {
             // Still behind: show this frame so motion stays visible, and start a new window.
             self.backlog_since = Some(now);
             return (true, true);
+        }
+        if self.newest_only {
+            return (false, false);
         }
         let window_ms = self.interval_ms.clamp(4.0, 50.0) * 1.5;
         let lasting = backlog.as_secs_f64() * 1000.0 >= window_ms;
@@ -4995,7 +5033,37 @@ pub fn start_video_thread<F, T>(
         // STEADY_WARMUP_FRAMES (for `VideoCounters::steady_*`).
         let mut warmup = 0;
         loop {
-            if let Ok(data) = video_receiver.recv() {
+            #[cfg(not(all(target_os = "android", feature = "surface-decode")))]
+            let data = video_receiver.recv().map_err(|_| ());
+            // Android surface decoding: while the decoder still owes a picture (it came after
+            // its frame's decode stopped waiting), or a key frame request is held back by its
+            // spacing, the thread wakes between frames to take and show it; and twice a
+            // second while a surface decoder runs, to release it once its surface is gone.
+            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+            let data = loop {
+                let wake = video_handler
+                    .as_ref()
+                    .and_then(|h: &VideoHandler| h.surface_wake());
+                let Some(wake) = wake else {
+                    break video_receiver.recv().map_err(|_| ());
+                };
+                match video_receiver.recv_timeout(wake) {
+                    Ok(data) => break Ok(data),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(handler) = video_handler.as_mut() {
+                            surface::idle(
+                                handler,
+                                &session,
+                                display,
+                                &counters,
+                                &mut video_callback,
+                            );
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break Err(()),
+                }
+            };
+            if let Ok(data) = data {
                 match data {
                     MediaData::VideoFrame(_) | MediaData::VideoQueue => {
                         let key_frame = matches!(data, MediaData::VideoFrame(_));
@@ -5040,7 +5108,41 @@ pub fn start_video_thread<F, T>(
                         if let Some(handler) = video_handler.as_mut() {
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
+                            // Android surface decoding: start, keep or drop the surface
+                            // decoder for this frame. The surface is used only while exactly
+                            // one view shows this display and registered one.
+                            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                            let surface_sync = {
+                                let want = if is_view_camera {
+                                    None
+                                } else {
+                                    session.video_surface(display)
+                                };
+                                let backlog = video_queue.read().unwrap().len() > 0
+                                    || pacer.shared.key_frames_pending.load(Ordering::Relaxed)
+                                        > 0;
+                                let sync =
+                                    handler.surface_sync(want, key_frame, format, backlog);
+                                surface::notify(handler, &session, display);
+                                if sync.skip {
+                                    // No decoder until the key frame that was asked for.
+                                    counters.on_discarded();
+                                    pacer.reset();
+                                    continue;
+                                }
+                                // Newest-only skipping threw away most frames of Wi-Fi bursts at
+                                // 72-90 fps (measured: 84 received, 35 shown). The window rule
+                                // shows both frames of a burst; "Y" brings the old rule back.
+                                pacer.newest_only = handler.surface_active()
+                                    && surface_newest_only();
+                                sync
+                            };
+                            #[cfg(not(all(target_os = "android", feature = "surface-decode")))]
                             let format_changed = handler.decoder.format() != format;
+                            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                            let format_changed = surface_sync.switched
+                                || (!handler.surface_active()
+                                    && handler.decoder.format() != format);
                             if format_changed {
                                 pacer.reset();
                                 warmup = 0;
@@ -5064,6 +5166,12 @@ pub fn start_video_thread<F, T>(
                                 &mut tmp_chroma,
                                 want_output,
                             );
+                            // A surface decoder that failed in the frame: its view is told,
+                            // and the key frame the software decoder needs is requested.
+                            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                            surface::notify(handler, &session, display);
+                            #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                            let surface_frame = !pixelbuffer;
                             #[cfg(windows)]
                             decoder_mmcss.update(handler.is_vram());
                             match result {
@@ -5085,6 +5193,21 @@ pub fn start_video_thread<F, T>(
                                             video_queue.read().unwrap().len(),
                                             decode_end,
                                         )
+                                    };
+                                    // Surface decoding: the present decision renders the
+                                    // output buffer the decode holds, or drops it. A frame
+                                    // whose picture was not out in time holds none
+                                    // (`DecodedNoOutput`); it is shown when it comes.
+                                    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                                    let present = if surface_frame {
+                                        let (rendered, info) = handler.surface_release(
+                                            present && output == DecodeOutput::Output,
+                                        );
+                                        surface::announce(&session, display, info);
+                                        surface::notify(handler, &session, display);
+                                        rendered
+                                    } else {
+                                        present
                                     };
                                     if output == DecodeOutput::DecodedNoOutput {
                                         counters.no_output.fetch_add(1, Ordering::Relaxed);
@@ -5127,6 +5250,10 @@ pub fn start_video_thread<F, T>(
                                         decode_end,
                                         format,
                                         gpu_texture: !pixelbuffer,
+                                        #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                                        surface: surface_frame,
+                                        #[cfg(not(all(target_os = "android", feature = "surface-decode")))]
+                                        surface: false,
                                         paced: pacer.enabled(),
                                         no_output: output == DecodeOutput::DecodedNoOutput,
                                     };
@@ -5152,6 +5279,13 @@ pub fn start_video_thread<F, T>(
 
                                     // fps calculation
                                     let busy = start.elapsed();
+                                    // Surface decoding: the time spent waiting for the
+                                    // decoder's output is idle time of a pipeline, not work.
+                                    // Counted as busy it would cap the frame rate at one
+                                    // frame per decoder latency; a decoder that is too slow
+                                    // still shows as a growing queue.
+                                    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+                                    let busy = busy.saturating_sub(handler.surface_take_wait());
                                     counters.on_decoded_busy(
                                         busy,
                                         !key_frame && warmup >= STEADY_WARMUP_FRAMES,

@@ -967,6 +967,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final panels = androidDisplayPanels;
     return [
       const SizedBox(width: 4),
+      const _QuestStatusChip(),
       Obx(() => _keyButton(
           context,
           _KeySpec('', _showDisplayOverview,
@@ -1022,6 +1023,28 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                           style: TextStyle(fontSize: 12))),
                 ],
               ),
+              // Hardware decoding into a texture (enable-android-surface-decode): on
+              // unless "N"; read when a connection starts.
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Checkbox(
+                      value: bind.mainGetLocalOption(
+                              key: kOptionEnableAndroidSurfaceDecode) !=
+                          'N',
+                      onChanged: (v) async {
+                        await bind.mainSetLocalOption(
+                            key: kOptionEnableAndroidSurfaceDecode,
+                            value: v == true ? 'Y' : 'N');
+                        setState(() {});
+                      }),
+                  const Flexible(
+                      child: Text('Hardveres dekódolás (kísérleti)',
+                          style: TextStyle(fontSize: 12))),
+                ],
+              ),
+              const Text('A hardveres dekódolás a következő csatlakozástól érvényes.',
+                  style: TextStyle(fontSize: 11)),
             ],
           );
         }),
@@ -1039,7 +1062,8 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     final disp = pi.displays[d];
     final isMain = d == keep;
     final open = isMain || panels.isPanelOpen(d);
-    final isLast = d == pi.displays.length - 1;
+    // Amyuni: only the last display can go; RustDesk IDD: any virtual one but the main.
+    final removes = panels.removesDisplay(gFFI, d);
     Widget arrow(IconData icon, int by, bool enabled) => InkWell(
         onTap: enabled ? () => panels.move(gFFI, d, by) : null,
         child: Padding(
@@ -1081,7 +1105,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                   panels.openPanel(gFFI, d);
                 }
               },
-              child: Text(open ? (isLast ? 'Eltávolít' : 'Bezár') : 'Megnyit',
+              child: Text(open ? (removes ? 'Eltávolít' : 'Bezár') : 'Megnyit',
                   style: const TextStyle(fontSize: 12)),
             )
           else
@@ -2075,6 +2099,41 @@ class ImagePaint extends StatelessWidget {
       }
     }
     final adjust = c.getAdjustY();
+    // Android surface decoding: the display's picture is in a texture the hardware decoder
+    // renders into. Same place and size as ImagePainter gives the software picture.
+    final textureId = m.surfaceTextureId;
+    if (textureId != null && ffiModel.pi.currentDisplay != kAllDisplayValue) {
+      final left = (c.x / s).truncateToDouble() * s;
+      final top = ((c.y + adjust) / s).truncateToDouble() * s;
+      final size = m.surfaceSize * s;
+      if (left.isFinite && top.isFinite && size.width > 0 && size.height > 0) {
+        Widget texture = Texture(
+            textureId: textureId,
+            filterQuality: (s - 1.0).abs() > 0.001
+                ? FilterQuality.medium
+                : FilterQuality.none);
+        if (m.surfaceBufX > 1 || m.surfaceBufY > 1) {
+          // The texture shows the decoder's whole buffer, padding included: lay the buffer
+          // out larger than the picture's place and cut the padding off.
+          final bw = size.width * m.surfaceBufX;
+          final bh = size.height * m.surfaceBufY;
+          texture = ClipRect(
+              child: OverflowBox(
+                  alignment: Alignment.topLeft,
+                  minWidth: bw,
+                  maxWidth: bw,
+                  minHeight: bh,
+                  maxHeight: bh,
+                  child: texture));
+        }
+        return Positioned(
+            left: left,
+            top: top,
+            width: size.width,
+            height: size.height,
+            child: IgnorePointer(child: texture));
+      }
+    }
     return CustomPaint(
       painter: ImagePainter(
           image: m.image, x: c.x / s, y: (c.y + adjust) / s, scale: s),
@@ -2491,5 +2550,103 @@ class FABLocation extends FloatingActionButtonLocation {
   Offset getOffset(ScaffoldPrelayoutGeometry scaffoldGeometry) {
     final offset = location.getOffset(scaffoldGeometry);
     return Offset(offset.dx + offsetX, offset.dy + offsetY);
+  }
+}
+
+
+/// Headset battery and Wi-Fi in the toolbar (Quest main window), read every 30 s from
+/// MainActivity's `quest_status`. A tap shows the details.
+class _QuestStatusChip extends StatefulWidget {
+  const _QuestStatusChip();
+
+  @override
+  State<_QuestStatusChip> createState() => _QuestStatusChipState();
+}
+
+class _QuestStatusChipState extends State<_QuestStatusChip> {
+  Timer? _timer;
+  Map<dynamic, dynamic> _s = const {};
+
+  @override
+  void initState() {
+    super.initState();
+    _read();
+    _timer = Timer.periodic(const Duration(seconds: 30), (_) => _read());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _read() async {
+    try {
+      final r = await gFFI.invokeMethodWithResult<dynamic>('quest_status');
+      if (mounted && r is Map) setState(() => _s = r);
+    } catch (e) {
+      debugPrint('[quest] status: $e');
+    }
+  }
+
+  IconData _batteryIcon(int level, bool charging) {
+    if (charging) return Icons.battery_charging_full;
+    if (level >= 95) return Icons.battery_full;
+    if (level >= 80) return Icons.battery_6_bar;
+    if (level >= 65) return Icons.battery_5_bar;
+    if (level >= 50) return Icons.battery_4_bar;
+    if (level >= 35) return Icons.battery_3_bar;
+    if (level >= 20) return Icons.battery_2_bar;
+    if (level >= 10) return Icons.battery_1_bar;
+    return Icons.battery_alert;
+  }
+
+  IconData _wifiIcon(bool wifi, int? rssi) {
+    if (!wifi) return Icons.wifi_off;
+    if (rssi == null || rssi >= -55) return Icons.wifi;
+    if (rssi >= -66) return Icons.network_wifi_3_bar;
+    if (rssi >= -77) return Icons.network_wifi_2_bar;
+    return Icons.network_wifi_1_bar;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final level = _s['battery'] as int?;
+    if (level == null) return const SizedBox.shrink();
+    final charging = _s['charging'] == true;
+    final wifi = _s['wifi'] == true;
+    final rssi = _s['rssi'] as int?;
+    final low = level <= 20 && !charging;
+    final color = low ? Colors.redAccent : Colors.white;
+    String details() {
+      final b = 'Akkumulátor: $level%${charging ? ' (töltődik)' : ''}';
+      if (!wifi) return '$b\nWi-Fi: nincs';
+      final mbps = _s['linkMbps'];
+      final mhz = _s['freqMHz'] as int?;
+      final band = mhz == null
+          ? ''
+          : mhz >= 5925
+              ? ', 6 GHz'
+              : mhz >= 4900
+                  ? ', 5 GHz'
+                  : ', 2,4 GHz';
+      return '$b\nWi-Fi: ${rssi ?? '?'} dBm, ${mbps ?? '?'} Mbps$band';
+    }
+
+    return InkWell(
+      onTap: () {
+        _read();
+        showToast(details());
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(_batteryIcon(level, charging), color: color, size: 20),
+          Text('$level%', style: TextStyle(color: color, fontSize: 13)),
+          const SizedBox(width: 6),
+          Icon(_wifiIcon(wifi, rssi), color: Colors.white, size: 18),
+        ]),
+      ),
+    );
   }
 }

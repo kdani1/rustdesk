@@ -392,6 +392,9 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
+      } else if (name == 'video_surface') {
+        // Android surface decoding: a display's picture is in its texture now, or not.
+        await parent.target?.imageModel.onSurfaceEvent(evt);
       } else if (name == 'cursor_id') {
         updateLastCursorId(evt);
         handleCursorId(evt);
@@ -958,7 +961,7 @@ class FfiModel with ChangeNotifier {
                 type.startsWith('relay-hint')));
     if (isDisplayPanel) {
       // The main panel owns login, errors and reconnect; a panel only shows a picture.
-      if (breaksConn) closeDisplayPanel();
+      if (breaksConn) closeDisplayPanel(reason: kPanelCloseConn);
       return;
     }
     if (breaksConn && isAndroid && androidDisplayPanels.isOpen) {
@@ -1321,6 +1324,8 @@ class FfiModel with ChangeNotifier {
           );
         }
       }
+      // Android: the texture the shown display is decoded into follows its size.
+      parent.target?.imageModel.syncSurface();
     }
   }
 
@@ -1523,6 +1528,7 @@ class FfiModel with ChangeNotifier {
           : null;
       if (isMobile && !isCache && parent.target != null) {
         androidDisplayPanels.maybeOfferRestore(parent.target!);
+        androidDisplayPanels.applyQuestFrameRate(parent.target!);
       }
       if (isMobile &&
           !isCache &&
@@ -1719,6 +1725,8 @@ class FfiModel with ChangeNotifier {
     d.width = evt['width'] ?? d.width;
     d.height = evt['height'] ?? d.height;
     d.cursorEmbedded = evt['cursor_embedded'] == 1;
+    // Windows device name ("\\.\DISPLAYnn"), when the core passes it on.
+    d.name = evt['name']?.toString() ?? '';
     d.originalWidth = evt['original_width'] ?? kInvalidResolutionValue;
     d.originalHeight = evt['original_height'] ?? kInvalidResolutionValue;
     d._scale = 1.0;
@@ -1777,7 +1785,7 @@ class FfiModel with ChangeNotifier {
           updateCurDisplay(sessionId);
           notifyListeners();
         } else {
-          closeDisplayPanel();
+          closeDisplayPanel(reason: kPanelCloseGone);
         }
         return;
       }
@@ -1880,6 +1888,7 @@ class FfiModel with ChangeNotifier {
     if (updateData.isEmpty) {
       _pi.platformAdditions.remove(kPlatformAdditionsRustDeskVirtualDisplays);
       _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
+      _pi.platformAdditions.remove(kPlatformAdditionsVirtualDisplayNames);
     } else {
       try {
         final updateJson = json.decode(updateData) as Map<String, dynamic>;
@@ -1894,6 +1903,10 @@ class FfiModel with ChangeNotifier {
         if (!updateJson.containsKey(kPlatformAdditionsAmyuniVirtualDisplays)) {
           _pi.platformAdditions.remove(kPlatformAdditionsAmyuniVirtualDisplays);
         }
+        // Like the list of plugged indices: absent means none.
+        if (!updateJson.containsKey(kPlatformAdditionsVirtualDisplayNames)) {
+          _pi.platformAdditions.remove(kPlatformAdditionsVirtualDisplayNames);
+        }
       } catch (e) {
         debugPrint('Failed to decode platformAdditions $e');
       }
@@ -1901,6 +1914,11 @@ class FfiModel with ChangeNotifier {
 
     cachedPeerData.peerInfo['platform_additions'] =
         json.encode(_pi.platformAdditions);
+
+    // RustDesk IDD: a display asked for may only now be known by its index and name.
+    if (isAndroid && !isDisplayPanel && parent.target != null) {
+      androidDisplayPanels.onIddAdditionsChanged(parent.target!);
+    }
 
     // After a press of "+" / "-" in the virtual display menu: remember what the host now
     // really has, so the next connection asks for exactly that many (see toolbar.dart).
@@ -2101,6 +2119,14 @@ class VirtualMouseMode with ChangeNotifier {
   }
 }
 
+// Android surface decoding: the display a view shows alone, and its size in pixels.
+class _SurfaceWant {
+  final int display;
+  final int w;
+  final int h;
+  const _SurfaceWant(this.display, this.w, this.h);
+}
+
 class ImageModel with ChangeNotifier {
   ui.Image? _image;
   // The display _image is a picture of, when known. pi.currentDisplay is not enough: after a
@@ -2187,6 +2213,8 @@ class ImageModel with ChangeNotifier {
       _imageDisplay = keep == null ? null : to;
     }
     notifyListeners();
+    // After the caller has set pi.currentDisplay: the texture follows the shown display.
+    if (isAndroid) scheduleMicrotask(syncSurface);
   }
 
   /// Mobile "all displays" view: the host's displays changed. Drops the pictures of displays
@@ -2206,6 +2234,263 @@ class ImageModel with ChangeNotifier {
       _displayImages.remove(i)?.dispose();
     }
     notifyListeners();
+  }
+
+  // ---- Android: hardware decoding into a texture ("surface decoding") ----
+  // The display this view shows alone is decoded by the device's hardware decoder straight
+  // into a Flutter texture (Kotlin VideoTextures, Rust surface_decoder.rs): no picture comes
+  // to Dart, the page draws a Texture widget instead. The software pictures (onRgba) stay
+  // the fallback; Rust decides which path a display uses and says so with the
+  // `video_surface` event, or by sending software pictures again.
+  int? _surfaceTextureId;
+  int? _surfaceDisplay;
+  int _surfaceW = 0;
+  int _surfaceH = 0;
+  // The texture has a picture, and it is the one to show.
+  bool _surfaceActive = false;
+  // The decoded buffer's size over the picture's (>= 1): a decoder pads its buffers at the
+  // right and bottom (1920x1088 for 1920x1080), and the texture shows the whole buffer.
+  double _surfaceBufX = 1;
+  double _surfaceBufY = 1;
+  // Counts the texture's activations and disposals: an older answer is told from a newer one.
+  int _surfaceEpoch = 0;
+  // A surface picture was this session's first picture (canvas and cursor are set up).
+  bool _surfaceFirstDone = false;
+  // enable-android-surface-decode, read once per session; false once no texture could be made.
+  bool? _surfaceEnabled;
+  Future<void> _surfaceQueue = Future.value();
+  // An "active" event for a texture this isolate does not know yet (Kotlin registered its
+  // Surface, the answer with its id is still on its way).
+  Map<String, dynamic>? _pendingSurfaceEvt;
+
+  /// The texture to draw instead of [image]; null while the software picture is the one.
+  int? get surfaceTextureId => _surfaceActive ? _surfaceTextureId : null;
+
+  /// The size of the texture's picture in remote pixels.
+  Size get surfaceSize => Size(_surfaceW.toDouble(), _surfaceH.toDouble());
+  double get surfaceBufX => _surfaceBufX;
+  double get surfaceBufY => _surfaceBufY;
+
+  /// Whether a remote picture is on screen, as a software picture or in the texture.
+  bool get hasPicture => image != null || surfaceTextureId != null;
+
+  // What this view shows alone right now: the display and its size. Null: no texture (the
+  // all-displays view, no display yet, the option off, not Android, not a remote desktop).
+  _SurfaceWant? _wantedSurface() {
+    if (!isAndroid) return null;
+    final ffi = parent.target;
+    if (ffi == null || ffi.closed || ffi.connType != ConnType.defaultConn) {
+      return null;
+    }
+    _surfaceEnabled ??=
+        bind.mainGetLocalOption(key: kOptionEnableAndroidSurfaceDecode) != 'N';
+    if (_surfaceEnabled != true) return null;
+    final pi = ffi.ffiModel.pi;
+    final d = pi.currentDisplay;
+    if (d == kAllDisplayValue || d < 0 || d >= pi.displays.length) return null;
+    final w = pi.displays[d].width;
+    final h = pi.displays[d].height;
+    if (w <= 0 || h <= 0) return null;
+    return _SurfaceWant(d, w, h);
+  }
+
+  /// Android: makes the texture match what this view shows now (one display at its size, or
+  /// none). Cheap when nothing changed; calls are worked off one after the other, each
+  /// looking at the state of its own moment, so they may come from anywhere.
+  void syncSurface() {
+    if (!isAndroid) return;
+    final want = _wantedSurface();
+    if (want == null
+        ? _surfaceDisplay == null
+        : (want.display == _surfaceDisplay &&
+            want.w == _surfaceW &&
+            want.h == _surfaceH)) {
+      return;
+    }
+    _surfaceQueue = _surfaceQueue.then((_) => _syncSurface()).catchError((e) {
+      debugPrint('[surface] sync failed: $e');
+    });
+  }
+
+  Future<void> _syncSurface() async {
+    final want = _wantedSurface();
+    if (want != null &&
+        want.display == _surfaceDisplay &&
+        want.w == _surfaceW &&
+        want.h == _surfaceH) {
+      return;
+    }
+    final wasActive = _surfaceActive;
+    final old = _surfaceDisplay;
+    await _disposeSurface();
+    if (want == null) {
+      // The all-displays view takes over a display the texture showed: its software
+      // picture needs a key frame, and a still screen sends none by itself.
+      if (wasActive && old != null && _allDisplays) {
+        await bind.sessionRefresh(sessionId: sessionId, display: old);
+      }
+      return;
+    }
+    int? id;
+    try {
+      id = await platformFFI.invokeMethodWithResult<int>('video_texture_create', {
+        'sid': sessionId.toString(),
+        'display': want.display,
+        'w': want.w,
+        'h': want.h,
+      });
+    } catch (e) {
+      debugPrint('[surface] video_texture_create failed: $e');
+    }
+    if (id == null || id < 0) {
+      // No texture on this device or in this build: software for the rest of the session.
+      debugPrint('[surface] no texture for display ${want.display}: software');
+      _surfaceEnabled = false;
+      return;
+    }
+    _surfaceTextureId = id;
+    _surfaceDisplay = want.display;
+    _surfaceW = want.w;
+    _surfaceH = want.h;
+    _surfaceEpoch++;
+    debugPrint('[surface] ${isDisplayPanel ? 'panel' : 'main'} texture=$id '
+        'display=${want.display} ${want.w}x${want.h}');
+    // The decoder starts on a key frame; Rust's video thread asks for it (also on a still
+    // screen), so nothing is asked for here.
+    final pending = _pendingSurfaceEvt;
+    _pendingSurfaceEvt = null;
+    if (pending != null) await onSurfaceEvent(pending);
+  }
+
+  Future<void> _disposeSurface() async {
+    final d = _surfaceDisplay;
+    _pendingSurfaceEvt = null;
+    if (d == null) return;
+    final wasActive = _surfaceActive;
+    _surfaceTextureId = null;
+    _surfaceDisplay = null;
+    _surfaceW = 0;
+    _surfaceH = 0;
+    _surfaceActive = false;
+    _surfaceBufX = 1;
+    _surfaceBufY = 1;
+    _surfaceEpoch++;
+    _stopSurfaceStat();
+    if (wasActive) notifyListeners();
+    try {
+      await platformFFI.invokeMethod('video_texture_dispose', d);
+    } catch (e) {
+      debugPrint('[surface] video_texture_dispose failed: $e');
+    }
+  }
+
+  /// Session end: the texture goes, and the next session reads the option again.
+  void closeSurface() {
+    _surfaceEnabled = null;
+    _surfaceFirstDone = false;
+    _surfaceQueue = _surfaceQueue.then((_) => _disposeSurface()).catchError((e) {
+      debugPrint('[surface] close failed: $e');
+    });
+  }
+
+  /// Rust's `video_surface` event: the texture of [evt]'s display has a picture now
+  /// (active, sent after the first rendered frame and after a change of the decoded
+  /// format), or its decoder is gone (the software pictures follow).
+  Future<void> onSurfaceEvent(Map<String, dynamic> evt) async {
+    final display = int.tryParse('${evt['display']}') ?? -1;
+    if (evt['active'] != 'true') {
+      // The texture keeps its last picture until the first software picture is there.
+      if (display == _surfaceDisplay) {
+        debugPrint('[surface] display=$display decoder gone: software follows');
+      }
+      return;
+    }
+    if (display != _surfaceDisplay ||
+        _surfaceTextureId == null ||
+        int.tryParse('${evt['texture']}') != _surfaceTextureId) {
+      // Not this view's current texture: a replaced one, or one whose id has not arrived.
+      _pendingSurfaceEvt = evt;
+      return;
+    }
+    _pendingSurfaceEvt = null;
+    final w = int.tryParse('${evt['w']}') ?? 0;
+    final h = int.tryParse('${evt['h']}') ?? 0;
+    final bw = int.tryParse('${evt['bw']}') ?? 0;
+    final bh = int.tryParse('${evt['bh']}') ?? 0;
+    // Padding only: anything else is not a buffer of this picture.
+    _surfaceBufX = (w > 0 && bw > w && bw - w < 64) ? bw / w : 1;
+    _surfaceBufY = (h > 0 && bh > h && bh - h < 64) ? bh / h : 1;
+    _surfaceActive = true;
+    _surfaceEpoch++;
+    // The software picture is older than the texture's from now on: never shown again.
+    final hadImage = _image != null;
+    _image?.dispose();
+    _image = null;
+    _imageDisplay = null;
+    notifyListeners();
+    debugPrint('[surface] ${isDisplayPanel ? 'panel' : 'main'} display=$display '
+        'active decoder=${evt['decoder']} picture=${w}x$h buffer=${bw}x$bh '
+        'texture=$_surfaceTextureId');
+    _startSurfaceStat();
+    final ffi = parent.target;
+    if (ffi == null) return;
+    final first = !hadImage && !_surfaceFirstDone;
+    _surfaceFirstDone = true;
+    await ffi.onEvent2UIRgba();
+    if (first) await initializeCursorAndCanvas(ffi);
+  }
+
+  // While a texture shows the picture: one line every 5 s with the frames this engine drew.
+  // Rust's `shown_fps` counts the pictures given to the texture; fewer Flutter frames than
+  // that means pictures were replaced in the texture's queue before they were drawn.
+  bool _surfaceStatOn = false;
+  int _ssFrames = 0;
+  int _ssRasterUs = 0;
+  int _ssRasterMaxUs = 0;
+  int _ssBuildUs = 0;
+  int _ssSinceMs = 0;
+
+  void _startSurfaceStat() {
+    if (_surfaceStatOn) return;
+    _surfaceStatOn = true;
+    _ssSinceMs = 0;
+    SchedulerBinding.instance.addTimingsCallback(_onSurfaceTimings);
+  }
+
+  void _stopSurfaceStat() {
+    if (!_surfaceStatOn) return;
+    _surfaceStatOn = false;
+    SchedulerBinding.instance.removeTimingsCallback(_onSurfaceTimings);
+  }
+
+  void _onSurfaceTimings(List<ui.FrameTiming> timings) {
+    if (!_surfaceActive) {
+      _ssSinceMs = 0;
+      return;
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (_ssSinceMs == 0) {
+      _ssSinceMs = now;
+      _ssFrames = 0;
+      _ssRasterUs = 0;
+      _ssRasterMaxUs = 0;
+      _ssBuildUs = 0;
+    }
+    for (final t in timings) {
+      final raster = t.rasterDuration.inMicroseconds;
+      _ssFrames++;
+      _ssRasterUs += raster;
+      if (raster > _ssRasterMaxUs) _ssRasterMaxUs = raster;
+      _ssBuildUs += t.buildDuration.inMicroseconds;
+    }
+    final span = now - _ssSinceMs;
+    if (span < 5000 || _ssFrames == 0) return;
+    debugPrint('[surface stat] ${isDisplayPanel ? 'panel' : 'main'} '
+        'd=$_surfaceDisplay flutter_fps=${(_ssFrames * 1000 / span).toStringAsFixed(1)} '
+        'raster_ms avg=${(_ssRasterUs / _ssFrames / 1000).toStringAsFixed(1)} '
+        'max=${(_ssRasterMaxUs / 1000).toStringAsFixed(1)} '
+        'build_ms avg=${(_ssBuildUs / _ssFrames / 1000).toStringAsFixed(1)}');
+    _ssSinceMs = 0;
   }
 
   String id = '';
@@ -2259,8 +2544,31 @@ class ImageModel with ChangeNotifier {
             : null;
     final seqBefore = _imageSeq;
     final statWatch = Stopwatch()..start();
+    // Android surface decoding. Events come in Rust's order, and this part runs before the
+    // first await: a software picture that comes while the texture is active was decoded
+    // after it, so the software decoder has taken over again (fallback).
+    final surfaceEpoch = _surfaceEpoch;
+    final overSurface = _surfaceActive && display == _surfaceDisplay;
+    // Software pictures without a matching texture: (re)try to get one.
+    if (isAndroid && !overSurface) syncSurface();
     try {
       await decodeAndUpdate(display, rgba);
+      if (_surfaceActive && display == _surfaceDisplay) {
+        if (overSurface && surfaceEpoch == _surfaceEpoch) {
+          if (_imageSeq != seqBefore) {
+            // The software picture is on: the texture's last one goes.
+            _surfaceActive = false;
+            notifyListeners();
+            debugPrint('[surface] display=$display software picture shown '
+                '(fallback)');
+          }
+        } else if (_imageDisplay == display) {
+          // Decoded before the texture got its picture: older than it.
+          _image?.dispose();
+          _image = null;
+          _imageDisplay = null;
+        }
+      }
       _panelStat(display, statWatch.elapsedMicroseconds);
       if (imageWatch != null && _imageSeq != seqBefore) {
         _paintLatency.addImage(imageWatch.elapsedMicroseconds);
@@ -2382,7 +2690,8 @@ class ImageModel with ChangeNotifier {
         await parent.target?.canvasModel.updateScrollStyle();
         await parent.target?.canvasModel.initializeEdgeScrollEdgeThickness();
       }
-      if (parent.target != null) {
+      // Not again after a surface picture was the first one (it would undo the user's zoom).
+      if (parent.target != null && !_surfaceFirstDone) {
         await initializeCursorAndCanvas(parent.target!);
       }
     }
@@ -2412,6 +2721,7 @@ class ImageModel with ChangeNotifier {
       final r = parent.target?.ffiModel.rect;
       if (r != null && r.width > 0 && r.height > 0) return r.size;
     }
+    if (surfaceTextureId != null) return surfaceSize;
     final i = _image;
     return i == null ? null : Size(i.width.toDouble(), i.height.toDouble());
   }
@@ -3168,7 +3478,7 @@ class CanvasModel with ChangeNotifier {
 
   // mobile only
   updateScale(double v, Offset focalPoint) {
-    if (parent.target?.imageModel.image == null) return;
+    if (parent.target?.imageModel.hasPicture != true) return;
     final s = _scale;
     _scale *= v;
     final maxs = parent.target?.imageModel.maxScale ?? 1;
@@ -3817,7 +4127,7 @@ class CursorModel with ChangeNotifier {
     }
     double dx = delta.dx;
     double dy = delta.dy;
-    if (parent.target?.imageModel.image == null) return;
+    if (parent.target?.imageModel.hasPicture != true) return;
     final scale = parent.target?.canvasModel.scale ?? 1.0;
     dx /= scale;
     dy /= scale;
@@ -4927,7 +5237,7 @@ class FFI {
           if (message.field0 == "close") {
             closed = true;
             debugPrint('Exit session event loop');
-            if (isDisplayPanel) closeDisplayPanel();
+            if (isDisplayPanel) closeDisplayPanel(reason: kPanelCloseConn);
             return;
           }
 
@@ -5042,7 +5352,7 @@ class FFI {
       model.dispose();
     }
     _terminalModels.clear();
-    if (imageModel.image != null && !isWebDesktop) {
+    if (imageModel.hasPicture && !isWebDesktop) {
       await setCanvasConfig(
           sessionId,
           cursorModel.x,
@@ -5053,6 +5363,8 @@ class FFI {
           ffiModel.pi.currentDisplay);
     }
     imageModel.callbacksOnFirstImage.clear();
+    // Not awaited: a display panel's engine may be going down with its channel.
+    imageModel.closeSurface();
     await imageModel.update(null);
     cursorModel.clear();
     ffiModel.clear();
@@ -5112,6 +5424,7 @@ class Display {
   int width = 0;
   int height = 0;
   bool cursorEmbedded = false;
+  String name = '';
   int originalWidth = kInvalidResolutionValue;
   int originalHeight = kInvalidResolutionValue;
   double _scale = 1.0;
@@ -5203,6 +5516,31 @@ class PeerInfo with ChangeNotifier {
       platformAdditions[kPlatformAdditionsIddImpl] == 'rustdesk_idd';
   bool get isAmyuniIdd =>
       platformAdditions[kPlatformAdditionsIddImpl] == 'amyuni_idd';
+
+  /// RustDesk IDD host of this fork: every virtual display has an index (1..4) that can be
+  /// plugged in and out on its own.
+  bool get isRustDeskIddTargeted =>
+      isRustDeskIdd &&
+      platformAdditions[kPlatformAdditionsVirtualDisplayTargetedUnplug] == true;
+
+  /// Windows device name of each plugged RustDesk IDD index, upper case.
+  Map<int, String> get virtualDisplayNames {
+    final raw = platformAdditions[kPlatformAdditionsVirtualDisplayNames];
+    final m = <int, String>{};
+    if (raw is Map) {
+      raw.forEach((k, v) {
+        final i = int.tryParse(k.toString());
+        if (i != null && v is String && v.isNotEmpty) m[i] = v.toUpperCase();
+      });
+    }
+    return m;
+  }
+
+  /// Refresh rate of new RustDesk IDD displays (0: not announced).
+  int get virtualDisplayHz {
+    final v = platformAdditions[kPlatformAdditionsVirtualDisplayHz];
+    return v is num ? v.toInt() : int.tryParse(v?.toString() ?? '') ?? 0;
+  }
 
   Display? tryGetDisplay({int? display}) {
     if (displays.isEmpty) {

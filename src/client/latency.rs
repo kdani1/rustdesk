@@ -189,6 +189,8 @@ pub struct DecodedFrame {
     pub decode_end: Instant,
     pub format: CodecFormat,
     pub gpu_texture: bool,
+    // Decoded by MediaCodec into the view's surface (Android surface decoding).
+    pub surface: bool,
     // Present pacing on for this display.
     pub paced: bool,
     // Decoded without output (`DecodeOutput::DecodedNoOutput`): no conversion was done.
@@ -210,6 +212,7 @@ struct StreamLatency {
     queue_len_max: usize,
     codec: Option<CodecFormat>,
     gpu_texture: bool,
+    surface: bool,
     paced: bool,
     // When the previous shown frame was handed to the UI, and the one before it; kept across
     // windows.
@@ -264,6 +267,7 @@ impl StreamLatency {
             queue_len_max: 0,
             codec: None,
             gpu_texture: false,
+            surface: false,
             paced: false,
             last_shown: None,
             prev_shown: None,
@@ -378,6 +382,7 @@ impl StreamLatency {
         self.frames += 1;
         self.codec = Some(frame.format);
         self.gpu_texture = frame.gpu_texture;
+        self.surface = frame.surface;
         self.paced = frame.paced;
         self.queue_len_max = self.queue_len_max.max(queue_len);
         let pending = frame.pts.and_then(|pts| self.take_pending(pts));
@@ -478,7 +483,7 @@ impl StreamLatency {
             let fmt_rate = |n: usize| rate(n).map_or("n/a".to_owned(), |r| format!("{:.1}", r));
             let skipped = c.decoded.saturating_sub(c.shown);
             let line = format!(
-                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} gap50={} gap_long={} gap_max_ms={} discard={} dec_fail={} via={}",
+                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} gap50={} gap_long={} gap_max_ms={} discard={} dec_fail={} via={} render={}",
                 self.display,
                 self.codec.map_or("-".to_owned(), |c| c.to_string()),
                 self.gpu_texture,
@@ -509,6 +514,15 @@ impl StreamLatency {
                 c.discarded,
                 c.failed,
                 if self.via.is_empty() { "?" } else { self.via },
+                // Which path draws the picture: MediaCodec into the view's surface, a GPU
+                // texture, or software decoding plus the RGBA hand-off.
+                if self.surface {
+                    "surface"
+                } else if self.gpu_texture {
+                    "texture"
+                } else {
+                    "soft"
+                },
             );
             let round1 = |v: f64| (v * 10.0).round() / 10.0;
             self.seq += 1;
@@ -1123,6 +1137,7 @@ mod tests {
             decode_end: at + Duration::from_millis(4),
             format: CodecFormat::H265,
             gpu_texture: true,
+            surface: false,
             paced: true,
             no_output: pts == 0,
         };
@@ -1158,6 +1173,7 @@ mod tests {
             decode_end: at + Duration::from_millis(ms),
             format: CodecFormat::H264,
             gpu_texture: true,
+            surface: false,
             paced: true,
             no_output,
         };
@@ -1182,6 +1198,7 @@ mod tests {
             decode_end: at,
             format: CodecFormat::H265,
             gpu_texture: false,
+            surface: false,
             paced: true,
             no_output: false,
         };
@@ -1206,6 +1223,7 @@ mod tests {
             decode_end: at,
             format: CodecFormat::H265,
             gpu_texture: false,
+            surface: false,
             paced: true,
             no_output: false,
         };

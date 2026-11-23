@@ -899,7 +899,10 @@ void androidChannelInit() {
       gFFI.inputModel.quest.onPlatformEvent(arguments);
       return "";
     }
-    debugPrint("flutter got android msg,$method,$arguments");
+    // Poses arrive every 500 ms and would push everything else out of logcat.
+    if (method != "panel_pose") {
+      debugPrint("flutter got android msg,$method,$arguments");
+    }
     try {
       switch (method) {
         case "panel_pose":
@@ -916,7 +919,8 @@ void androidChannelInit() {
           break;
         case "panel_closed":
           androidDisplayPanels.onPanelClosed(
-              arguments["display"] as int, arguments["sid"] as String);
+              arguments["display"] as int, arguments["sid"] as String,
+              reason: arguments["reason"] as String? ?? kPanelCloseUser);
           break;
         case "start_capture":
           {

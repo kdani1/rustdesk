@@ -703,7 +703,7 @@ String formatDurationToTime(Duration duration) {
 
 closeConnection({String? id}) {
   if (isDisplayPanel) {
-    closeDisplayPanel();
+    closeDisplayPanel(reason: kPanelCloseConn);
     return;
   }
   if (isAndroid || isIOS) {
@@ -1606,9 +1606,14 @@ FFI get gFFI => _globalFFI;
 Map<String, dynamic>? kDisplayPanelArgs;
 bool get isDisplayPanel => kDisplayPanelArgs != null;
 
+/// Why a panel closes itself, passed on to the main panel ([AndroidDisplayPanels.onPanelClosed]).
+const kPanelCloseUser = 'user'; // the user closed it: its display may go
+const kPanelCloseGone = 'gone'; // its display left the host's list
+const kPanelCloseConn = 'conn'; // the session or connection ended
+
 /// Extra display panel: detach this panel's UI session and close its window. The connection
 /// stays: it belongs to the main panel.
-Future<void> closeDisplayPanel() async {
+Future<void> closeDisplayPanel({String reason = kPanelCloseUser}) async {
   try {
     await bind
         .sessionClose(sessionId: gFFI.sessionId)
@@ -1616,7 +1621,7 @@ Future<void> closeDisplayPanel() async {
   } catch (e) {
     debugPrint('panel: sessionClose failed: $e');
   }
-  platformFFI.invokeMethod('panel_finish');
+  platformFFI.invokeMethod('panel_finish', {'reason': reason});
 }
 
 /// Main engine only (Android): the extra Quest panels, one per remote display. Each is a
@@ -1628,11 +1633,30 @@ Future<void> closeDisplayPanel() async {
 ///
 /// The session starts with the main window alone. "+" gives one more display a window (a new
 /// virtual display if every display has one), "-" takes the last one away again.
+///
+/// Two kinds of host: Amyuni (only the display added last can be unplugged, so displays go
+/// from the end of the list) and the RustDesk IDD of this fork ([isIddMode]: every virtual
+/// display has an index 1..4 and is plugged in and out on its own, so a closed window takes
+/// exactly its own display away).
 class AndroidDisplayPanels {
   static const _kSessionKey = 'quest-display-session';
   static const _kAutoOrderKey = 'quest-panel-auto-order';
 
   final _open = <int, String>{}; // display -> the panel's UI session id
+  // RustDesk IDD: display -> which display the panel was opened for ([_identity]), to find
+  // it again when the host's list shifts (a display in the middle went or came).
+  final _openId = <int, String>{};
+  // RustDesk IDD indices this session plugged in, oldest first ("-" takes the newest).
+  final _iddOrder = <int>[];
+  // RustDesk IDD indices asked for and not plugged in yet -> when.
+  final _iddAsked = <int, int>{};
+  // RustDesk IDD indices asked for ("+", restore) whose display has no window yet -> when
+  // asked. [_resync] opens it once the host lists the index (it may come in the middle of
+  // the host's list, so not by position).
+  final _iddFresh = <int, int>{};
+  // Displays whose window went while the host's list changed: they get one again.
+  final _orphans = <String>[];
+  Timer? _resyncTimer;
   final isOpenRx = false.obs;
 
   /// Bumped on every change, for the toolbar and the overview.
@@ -1669,6 +1693,12 @@ class AndroidDisplayPanels {
     _pendingAdds = 0;
     _orderAfterAdds = null;
     restoreOffered = false;
+    _openId.clear();
+    _iddOrder.clear();
+    _iddAsked.clear();
+    _iddFresh.clear();
+    _orphans.clear();
+    _resyncTimer?.cancel();
     revision.value++;
   }
 
@@ -1692,8 +1722,145 @@ class AndroidDisplayPanels {
     return l;
   }
 
+  /// The host has the RustDesk IDD backend and unplugs exactly the index it is given.
+  bool isIddMode(FFI ffi) => ffi.ffiModel.pi.isRustDeskIddTargeted;
+
+  /// RustDesk IDD index of [display], null when it is not one of its virtual displays.
+  /// By the Windows device name (DisplayInfo.name against virtual_display_names). Without
+  /// names, only a guess that cannot be wrong in the usual case: the host plugged its
+  /// virtual displays in ascending index order and lists them last; otherwise null (no
+  /// index: a close then unplugs nothing).
+  int? iddIndexOf(FFI ffi, int display) {
+    final pi = ffi.ffiModel.pi;
+    if (display < 0 || display >= pi.displays.length) return null;
+    final hostOrder = pi.RustDeskVirtualDisplays;
+    if (hostOrder.isEmpty) return null;
+    final plugged = [...hostOrder]..sort();
+    final name = pi.displays[display].name.toUpperCase();
+    final names = pi.virtualDisplayNames;
+    if (name.isNotEmpty && names.isNotEmpty) {
+      for (final e in names.entries) {
+        if (e.value == name && plugged.contains(e.key)) return e.key;
+      }
+      return null;
+    }
+    // Plugged out of index order (an index below one in use was taken again): the host's
+    // list order of the displays is not known.
+    for (var i = 0; i < plugged.length; i++) {
+      if (plugged[i] != hostOrder[i]) return null;
+    }
+    final first = pi.displays.length - plugged.length;
+    if (first < 0 || display < first) return null;
+    return plugged[display - first];
+  }
+
+  /// The display that shows RustDesk IDD index [idx], if any.
+  int? displayOfIdd(FFI ffi, int idx) {
+    for (var d = 0; d < ffi.ffiModel.pi.displays.length; d++) {
+      if (iddIndexOf(ffi, d) == idx) return d;
+    }
+    return null;
+  }
+
+  /// RustDesk IDD: the index to unplug to take [display] away, null when it must stay (not
+  /// a virtual display, the main display, or left of it: the main window's display would
+  /// shift).
+  int? removableIddIndex(FFI ffi, int display) {
+    if (!isIddMode(ffi)) return null;
+    final m = ffi.ffiModel;
+    if (!m.keyboard || m.viewOnly) return null;
+    final keep = mainDisplay(ffi);
+    if (display == keep || display < keep) return null;
+    return iddIndexOf(ffi, display);
+  }
+
+  /// Overview: whether "remove" takes the display itself away, not only its window.
+  bool removesDisplay(FFI ffi, int display) => isIddMode(ffi)
+      ? removableIddIndex(ffi, display) != null
+      : display == ffi.ffiModel.pi.displays.length - 1;
+
+  // Which display a panel shows, in a form that survives a shift of the host's list.
+  String _identity(FFI ffi, int d) {
+    final pi = ffi.ffiModel.pi;
+    if (d < 0 || d >= pi.displays.length) return '';
+    final n = pi.displays[d].name;
+    if (n.isNotEmpty) return 'n:${n.toUpperCase()}';
+    final idx = iddIndexOf(ffi, d);
+    return idx != null ? 'i:$idx' : 'd:$d';
+  }
+
+  int _findIdentity(FFI ffi, String id) {
+    final pi = ffi.ffiModel.pi;
+    if (id.length < 3) return -1;
+    final v = id.substring(2);
+    switch (id.substring(0, 2)) {
+      case 'n:':
+        return pi.displays.indexWhere((x) => x.name.toUpperCase() == v);
+      case 'i:':
+        final idx = int.tryParse(v);
+        return idx == null ? -1 : (displayOfIdd(ffi, idx) ?? -1);
+      case 'd:':
+        final d = int.tryParse(v) ?? -1;
+        return d < pi.displays.length ? d : -1;
+    }
+    return -1;
+  }
+
+  // The next RustDesk IDD index to plug in: above every index in use (the new display
+  // then comes last in the host's list), else the lowest free one.
+  int? _freeIddIndex(FFI ffi) {
+    final plugged = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _iddAsked
+        .removeWhere((i, t) => plugged.contains(i) || now - t > 30000);
+    final taken = {...plugged, ..._iddAsked.keys};
+    var top = 0;
+    for (final i in taken) {
+      if (i > top) top = i;
+    }
+    for (var i = top + 1; i <= kMaxVirtualDisplayCount; i++) {
+      if (!taken.contains(i)) return i;
+    }
+    for (var i = 1; i <= kMaxVirtualDisplayCount; i++) {
+      if (!taken.contains(i)) return i;
+    }
+    return null;
+  }
+
+  void _unplugIdd(FFI ffi, int idx) {
+    if (!ffi.ffiModel.keyboard || ffi.ffiModel.viewOnly) return;
+    _iddOrder.remove(idx);
+    _iddAsked.remove(idx);
+    _iddFresh.remove(idx);
+    debugPrint('[panel] unplug virtual display (index $idx)');
+    toggleAmyuniVirtualDisplay(ffi, false, index: idx);
+  }
+
+  // The display "-" takes away: the virtual display this session plugged in last, else
+  // the host's highest one.
+  int? _newestIddDisplay(FFI ffi) {
+    final plugged = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+    final rest = plugged.where((i) => !_iddOrder.contains(i)).toList()
+      ..sort((a, b) => b.compareTo(a));
+    for (final idx in [
+      ..._iddOrder.reversed.where(plugged.contains),
+      ...rest,
+    ]) {
+      final d = displayOfIdd(ffi, idx);
+      if (d != null && removableIddIndex(ffi, d) == idx) return d;
+    }
+    return null;
+  }
+
   bool canPlug(FFI ffi) {
     final m = ffi.ffiModel;
+    if (isIddMode(ffi)) {
+      return showVirtualDisplayMenu(ffi) &&
+          m.keyboard &&
+          !m.viewOnly &&
+          _freeIddIndex(ffi) != null &&
+          m.pi.displays.length < 4;
+    }
     return m.pi.isAmyuniIdd &&
         showVirtualDisplayMenu(ffi) &&
         m.keyboard &&
@@ -1767,6 +1934,7 @@ class AndroidDisplayPanels {
         }
         final sid = const Uuid().v4();
         _open[i] = sid;
+        _openId[i] = _identity(ffi, i);
         isOpenRx.value = true;
         final ok = await platformFFI.invokeMethod('panel_open', {
           'display': i,
@@ -1781,7 +1949,10 @@ class AndroidDisplayPanels {
           }),
         });
         debugPrint('[panel] open display $i: $ok');
-        if (ok != true && _open[i] == sid) _open.remove(i);
+        if (ok != true && _open[i] == sid) {
+          _open.remove(i);
+          _openId.remove(i);
+        }
       }
     } catch (e) {
       debugPrint('[panel] open failed: $e');
@@ -1796,6 +1967,24 @@ class AndroidDisplayPanels {
 
   void _requestPlug(FFI ffi) {
     _addAskedMs = DateTime.now().millisecondsSinceEpoch;
+    if (isIddMode(ffi)) {
+      final idx = _freeIddIndex(ffi);
+      if (idx == null) {
+        _pendingAdds = 0;
+        _orderAfterAdds = null;
+        showToast('No more displays can be added');
+        return;
+      }
+      _iddAsked[idx] = _addAskedMs;
+      _iddFresh[idx] = _addAskedMs;
+      _iddOrder
+        ..remove(idx)
+        ..add(idx);
+      debugPrint(
+          '[panel] ask the host for virtual display $idx ($_pendingAdds pending)');
+      toggleAmyuniVirtualDisplay(ffi, true, index: idx);
+      return;
+    }
     debugPrint('[panel] ask the host for one more display ($_pendingAdds pending)');
     toggleAmyuniVirtualDisplay(ffi, true);
   }
@@ -1823,6 +2012,20 @@ class AndroidDisplayPanels {
 
   /// The host's display list grew (FfiModel.handleSyncPeerInfo).
   void onDisplaysGrown(FFI ffi, int oldCount, int newCount) {
+    if (isIddMode(ffi)) {
+      // A display that came in the middle of the list shifts the ones after it, and the new
+      // one need not be at the end: [_resync] finds it by its index ([_iddFresh]) once the
+      // host's platform additions list it (they may come after the display list), then
+      // goes on with the pending adds ([_continueAdds]).
+      if (_waitingForDisplay) {
+        _pendingAdds -= newCount - oldCount;
+        if (_pendingAdds < 0) _pendingAdds = 0;
+      } else {
+        _pendingAdds = 0;
+      }
+      _scheduleResync(ffi);
+      return;
+    }
     if (!_waitingForDisplay) {
       _pendingAdds = 0;
       return;
@@ -1832,25 +2035,51 @@ class AndroidDisplayPanels {
     if (_pendingAdds < 0) _pendingAdds = 0;
     () async {
       await _openPanels(ffi, fresh);
-      if (_pendingAdds > 0) {
-        if (canPlug(ffi)) {
-          _requestPlug(ffi);
-          return;
-        }
-        _pendingAdds = 0;
-      }
-      final o = _orderAfterAdds;
-      _orderAfterAdds = null;
-      if (o != null) {
-        // The host is still settling its new display.
-        await Future.delayed(const Duration(milliseconds: 1500));
-        applyOrder(ffi, o);
-      }
+      await _continueAdds(ffi);
     }();
+  }
+
+  /// RustDesk IDD: the host's platform additions changed (plugged indices, their names).
+  void onIddAdditionsChanged(FFI ffi) {
+    if (!isAndroid || isDisplayPanel || !isIddMode(ffi)) return;
+    if (_iddFresh.isNotEmpty || isOpen) _scheduleResync(ffi);
+  }
+
+  // After the windows for newly arrived displays are open: the next pending add, or the
+  // order to apply once every one has arrived.
+  Future<void> _continueAdds(FFI ffi) async {
+    if (_pendingAdds > 0) {
+      if (canPlug(ffi)) {
+        _requestPlug(ffi);
+        return;
+      }
+      _pendingAdds = 0;
+    }
+    final o = _orderAfterAdds;
+    _orderAfterAdds = null;
+    if (o != null) {
+      // The host is still settling its new display.
+      await Future.delayed(const Duration(milliseconds: 1500));
+      if (!ffi.closed) applyOrder(ffi, o);
+    }
+  }
+
+  void _expireIddFresh() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _iddFresh.removeWhere((_, t) => now - t > 30000);
   }
 
   /// The host's display list shrank: the windows of the displays that went away go too.
   void onDisplaysShrunk(FFI ffi, int newCount) {
+    if (isIddMode(ffi)) {
+      // Any display can go, also one in the middle: the windows follow their displays
+      // ([_resync]); the windows of the displays that went away go too.
+      _scheduleResync(ffi);
+      Future.delayed(const Duration(milliseconds: 1700), () {
+        if (!ffi.closed) trimTrailing(ffi);
+      });
+      return;
+    }
     for (final d in _open.keys.where((d) => d >= newCount).toList()) {
       closePanel(ffi, d);
     }
@@ -1863,6 +2092,7 @@ class AndroidDisplayPanels {
   /// Closes one display's window. The display itself stays on the host.
   Future<void> closePanel(FFI ffi, int display) async {
     final sid = _open.remove(display);
+    _openId.remove(display);
     if (sid == null) return;
     debugPrint('[panel] close display $display');
     _changed(ffi);
@@ -1880,6 +2110,13 @@ class AndroidDisplayPanels {
   Future<void> removeDisplay(FFI ffi, int display) async {
     final pi = ffi.ffiModel.pi;
     if (display == mainDisplay(ffi)) return;
+    if (isIddMode(ffi)) {
+      // RustDesk IDD: exactly this display goes (if it is a virtual one).
+      final idx = removableIddIndex(ffi, display);
+      await closePanel(ffi, display);
+      if (idx != null) _unplugIdd(ffi, idx);
+      return;
+    }
     await closePanel(ffi, display);
     trimTrailing(ffi);
   }
@@ -1892,6 +2129,10 @@ class AndroidDisplayPanels {
   /// here again for the next one ([onDisplaysShrunk]).
   void trimTrailing(FFI ffi) {
     if (!isAndroid || isDisplayPanel || _busy || _waitingForDisplay) return;
+    if (isIddMode(ffi)) {
+      _trimIdd(ffi);
+      return;
+    }
     final pi = ffi.ffiModel.pi;
     final last = pi.displays.length - 1;
     if (last < 1 || last == mainDisplay(ffi) || _open.containsKey(last)) return;
@@ -1908,11 +2149,54 @@ class AndroidDisplayPanels {
     toggleAmyuniVirtualDisplay(ffi, false);
   }
 
+  /// RustDesk IDD: a virtual display this session plugged in that has no window goes
+  /// (one per call; the shorter list brings this here again). Displays plugged in by
+  /// someone else stay.
+  void _trimIdd(FFI ffi) {
+    // Windows are still being moved to their displays.
+    if (_resyncing || _resyncTimer?.isActive == true || _orphans.isNotEmpty) {
+      return;
+    }
+    _expireIddFresh();
+    final plugged = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+    for (final idx in _iddOrder.reversed.toList()) {
+      // Asked for and not given its window yet ([_resync]).
+      if (!plugged.contains(idx) || _iddFresh.containsKey(idx)) continue;
+      final d = displayOfIdd(ffi, idx);
+      if (d == null ||
+          _open.containsKey(d) ||
+          removableIddIndex(ffi, d) != idx) {
+        continue;
+      }
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastTrimMs < 1500) return;
+      _lastTrimMs = now;
+      debugPrint('[panel] display ${d + 1} has no window: unplug it');
+      _unplugIdd(ffi, idx);
+      return;
+    }
+  }
+
   /// "-": the display added last goes.
   Future<void> removeLast(FFI ffi) async {
     if (!isAndroid || isDisplayPanel || _busy) return;
     final pi = ffi.ffiModel.pi;
     final keep = mainDisplay(ffi);
+    if (isIddMode(ffi)) {
+      final d = _newestIddDisplay(ffi);
+      if (d != null) {
+        await removeDisplay(ffi, d);
+        return;
+      }
+      // No virtual display to unplug: the last window closes.
+      final open = _open.keys.toList()..sort();
+      if (open.isNotEmpty) {
+        await removeDisplay(ffi, open.last);
+        return;
+      }
+      showToast('Nothing to remove');
+      return;
+    }
     final last = pi.displays.length - 1;
     for (var d = last; d >= 0; d--) {
       if (d == keep) continue;
@@ -1933,6 +2217,10 @@ class AndroidDisplayPanels {
     if (!isOpen) return;
     final sids = _open.values.toList();
     _open.clear();
+    _openId.clear();
+    _orphans.clear();
+    _iddFresh.clear();
+    _resyncTimer?.cancel();
     isOpenRx.value = false;
     revision.value++;
     _pendingAdds = 0;
@@ -1948,18 +2236,116 @@ class AndroidDisplayPanels {
     platformFFI.invokeMethod('panel_close_all');
   }
 
-  /// The window of a panel is gone (its own close button, or the system one).
-  void onPanelClosed(int display, String sid) {
-    debugPrint('[panel] closed display $display');
+  /// The window of a panel is gone (its own close button, or the system one). [reason]: why
+  /// the panel closed itself ([kPanelCloseUser], [kPanelCloseGone], [kPanelCloseConn]).
+  void onPanelClosed(int display, String sid, {String reason = kPanelCloseUser}) {
+    debugPrint('[panel] closed display $display ($reason)');
     bind.sessionClose(sessionId: UuidValue(sid)); // no-op if the panel did it itself
     if (_open[display] == sid) {
       _open.remove(display);
+      final id = _openId.remove(display);
       _changed(gFFI);
-      // Closed with its own button: the display goes with its window if it is the last.
-      trimTrailing(gFFI);
+      if (isIddMode(gFFI)) {
+        // RustDesk IDD: exactly this window's display goes.
+        _afterIddPanelClosed(gFFI, display, id ?? '', reason);
+      } else {
+        // Closed with its own button: the display goes with its window if it is the last.
+        trimTrailing(gFFI);
+      }
     }
     if (gFFI.id.isNotEmpty) bind.setCurSessionId(sessionId: gFFI.sessionId);
   }
+
+  /// RustDesk IDD: a panel window went by itself. Closed by the user: its display (found by
+  /// identity, so a shift of the host's list does not matter) is unplugged. Gone because its
+  /// display left the host's list under it: the display it showed, if still there, gets a
+  /// window again ([_resync]). Closed because the session ended: nothing.
+  void _afterIddPanelClosed(FFI ffi, int display, String id, String reason) {
+    if (ffi.closed || !isIddMode(ffi) || id.isEmpty) return;
+    if (reason == kPanelCloseGone) {
+      _orphans.add(id);
+      _scheduleResync(ffi);
+      return;
+    }
+    if (reason != kPanelCloseUser) return;
+    final d = _findIdentity(ffi, id);
+    final idx = d < 0 ? null : removableIddIndex(ffi, d);
+    if (idx == null) {
+      debugPrint('[panel] display ${display + 1} stays on the host');
+      return;
+    }
+    _unplugIdd(ffi, idx);
+  }
+
+  void _scheduleResync(FFI ffi) {
+    _resyncTimer?.cancel();
+    // The host's display list and its list of virtual displays arrive separately.
+    _resyncTimer =
+        Timer(const Duration(milliseconds: 700), () => _resync(ffi));
+  }
+
+  /// RustDesk IDD: after the host's list changed, every display that had a window has one
+  /// again, with as few windows closed and opened as possible. A window whose index still
+  /// holds a display that should have one keeps it (it may now show another of them);
+  /// the others close, and the displays left without a window get a new one.
+  Future<void> _resync(FFI ffi) async {
+    if (ffi.closed || !isIddMode(ffi)) {
+      _orphans.clear();
+      return;
+    }
+    if (_busy) {
+      _scheduleResync(ffi);
+      return;
+    }
+    final keep = mainDisplay(ffi);
+    final want = <int>{};
+    for (final id in [
+      for (final e in _openId.entries)
+        if (_open.containsKey(e.key)) e.value,
+      ..._orphans,
+    ]) {
+      final j = _findIdentity(ffi, id);
+      if (j >= 0 && j != keep) want.add(j);
+    }
+    _orphans.clear();
+    // Displays asked for that the host now lists get their window, wherever they are.
+    _expireIddFresh();
+    final plugged = ffi.ffiModel.pi.RustDeskVirtualDisplays;
+    var freshArrived = false;
+    for (final idx in _iddFresh.keys.toList()) {
+      if (!plugged.contains(idx)) continue;
+      final d = displayOfIdd(ffi, idx);
+      if (d == null) continue; // its name is not known yet
+      _iddFresh.remove(idx);
+      freshArrived = true;
+      if (d != keep) want.add(d);
+    }
+    for (final k in _open.keys) {
+      if (want.contains(k)) _openId[k] = _identity(ffi, k);
+    }
+    final close = _open.keys.where((k) => !want.contains(k)).toList();
+    final open = want.where((j) => !_open.containsKey(j)).toList()..sort();
+    if (close.isEmpty && open.isEmpty) {
+      if (freshArrived) await _continueAdds(ffi);
+      return;
+    }
+    debugPrint('[panel] the host\'s displays moved: close $close, open $open');
+    _resyncing = true;
+    try {
+      for (final k in close) {
+        await closePanel(ffi, k);
+      }
+      if (open.isNotEmpty) {
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (!ffi.closed) await _openPanels(ffi, open);
+      }
+    } finally {
+      _resyncing = false;
+    }
+    if (freshArrived && !ffi.closed) await _continueAdds(ffi);
+  }
+
+  bool _resyncing = false;
 
   /// Asks the host to put its displays in one row in this left-to-right order
   /// (ToggleVirtualDisplay values from 9000 on, see connection.rs on the host).
@@ -2180,6 +2566,49 @@ class AndroidDisplayPanels {
     o.insert(o.indexOf(l) + 1, r);
     debugPrint('[panel] the laser went from $l to $r');
     applyOrder(ffi, o);
+  }
+
+  /// Once per host on a Quest with hardware decoding: ask for 72 fps (the panel's
+  /// refresh rate) at custom quality 200, which keeps about today's bits per frame.
+  /// A host whose virtual displays run at 90 Hz or more (RustDesk IDD,
+  /// virtual_display_hz) gets 90 fps instead, once more (version v2-90).
+  /// Changing the quality later in the toolbar sticks: this runs only once per version.
+  static const _kFpsDefaultsKey = 'quest-fps-defaults';
+  static const _kFpsDefaultsVersion = 'v1-72';
+  static const _kFpsDefaultsVersion90 = 'v2-90';
+  Future<void> applyQuestFrameRate(FFI ffi) async {
+    if (!isAndroid || isDisplayPanel) return;
+    if (!ffi.inputModel.quest.isQuest.value) return;
+    if (bind.mainGetLocalOption(key: kOptionEnableAndroidSurfaceDecode) == 'N') {
+      return;
+    }
+    try {
+      // Called from the peer info handler before it reads the platform additions.
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (ffi.closed) return;
+      final fps = ffi.ffiModel.pi.virtualDisplayHz >= 90 ? 90 : 72;
+      final version = fps == 90 ? _kFpsDefaultsVersion90 : _kFpsDefaultsVersion;
+      final stored =
+          bind.mainGetPeerOptionSync(id: ffi.id, key: _kFpsDefaultsKey);
+      // Once per version; a host that once got 90 is not set back to 72 when it announces
+      // no rate (another backend): the user's own choice since then stays.
+      if (stored == version ||
+          (fps == 72 && stored == _kFpsDefaultsVersion90)) {
+        return;
+      }
+      final before =
+          await bind.sessionGetImageQuality(sessionId: ffi.sessionId);
+      await bind.sessionSetImageQuality(
+          sessionId: ffi.sessionId, value: kRemoteImageQualityCustom);
+      await bind.sessionSetCustomImageQuality(
+          sessionId: ffi.sessionId, value: 200);
+      await bind.sessionSetCustomFps(sessionId: ffi.sessionId, fps: fps);
+      await bind.mainSetPeerOption(
+          id: ffi.id, key: _kFpsDefaultsKey, value: version);
+      debugPrint('[quest] frame rate: custom quality 200, $fps fps (was $before)');
+    } catch (e) {
+      debugPrint('[quest] frame rate defaults failed: $e');
+    }
   }
 
   /// At connect: a session with more windows was used on this host last time.

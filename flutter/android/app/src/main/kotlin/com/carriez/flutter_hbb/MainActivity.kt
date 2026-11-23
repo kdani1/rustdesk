@@ -77,6 +77,9 @@ class MainActivity : FlutterActivity() {
     private var isAudioStart = false
     private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
 
+    // Hardware decoding into Flutter textures of this engine (see VideoTextures).
+    private var videoTextures: VideoTextures? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         if (MainService.isReady) {
@@ -89,6 +92,7 @@ class MainActivity : FlutterActivity() {
             channelTag
         )
         initFlutterChannel(flutterMethodChannel!!)
+        videoTextures = VideoTextures(flutterEngine, "main")
         thread {
             try {
                 setCodecInfo()
@@ -231,6 +235,59 @@ class MainActivity : FlutterActivity() {
             _rdClipboardManager = RdClipboardManager(getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
             FFI.setClipboardManager(_rdClipboardManager!!)
         }
+    }
+
+    // At background level the engine closes the buffers behind its textures: the decoders
+    // must have let go of them first.
+    override fun onTrimMemory(level: Int) {
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            videoTextures?.beforeTrim()
+        }
+        super.onTrimMemory(level)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        videoTextures?.disposeAll()
+        videoTextures = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    private fun questStatus(): Map<String, Any> {
+        val out = HashMap<String, Any>()
+        try {
+            val b = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (b != null) {
+                val level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+                val scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
+                if (level >= 0 && scale > 0) out["battery"] = level * 100 / scale
+                val st = b.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+                out["charging"] = st == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    st == android.os.BatteryManager.BATTERY_STATUS_FULL
+                out["plugged"] = b.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0
+            }
+        } catch (e: Throwable) {
+            Log.w(logTag, "quest_status battery: $e")
+        }
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                out["wifi"] = true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val wi = caps.transportInfo as? android.net.wifi.WifiInfo
+                    if (wi != null) {
+                        out["rssi"] = wi.rssi
+                        out["linkMbps"] = wi.linkSpeed
+                        out["freqMHz"] = wi.frequency
+                    }
+                }
+            } else {
+                out["wifi"] = false
+            }
+        } catch (e: Throwable) {
+            Log.w(logTag, "quest_status wifi: $e")
+        }
+        return out
     }
 
     override fun onDestroy() {
@@ -653,6 +710,11 @@ class MainActivity : FlutterActivity() {
                 "quest_get_info" -> {
                     result.success(QuestInput.info())
                 }
+                "quest_status" -> {
+                    // Headset battery and Wi-Fi for the toolbar chip (no extra permission:
+                    // the battery intent is sticky, Wi-Fi comes from the active network).
+                    result.success(questStatus())
+                }
                 "quest_input_config" -> {
                     result.success(QuestInput.configure(call.arguments))
                 }
@@ -673,6 +735,21 @@ class MainActivity : FlutterActivity() {
                 }
                 "panel_close_all" -> {
                     DisplayActivity.closeAll()
+                    result.success(true)
+                }
+                "video_texture_create" -> {
+                    val a = call.arguments as? Map<*, *>
+                    val sid = a?.get("sid") as? String
+                    val d = a?.get("display") as? Int
+                    val w = a?.get("w") as? Int
+                    val h = a?.get("h") as? Int
+                    result.success(
+                        if (sid == null || d == null || w == null || h == null) -1L
+                        else videoTextures?.create(sid, d, w, h) ?: -1L
+                    )
+                }
+                "video_texture_dispose" -> {
+                    (call.arguments as? Int)?.let { videoTextures?.dispose(it) }
                     result.success(true)
                 }
                 else -> {
@@ -1036,6 +1113,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onStart() {
         super.onStart()
+        // The stop before this start took the textures' Surfaces (see VideoTextures.reattach).
+        videoTextures?.reattach()
         poseWatcher.start()
         stopService(Intent(this, FloatingWindowService::class.java))
     }

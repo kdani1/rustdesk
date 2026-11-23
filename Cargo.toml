@@ -30,6 +30,9 @@ default = ["use_dasp"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
+# Android viewer: MediaCodec decodes into a Surface shown as a Flutter Texture; the software
+# decoder stays the automatic fallback (local option enable-android-surface-decode).
+surface-decode = ["scrap/surface-decode"]
 drm = ["scrap/drm"]
 # The display wake, as its OWN compile gate on top of `drm`. Everything else in the drm backend
 # READS (it captures a scanout); the wake WRITES, injecting one synthetic pointer event from the

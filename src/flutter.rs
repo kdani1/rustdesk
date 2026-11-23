@@ -642,6 +642,13 @@ impl FlutterHandler {
                 let scaled_width = (d.width as f64 / d.scale).round() as i32;
                 h.insert("scaled_width", scaled_width);
             }
+            // Fork: the Windows device name too, so that a viewer can map a display to the
+            // host's virtual display index (platform addition virtual_display_names).
+            let mut h: serde_json::Map<String, serde_json::Value> = h
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), json!(v)))
+                .collect();
+            h.insert("name".to_owned(), json!(d.name));
             msg_vec.push(h);
         }
         serde_json::ser::to_string(&msg_vec).unwrap_or("".to_owned())
@@ -1115,6 +1122,68 @@ impl InvokeUiSession for FlutterHandler {
         if let Some(ui_handoff) = ui_handoff {
             crate::client::latency::on_ui_taken(ui_handoff);
         }
+    }
+
+    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+    fn video_surface(
+        &self,
+        display: usize,
+    ) -> Option<scrap::android::surface_decoder::SurfaceRef> {
+        let handlers = self.session_handlers.read().unwrap();
+        let mut viewers = handlers
+            .iter()
+            .filter(|(_, h)| h.displays.contains(&display));
+        let (sid, h) = viewers.next()?;
+        // Two views of one display share the software picture, and so does a view that shows
+        // several displays (the merged all-displays view).
+        if viewers.next().is_some() || h.displays.len() != 1 {
+            return None;
+        }
+        scrap::android::surface_decoder::get_surface(&sid.to_string(), display)
+    }
+
+    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+    fn on_video_surface(
+        &self,
+        display: usize,
+        active: bool,
+        info: Option<&scrap::android::surface_decoder::SurfaceInfo>,
+    ) {
+        let (w, h, bw, bh, decoder, texture) = info.map_or((0, 0, 0, 0, "", -1), |i| {
+            (
+                i.width,
+                i.height,
+                i.buf_width,
+                i.buf_height,
+                i.name.as_str(),
+                i.texture,
+            )
+        });
+        let event = [
+            ("display", display.to_string()),
+            ("active", active.to_string()),
+            ("texture", texture.to_string()),
+            ("w", w.to_string()),
+            ("h", h.to_string()),
+            ("bw", bw.to_string()),
+            ("bh", bh.to_string()),
+            ("decoder", decoder.to_string()),
+        ];
+        // Only the views that show this display: every UI session of the connection has its
+        // own engine and its own texture.
+        let sids: Vec<SessionID> = self
+            .session_handlers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.displays.contains(&display))
+            .map(|(sid, _)| *sid)
+            .collect();
+        if sids.is_empty() {
+            return;
+        }
+        let sids: Vec<&SessionID> = sids.iter().collect();
+        self.push_event_to("video_surface", &event, &sids);
     }
 
     fn update_record_status(&self, start: bool) {

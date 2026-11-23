@@ -302,6 +302,14 @@ pub const OPTION_ENABLE_VIEWER_PRIORITY_BOOST: &str = "enable-viewer-priority-bo
 // converts every frame, as before). Read when a display's video thread starts. See
 // docs/LATENCY-METRICS.md.
 pub const OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT: &str = "enable-viewer-decode-no-output";
+// Android viewer, local option: H.264/H.265 are decoded by the device's hardware decoder
+// (MediaCodec) straight into a Surface that Flutter shows as a Texture, instead of software
+// decoding plus a copy of every frame to Dart. The software path stays the automatic fallback
+// (no surface, two viewers of one display, the all-displays view, recording, any codec error,
+// no output for 1 s). On by default ("N" turns it off). Read when a display's video thread starts
+// and when a view starts, so a change applies from the next connection. See
+// docs/LATENCY-METRICS.md.
+pub const OPTION_ENABLE_ANDROID_SURFACE_DECODE: &str = "enable-android-surface-decode";
 // Windows viewer, local option: a display's decoder thread registers with the Multimedia Class
 // Scheduler as a "Playback" task while it decodes on the GPU (D3D11 texture output), without
 // changing the process priority class. On by default ("N" turns it off). Read when a display's
@@ -524,6 +532,7 @@ pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
     OPTION_ENABLE_FPS_CAP_SPLIT,
     OPTION_ENABLE_VIEWER_PRIORITY_BOOST,
     OPTION_ENABLE_VIEWER_DECODE_NO_OUTPUT,
+    OPTION_ENABLE_ANDROID_SURFACE_DECODE,
     OPTION_ENABLE_VIEWER_MMCSS,
     OPTION_AUDIO_TARGET_MS,
     OPTION_ENABLE_UDP_VIDEO,
