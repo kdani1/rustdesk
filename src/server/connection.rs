@@ -5368,6 +5368,37 @@ impl Connection {
             return;
         }
 
+        // Fork: with the RustDesk IDD backend ("virtual-display-impl" = "rustdesk") the display
+        // value is an index: on: 1..=4 plugs that one in, 0 the lowest free one; off: 1..=4
+        // plugs out exactly that one, 0 the newest, -1 all. Driver calls can take seconds (a
+        // cold device), so they run on a worker and only an error comes back here.
+        #[cfg(windows)]
+        if virtual_display_manager::is_rustdesk_idd() {
+            if t.on && !virtual_display_manager::is_virtual_display_supported() {
+                self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))
+                    .await;
+                return;
+            }
+            let mut inner = self.inner.clone();
+            let on = t.on;
+            virtual_display_manager::rustdesk_idd::toggle_queued(on, t.display, move |e| {
+                let mut msg_out = Message::new();
+                msg_out.set_message_box(MessageBox {
+                    msgtype: "nook-nocancel-hasclose".to_owned(),
+                    title: "Virtual display".to_owned(),
+                    text: if on {
+                        format!("Failed to plug in virtual display: {}", e)
+                    } else {
+                        format!("Failed to plug out virtual displays: {}", e)
+                    },
+                    link: "".to_owned(),
+                    ..Default::default()
+                });
+                inner.send(Arc::new(msg_out));
+            });
+            return;
+        }
+
         if t.on {
             if !virtual_display_manager::is_virtual_display_supported() {
                 self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))

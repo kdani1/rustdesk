@@ -3424,6 +3424,58 @@ pub(super) fn change_resolution_directly(
     }
 }
 
+/// Fork: (width, height, refresh rate) of the current mode of display `name`.
+pub fn current_display_mode(name: &str) -> ResultType<(u32, u32, u32)> {
+    let device_name = str_to_device_name(name);
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as _;
+        if EnumDisplaySettingsW(device_name.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm) == 0 {
+            bail!(
+                "failed to get current mode, error {}",
+                io::Error::last_os_error()
+            );
+        }
+        Ok((
+            dm.dmPelsWidth as _,
+            dm.dmPelsHeight as _,
+            dm.dmDisplayFrequency as _,
+        ))
+    }
+}
+
+/// Fork: like [change_resolution_directly], with the refresh rate too (DM_DISPLAYFREQUENCY),
+/// for virtual displays whose driver offers that rate.
+pub fn change_resolution_hz(name: &str, width: usize, height: usize, hz: u32) -> ResultType<()> {
+    let device_name = str_to_device_name(name);
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as _;
+        dm.dmPelsWidth = width as _;
+        dm.dmPelsHeight = height as _;
+        dm.dmDisplayFrequency = hz as _;
+        dm.dmFields = DM_PELSHEIGHT | DM_PELSWIDTH | DM_DISPLAYFREQUENCY;
+        let res = ChangeDisplaySettingsExW(
+            device_name.as_ptr(),
+            &mut dm,
+            NULL as _,
+            CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_RESET,
+            NULL,
+        );
+        if res != DISP_CHANGE_SUCCESSFUL {
+            bail!(
+                "ChangeDisplaySettingsExW {}x{}@{} failed, res={}, error {}",
+                width,
+                height,
+                hz,
+                res,
+                io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Puts the named displays next to each other in one row, left to right in the given order,
 /// tops aligned (see [arrange_displays]).
 pub fn arrange_displays_in_row(names: &[String]) -> ResultType<()> {

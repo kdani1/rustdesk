@@ -105,7 +105,7 @@ fn run(receiver: mpsc::Receiver<()>) {
         };
         let enabled = holders > 0 && Config::get_option(OPTION) != "N";
         if enabled && counted.map_or(true, |t| t.elapsed() >= RECHECK) {
-            displays = crate::virtual_display_manager::amyuni_idd::display_counts();
+            displays = crate::virtual_display_manager::virtual_display_counts();
             counted = Some(Instant::now());
         }
         let (virtual_displays, all_displays) = displays;

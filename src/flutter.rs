@@ -642,6 +642,13 @@ impl FlutterHandler {
                 let scaled_width = (d.width as f64 / d.scale).round() as i32;
                 h.insert("scaled_width", scaled_width);
             }
+            // Fork: the Windows device name too, so that a viewer can map a display to the
+            // host's virtual display index (platform addition virtual_display_names).
+            let mut h: serde_json::Map<String, serde_json::Value> = h
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), json!(v)))
+                .collect();
+            h.insert("name".to_owned(), json!(d.name));
             msg_vec.push(h);
         }
         serde_json::ser::to_string(&msg_vec).unwrap_or("".to_owned())

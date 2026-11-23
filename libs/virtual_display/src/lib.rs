@@ -94,7 +94,15 @@ lazy_static::lazy_static! {
 
 #[cfg(target_os = "windows")]
 fn get_lib_name() -> String {
-    format!("{}.dll", LIB_NAME_VIRTUAL_DISPLAY)
+    // Full path next to the exe: release builds call SetDefaultDllDirectories(SYSTEM32 |
+    // USER_DIRS), so a bare name is never looked up in the application folder.
+    let name = format!("{}.dll", LIB_NAME_VIRTUAL_DISPLAY);
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(&name)))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(name)
 }
 
 #[cfg(target_os = "linux")]
@@ -183,6 +191,13 @@ pub fn plug_out_monitor(monitor_index: u32) -> ResultType<()> {
     f(monitor_index)?;
     MONITOR_INDICES.lock().unwrap().remove(&monitor_index);
     Ok(())
+}
+
+/// Fork: forgets that `monitor_index` is plugged in without calling the driver (it is known to
+/// be gone), so that the next `plug_in_monitor` of that index calls the driver again.
+#[cfg(windows)]
+pub fn forget_monitor(monitor_index: u32) {
+    MONITOR_INDICES.lock().unwrap().remove(&monitor_index);
 }
 
 #[cfg(windows)]

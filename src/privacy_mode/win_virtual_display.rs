@@ -321,13 +321,15 @@ impl PrivacyModeImpl {
         Ok(())
     }
 
+    // Fork: 1920x1080 at the configured rate (`virtual-display-hz`), plus 72/60 Hz and
+    // 2560x1440. Only the RustDesk IDD backend uses the modes.
     #[inline]
     fn default_display_modes() -> Vec<MonitorMode> {
-        vec![MonitorMode {
-            width: 1920,
-            height: 1080,
-            sync: 60,
-        }]
+        virtual_display_manager::display_modes(
+            1920,
+            1080,
+            virtual_display_manager::virtual_display_hz(),
+        )
     }
 
     // This function will wait at most 6 seconds for the virtual displays to be ready.

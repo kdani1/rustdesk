@@ -539,6 +539,17 @@ pub fn temp_ignore_displays_changed() -> SimpleCallOnReturn {
     }
 }
 
+/// Fork: sends the display list (with fresh platform additions) to the viewers again, e.g. once
+/// the device names of new virtual displays are known.
+pub fn resync_displays() {
+    if !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
+        let mut sync = SYNC_DISPLAYS.lock().unwrap();
+        if !sync.displays.is_empty() {
+            sync.is_synced = false;
+        }
+    }
+}
+
 // This function is really useful, though a duplicate check if display changed.
 // The video server will then send the following messages to the client:
 //  1. the supported resolutions of the {idx} display
