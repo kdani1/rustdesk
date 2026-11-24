@@ -65,7 +65,13 @@ final isWebOnLinux = isWebOnLinux_;
 final isWebOnMacOs = isWebOnMacOS_;
 var isMobile = isAndroid || isIOS;
 var version = '';
+// Fork: the build number of this app (pubspec version after '+'), shown in About.
+var buildNumber = '';
 int androidVersion = 0;
+
+/// Fork: [v] with this app's build number appended, as "1.5.0 (build 107)".
+String withBuildNumber(String v) =>
+    buildNumber.isEmpty ? v : '$v (build $buildNumber)';
 
 // Only used on Linux.
 // `windowManager.setResizable(false)` will reset the window size to the default size on Linux.
@@ -1665,6 +1671,10 @@ class AndroidDisplayPanels {
   // Displays asked from the host ("+", session restore) that have not arrived yet.
   int _pendingAdds = 0;
   int _addAskedMs = 0;
+  // When this connection's first picture came ([onFirstImage]), and a count of connections
+  // so that a plug-in held for the host ([_whenHostTakesPlug]) never reaches the next one.
+  int _firstImageMs = 0;
+  int _connection = 0;
   // Left-to-right order to apply once every pending display has its window.
   List<int>? _orderAfterAdds;
   int _lastAutoOrderMs = 0;
@@ -1699,6 +1709,8 @@ class AndroidDisplayPanels {
     _open.clear();
     isOpenRx.value = false;
     _pendingAdds = 0;
+    _firstImageMs = 0;
+    _connection++;
     _orderAfterAdds = null;
     restoreOffered = false;
     _openId.clear();
@@ -2026,13 +2038,50 @@ class AndroidDisplayPanels {
       _iddOrder
         ..remove(idx)
         ..add(idx);
-      debugPrint(
-          '[panel] ask the host for virtual display $idx ($_pendingAdds pending)');
-      toggleAmyuniVirtualDisplay(ffi, true, index: idx);
+      _whenHostTakesPlug(ffi, () {
+        // The 30 s waits ([_waitingForDisplay], [_iddAsked], [_iddFresh]) start at the send.
+        _addAskedMs = DateTime.now().millisecondsSinceEpoch;
+        if (_iddAsked.containsKey(idx)) _iddAsked[idx] = _addAskedMs;
+        if (_iddFresh.containsKey(idx)) _iddFresh[idx] = _addAskedMs;
+        debugPrint(
+            '[panel] ask the host for virtual display $idx ($_pendingAdds pending)');
+        toggleAmyuniVirtualDisplay(ffi, true, index: idx);
+      });
       return;
     }
     debugPrint('[panel] ask the host for one more display ($_pendingAdds pending)');
     toggleAmyuniVirtualDisplay(ffi, true);
+  }
+
+  /// The main session's first picture of this connection arrived (FFI.onEvent2UIRgba).
+  void onFirstImage() {
+    if (!isDisplayPanel) _firstImageMs = DateTime.now().millisecondsSinceEpoch;
+  }
+
+  // A RustDesk IDD host drops a plug-in that comes within 3 s of login or of its first frame
+  // to this viewer (it takes it for a viewer replaying its remembered displays,
+  // src/server/connection.rs toggle_virtual_display), and says nothing. So a "+" or restore
+  // that early is held until 3.5 s after the first picture, which comes after both.
+  void _whenHostTakesPlug(FFI ffi, void Function() send) {
+    final conn = _connection;
+    void attempt() {
+      if (ffi.closed || conn != _connection) return;
+      if (ffi.ffiModel.waitForFirstImage.isTrue) {
+        Future.delayed(const Duration(milliseconds: 300), attempt);
+        return;
+      }
+      final wait = _firstImageMs == 0
+          ? 0
+          : _firstImageMs + 3500 - DateTime.now().millisecondsSinceEpoch;
+      if (wait > 0) {
+        debugPrint('[panel] virtual display request held ${wait}ms for the host');
+        Future.delayed(Duration(milliseconds: wait), attempt);
+        return;
+      }
+      send();
+    }
+
+    attempt();
   }
 
   /// "+": one more display in a window of its own. A display without a window gets one;

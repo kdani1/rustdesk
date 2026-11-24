@@ -1157,7 +1157,7 @@ fn physical_display_back(
 /// resolved at plug-in time is still ours), so the real display must be an active output of
 /// another driver.
 #[cfg(windows)]
-fn physical_display_back_now() -> bool {
+pub(crate) fn physical_display_back_now() -> bool {
     let Ok(all) = Display::all() else {
         return false;
     };

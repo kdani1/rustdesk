@@ -1605,6 +1605,12 @@ impl<T: InvokeUiSession> Remote<T> {
         if !self.peer_info.is_support_virtual_display() {
             return;
         }
+        // Fork: a RustDesk IDD host plugs in a display for a PC without one by itself, and
+        // the user adds the others with "+"; replaying the remembered ones at every login
+        // would plug in a display next to the real one each time.
+        if self.peer_info.idd_impl == "rustdesk_idd" {
+            return;
+        }
         let lc = self.handler.lc.read().unwrap();
         let displays = lc.get_option("virtual-display");
         for d in displays.split(',') {

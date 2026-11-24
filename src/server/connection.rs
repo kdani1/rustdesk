@@ -85,6 +85,12 @@ const ID_WHITELIST_FAILURE_DECAY_MINUTES: i32 = 10;
 /// credential prompt still unanswered. The controller reconnects on its own and the prompt
 /// comes back. A connection that says nothing at all goes at the 30 s idle timeout already.
 const LOGIN_GRACE: Duration = Duration::from_secs(180);
+
+/// Fork: a virtual display plug-in that comes this soon after authorization, or after the
+/// first video frame queued for the connection, is taken for the viewer replaying its
+/// remembered displays, not for a "+" (see toggle_virtual_display).
+#[cfg(windows)]
+const LOGIN_VIRTUAL_DISPLAY_REPLAY_WINDOW: Duration = Duration::from_secs(3);
 /// Connections between accept and authorization, across every transport: the resource bound.
 /// At this many a further arrival is refused and the oldest is told to go, one at a time.
 const MAX_UNAUTHORIZED_CONNS: usize = 64;
@@ -245,6 +251,9 @@ pub struct ConnInner {
     // Primary viewer rule (roadmap M18): the queue and input state the capture thread, the
     // video writer and the policy share; None for the viewer side's audio inner.
     video_gate: Option<Arc<super::video_qos::primary::VideoGate>>,
+    // Fork: when the first video frame was queued for this connection. A viewer replays its
+    // remembered virtual displays once that frame is shown (toggle_virtual_display).
+    first_video_at: Arc<std::sync::OnceLock<Instant>>,
 }
 
 struct InputMouse {
@@ -374,6 +383,10 @@ pub struct Connection {
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
+    // Fork: when this connection authorized; a viewer's stored virtual displays replayed right
+    // after login are told apart from a "+" by it (toggle_virtual_display).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    authorized_at: Option<Instant>,
     // The place among the unauthorized connections; given back at authorization.
     unauthorized_id: Option<UnauthorizedID>,
     require_2fa: Option<totp_rs::TOTP>,
@@ -612,6 +625,7 @@ impl ConnInner {
             tx,
             tx_video,
             video_gate: None,
+            first_video_at: Default::default(),
         }
     }
 
@@ -694,6 +708,13 @@ impl Subscriber for ConnInner {
                     return;
                 }
             }
+        }
+        if tx_by_video
+            && self.tx_video.is_some()
+            && self.first_video_at.get().is_none()
+            && matches!(&msg.union, Some(message::Union::VideoFrame(_)))
+        {
+            let _ = self.first_video_at.set(Instant::now());
         }
         let tx = if tx_by_video {
             self.tx_video.as_mut()
@@ -779,6 +800,7 @@ impl Connection {
                 tx: Some(tx),
                 tx_video: Some(tx_video),
                 video_gate: Some(super::video_qos::primary::register(id)),
+                first_video_at: Default::default(),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
             awaiting_2fa: false,
@@ -799,6 +821,7 @@ impl Connection {
             port_forward_address: "".to_owned(),
             tx_to_cm,
             authorized: false,
+            authorized_at: None,
             unauthorized_id: Some(unauthorized),
             keyboard: Self::permission(keys::OPTION_ENABLE_KEYBOARD, &control_permissions),
             clipboard: Self::permission(keys::OPTION_ENABLE_CLIPBOARD, &control_permissions),
@@ -2349,6 +2372,7 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        self.authorized_at = Some(Instant::now());
         self.unauthorized_id = None;
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
@@ -5409,6 +5433,27 @@ impl Connection {
         // cold device), so they run on a worker and only an error comes back here.
         #[cfg(windows)]
         if virtual_display_manager::is_rustdesk_idd() {
+            // Fork: a viewer replays the virtual displays it remembers for this peer (its
+            // "virtual-display" option) once the first frame of a session is shown. Next to a
+            // real display that plugs in a display nobody asked for this time, so such a
+            // replay is dropped: one that comes within the window after authorization or after
+            // the first video frame queued here (a slow capture start delays the replay). A
+            // "+" later in the session, and a PC without a real display, still plug in; the
+            // Quest viewer holds an early "+" or restore until the window has passed.
+            let in_window = |at: Option<Instant>| {
+                at.map_or(false, |at| at.elapsed() < LOGIN_VIRTUAL_DISPLAY_REPLAY_WINDOW)
+            };
+            if t.on
+                && (in_window(self.authorized_at)
+                    || in_window(self.inner.first_video_at.get().copied()))
+                && display_service::physical_display_back_now()
+            {
+                log::info!(
+                    "LATENCY vdisplay: ignored login replay of virtual display {} (a real display exists)",
+                    t.display
+                );
+                return;
+            }
             if t.on && !virtual_display_manager::is_virtual_display_supported() {
                 self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))
                     .await;

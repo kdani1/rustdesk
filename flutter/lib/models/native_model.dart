@@ -242,6 +242,11 @@ class PlatformFFI {
       debugPrintStack(label: 'initialize failed: $e');
     }
     version = await getVersion();
+    try {
+      buildNumber = (await PackageInfo.fromPlatform()).buildNumber;
+    } catch (e) {
+      debugPrint('Failed to read the build number: $e');
+    }
   }
 
   Future<bool> tryHandle(Map<String, dynamic> evt) async {
