@@ -888,6 +888,10 @@ impl Connection {
             video_feedback_log: Default::default(),
             video_feedback: None,
         };
+        // Game mode: check for the virtual pad driver now, so Features.gamepad is known by the
+        // time the PeerInfo is built (see gamepad.rs).
+        #[cfg(windows)]
+        super::gamepad::prime();
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
             conn.closed = true;
@@ -1153,6 +1157,8 @@ impl Connection {
                                 if !conn.peer_keyboard_enabled() {
                                     // No longer in control of the mouse (see cursor_hider.rs).
                                     super::cursor_hider::release(conn.inner.id());
+                                    // Nor of its virtual pad (see gamepad.rs).
+                                    super::gamepad::release(conn.inner.id(), "permission");
                                 }
                                 conn.send_permission(Permission::Keyboard, enabled).await;
                                 if let Some(s) = conn.server.upgrade() {
@@ -2555,11 +2561,25 @@ impl Connection {
                 crate::video_feedback::host::fec_adaptive_option()
             );
         }
+        // Game mode (gamepad.rs): remote control only. 1 = ViGEmBus usable, 2 = no driver; the
+        // check is cached and primed when the connection opened, so this does not hold the login.
+        #[cfg(windows)]
+        let gamepad = if self.file_transfer.is_none() && !self.terminal && !self.view_camera {
+            super::gamepad::availability()
+        } else {
+            0
+        };
+        #[cfg(not(windows))]
+        let gamepad = 0;
+        if gamepad > 0 {
+            log::info!("LATENCY gamepad conn={} Features.gamepad={}", self.inner.id, gamepad);
+        }
         pi.features = Some(Features {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
             video_feedback,
+            gamepad,
             ..Default::default()
         })
         .into();
@@ -4416,6 +4436,17 @@ impl Connection {
                     Some(misc::Union::VideoFeedback(f)) => {
                         self.on_video_feedback(&f);
                     }
+                    // Game mode: the viewer's virtual Xbox 360 pad (gamepad.rs). Input like the
+                    // keyboard and mouse: remote control with the keyboard permission only.
+                    #[allow(unused_variables)]
+                    Some(misc::Union::GamepadState(g)) => {
+                        if self.is_authed_remote_conn() && self.peer_keyboard_enabled() {
+                            self.inner.on_input();
+                            self.update_auto_disconnect_timer();
+                            #[cfg(windows)]
+                            super::gamepad::apply(self.inner.id(), g);
+                        }
+                    }
                     Some(misc::Union::VideoReceived(_)) => {
                         video_service::notify_video_frame_fetched_by_conn_id(
                             self.inner.id,
@@ -5731,6 +5762,7 @@ impl Connection {
                 #[cfg(windows)]
                 if !self.peer_keyboard_enabled() {
                     super::cursor_hider::release(self.inner.id());
+                    super::gamepad::release(self.inner.id(), "keyboard disabled");
                 }
                 if let Some(s) = self.server.upgrade() {
                     s.write().unwrap().subscribe(
@@ -8212,6 +8244,8 @@ mod raii {
             clear_relative_mouse_active(self.0);
             #[cfg(windows)]
             crate::server::cursor_hider::release(self.0);
+            #[cfg(windows)]
+            crate::server::gamepad::release(self.0, "connection closed");
             AUTHED_CONNS.lock().unwrap().retain(|c| c.conn_id != self.0);
             let remote_count = AUTHED_CONNS
                 .lock()

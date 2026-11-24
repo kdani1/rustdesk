@@ -168,6 +168,8 @@ remote_printer = { path = "libs/remote_printer" }
 impersonate_system = { git = "https://github.com/rustdesk-org/impersonate-system" }
 shared_memory = "0.12"
 tauri-winrt-notification = "0.1"
+# Game mode: virtual Xbox 360 pad through the ViGEmBus driver (src/server/gamepad.rs).
+vigem-client = "=0.1.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

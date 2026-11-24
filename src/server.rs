@@ -81,6 +81,8 @@ mod text_focus;
 #[cfg(windows)]
 mod cursor_hider;
 #[cfg(windows)]
+mod gamepad;
+#[cfg(windows)]
 mod key_refresh;
 #[cfg(windows)]
 mod virtual_fps;
