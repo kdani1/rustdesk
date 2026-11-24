@@ -213,6 +213,17 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
             return Err(io::Error::last_os_error().into());
         }
         if ci.flags & CURSOR_SHOWING == 0 {
+            // With no mouse attached Windows hides the cursor everywhere (flags 0, hCursor 0),
+            // and injected input does not bring it back. Sending nothing would leave a viewer
+            // without any shape (the desktop viewer then draws its placeholder dot), so report
+            // the standard arrow instead. A game that hides and confines the pointer keeps the
+            // hidden state (is_pointer_captured): its viewer must not get a cursor back.
+            if GetSystemMetrics(SM_MOUSEPRESENT) == 0 && !is_pointer_captured() {
+                let arrow = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+                if !arrow.is_null() {
+                    return Ok(Some(arrow as _));
+                }
+            }
             Ok(None)
         } else {
             Ok(Some(ci.hCursor as _))
