@@ -43,4 +43,9 @@ object FFI {
     external fun xrStop()
     external fun xrRequestExit()
     external fun xrLifecycle(resumed: Boolean)
+    // Quest 2D gamepad mode (QuestGamepadCapture.kt, Rust src/client/gamepad_jni.rs): one full
+    // Misc.gamepad_state snapshot for UI session [sid] (XInput buttons, triggers 0-255, sticks
+    // int16, up = +Y). Returns the host's Features.gamepad (sent only when 1), -2 before its
+    // PeerInfo, -1 without such a session.
+    external fun sendGamepad(sid: String, seq: Int, buttons: Int, lt: Int, rt: Int, lx: Int, ly: Int, rx: Int, ry: Int, off: Boolean): Int
 }

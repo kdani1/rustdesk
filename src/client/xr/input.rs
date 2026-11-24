@@ -335,9 +335,20 @@ pub struct Input {
     logged: PadState,
     logged_at: Option<Instant>,
     chords: Vec<Chord>,
+    diag_at: std::cell::Cell<Option<Instant>>,
 }
 
 impl Input {
+    /// One input diagnostic line every 2 s while focused.
+    fn diag_due(&self) -> bool {
+        let now = Instant::now();
+        let due = self.diag_at.get().map_or(true, |t| now.saturating_duration_since(t) >= Duration::from_secs(2));
+        if due {
+            self.diag_at.set(Some(now));
+        }
+        due
+    }
+
     /// Creates the actions and suggests the Touch controller bindings. Must run before the
     /// action set is attached to the session ([`Input::attach`], once per session).
     pub fn new(instance: &xr::Instance) -> xr::Result<Self> {
@@ -357,6 +368,7 @@ impl Input {
         let stick_click = set.create_action::<bool>("stick_click", "Thumbstick click", &hands)?;
         let haptic = set.create_action::<xr::Haptic>("haptic", "Vibration", &hands)?;
         let p = |s: &str| instance.string_to_path(s);
+        xlog_i("suggesting Touch controller bindings");
         instance.suggest_interaction_profile_bindings(
             profile,
             &[
@@ -399,6 +411,7 @@ impl Input {
             logged: PadState::default(),
             logged_at: None,
             chords: Vec::new(),
+            diag_at: std::cell::Cell::new(None),
         })
     }
 
@@ -434,11 +447,18 @@ impl Input {
         let trig_l = self.trigger.state(session, l)?;
         let trig_r = self.trigger.state(session, r)?;
         let v2 = |s: xr::ActionState<xr::Vector2f>| (s.current_state.x, s.current_state.y);
+        let any_active = trig_l.is_active || trig_r.is_active;
+        if self.diag_due() {
+            xlog_i(&format!(
+                "input diag: trigger active l={} r={} controllers={:?} lt={:.2} rt={:.2}",
+                trig_l.is_active, trig_r.is_active, self.controllers,
+                trig_l.current_state, trig_r.current_state
+            ));
+        }
         Ok(Raw {
-            active: (trig_l.is_active && self.controllers[0])
-                || (trig_r.is_active && self.controllers[1])
-                // Before the first INTERACTION_PROFILE_CHANGED: trust is_active alone.
-                || ((trig_l.is_active || trig_r.is_active) && self.controllers == [false; 2]),
+            // Any active binding counts: on Horizon v2.10 the profile check alone let the
+            // whole pad stay neutral (no button ever logged with the controllers bound).
+            active: any_active,
             a: self.a.state(session, n)?.current_state,
             b: self.b.state(session, n)?.current_state,
             x: self.x.state(session, n)?.current_state,

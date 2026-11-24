@@ -79,6 +79,8 @@ object GameMode {
         exitPath = ""
         xrResumed = false
         xrResumedOnce = false
+        // 2D gamepad mode: the capture release this focus move causes is not the Meta button.
+        QuestGamepadCapture.noteOwnFocus("game mode enter")
         return try {
             from.startActivity(Intent(from, XrActivity::class.java).apply {
                 putExtra(XrActivity.EXTRA_SID, sid)
@@ -89,6 +91,16 @@ object GameMode {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             })
             Log.i(TAG, "enter sid=$sid display=$display ${w}x$h pad=$pad")
+            // Horizon OS keeps a visible 2D panel in front: the immersive view then stays
+            // VISIBLE and never gets FOCUSED (no input, no picture; measured on v2.10). Move
+            // the panels' tasks behind it. They stay alive (onStop, not onDestroy), so the
+            // session and the Dart page survive; the exit brings MainActivity back.
+            handler.postDelayed({
+                if (!active) return@postDelayed
+                val ok = try { from.moveTaskToBack(true) } catch (e: Exception) { false }
+                Log.i(TAG, "game mode: main task to back: $ok")
+                DisplayActivity.moveAllToBack()
+            }, 400)
             true
         } catch (e: Exception) {
             Log.e(TAG, "enter: XrActivity did not start: $e")
@@ -256,6 +268,11 @@ class XrActivity : Activity() {
         GameMode.xrLifecycle(this, false)
         if (started) FFI.xrLifecycle(false)
         super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) QuestGamepadCapture.noteOwnFocus("XrActivity")
     }
 
     override fun onStop() {

@@ -125,6 +125,15 @@ class QuestInputModel {
   /// system keyboard has none of them. On by default; toggled from the toolbar.
   final keyBar = true.obs;
 
+  /// Gamepad mode (QuestGamepadCapture.kt): Horizon OS routes the Touch controllers to this
+  /// panel as a virtual gamepad, sent on to the host's virtual Xbox pad. True while the system
+  /// holds the capture for us (Kotlin's on_state_changed "gamepad_capture"); the Meta button
+  /// ends it.
+  final gamepadCapture = false.obs;
+  bool _gamepadWanted = false;
+  Timer? _gamepadRefuseTimer;
+  int _gamepadHost = -100;
+
   /// Called after a Quest pointer left click/drag is released (auto-keyboard hook), with the
   /// release position in local logical px.
   void Function(Offset localPos)? onLeftClick;
@@ -199,8 +208,82 @@ class QuestInputModel {
         'Left stick click hides this.');
   }
 
+  /// Quest menu toggle. On: asks the system for the controllers for session [sid]; no grant
+  /// within 1 s counts as refused (the system only grants it to the focused window).
+  Future<void> setGamepadMode(bool on, String sid) async {
+    _gamepadRefuseTimer?.cancel();
+    _gamepadRefuseTimer = null;
+    _gamepadWanted = on;
+    if (!on) {
+      await _gamepadCall({'on': false});
+      return;
+    }
+    _gamepadHost = -100;
+    final ok = await _gamepadCall({'on': true, 'sid': sid});
+    if (!ok) {
+      _gamepadWanted = false;
+      showToast('Gamepad mód: ez a Quest rendszer nem támogatja');
+      return;
+    }
+    if (gamepadCapture.value) return;
+    _gamepadRefuseTimer = Timer(const Duration(seconds: 1), () {
+      _gamepadRefuseTimer = null;
+      if (!_gamepadWanted || gamepadCapture.value) return;
+      _gamepadWanted = false;
+      // Do not let a later focus change grab the controllers unasked.
+      unawaited(_gamepadCall({'on': false}));
+      showToast('Gamepad mód: a rendszer elutasította');
+    });
+  }
+
+  /// Ends gamepad mode when the remote page closes. Kotlin's off = true is best effort here
+  /// (the session is usually gone by then); the host unplugs on connection close anyway.
+  void stopGamepadMode() {
+    if (!_gamepadWanted && !gamepadCapture.value) return;
+    _gamepadRefuseTimer?.cancel();
+    _gamepadRefuseTimer = null;
+    _gamepadWanted = false;
+    gamepadCapture.value = false;
+    unawaited(_gamepadCall({'on': false}));
+  }
+
+  Future<bool> _gamepadCall(Map<String, dynamic> args) async {
+    try {
+      return await platformFFI.invokeMethodWithResult<bool>(
+              'quest_gamepad_capture', args) ==
+          true;
+    } catch (e) {
+      debugPrint('quest_gamepad_capture failed: $e');
+      return false;
+    }
+  }
+
+  /// Kotlin: the system granted (true) or released (false, e.g. the Meta button) the capture.
+  void onGamepadCapture(bool captured) {
+    final was = gamepadCapture.value;
+    gamepadCapture.value = captured;
+    if (captured && !was) {
+      _gamepadRefuseTimer?.cancel();
+      _gamepadRefuseTimer = null;
+      showToast('Gamepad mód: kilépés a Meta gombbal '
+          '(vagy a két kar benyomva / Start+Select 1 mp-ig)');
+    }
+  }
+
+  /// Kotlin: the host's Features.gamepad as the first sends saw it (1 = the pad gets it).
+  void onGamepadHost(int value) {
+    if (value == _gamepadHost) return;
+    _gamepadHost = value;
+    if (value == 0) {
+      showToast('Gamepad mód: a gép nem fogad gamepadet');
+    } else if (value == 2) {
+      showToast('Gamepad mód: a gépen nincs ViGEmBus driver');
+    }
+  }
+
   Future<void> detach() async {
     if (!_attached) return;
+    stopGamepadMode();
     _attached = false;
     _stopTimer();
     _resetSystemScroll();

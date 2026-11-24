@@ -941,9 +941,16 @@ void androidChannelInit() {
             var name = arguments["name"] as String;
             var value = arguments["value"] as String == "true";
             debugPrint("from jvm:on_state_changed,$name:$value");
+            if (name == "gamepad_capture") {
+              gFFI.inputModel.quest.onGamepadCapture(value);
+              break;
+            }
             gFFI.serverModel.changeStatue(name, value);
             break;
           }
+        case "quest_gamepad_host":
+          gFFI.inputModel.quest.onGamepadHost(arguments["value"] as int);
+          break;
         case "on_android_permission_result":
           {
             var type = arguments["type"] as String;

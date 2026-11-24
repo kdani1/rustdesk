@@ -243,6 +243,22 @@ class MainActivity : FlutterActivity() {
             _rdClipboardManager = RdClipboardManager(getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
             FFI.setClipboardManager(_rdClipboardManager!!)
         }
+        // Quest gamepad mode in this 2D panel (QuestGamepadCapture.kt).
+        if (QuestInput.isQuest) {
+            QuestGamepadCapture.init(this, { c ->
+                flutterMethodChannel?.invokeMethod(
+                    "on_state_changed",
+                    mapOf("name" to "gamepad_capture", "value" to c.toString())
+                )
+            }, { v ->
+                flutterMethodChannel?.invokeMethod("quest_gamepad_host", mapOf("value" to v))
+            })
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        QuestGamepadCapture.onWindowFocusChanged(hasFocus)
     }
 
     // At background level the engine closes the buffers behind its textures: the decoders
@@ -300,6 +316,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         Log.e(logTag, "onDestroy finishing=$isFinishing gameMode=${GameMode.active}")
+        // Sends the owed off = true and lets go of the capture before any session closes.
+        QuestGamepadCapture.release()
         // The process can outlive the UI whenever something keeps it alive:
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
@@ -734,6 +752,19 @@ class MainActivity : FlutterActivity() {
                 "quest_input_config" -> {
                     result.success(QuestInput.configure(call.arguments))
                 }
+                "quest_gamepad_capture" -> {
+                    // {on: Boolean, sid: String?}: the Quest menu's gamepad-mode toggle, or
+                    // the remote page closing (on = false). The capture state comes back as
+                    // on_state_changed gamepad_capture; false here = no capture API.
+                    val a = call.arguments as? Map<*, *>
+                    val on = a?.get("on") as? Boolean ?: false
+                    if (on) {
+                        result.success(QuestGamepadCapture.enable(a?.get("sid") as? String))
+                    } else {
+                        QuestGamepadCapture.disable()
+                        result.success(true)
+                    }
+                }
                 "panel_open" -> {
                     // One more Quest panel for one remote display (see DisplayActivity).
                     val a = call.arguments as? Map<*, *>
@@ -1152,13 +1183,17 @@ class MainActivity : FlutterActivity() {
 
     // Meta Quest controllers: their buttons and sticks never reach Flutter as pointer events,
     // so the remote page gets them from QuestInput over the method channel. See QuestInput.kt.
+    // While gamepad mode holds the controllers, QuestGamepadCapture takes their events first, so
+    // they go to the host's virtual pad and never become mouse or scroll input.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (QuestGamepadCapture.onKey(event)) return true
         if (QuestInput.onKey(flutterMethodChannel, event)) return true
         return super.dispatchKeyEvent(event)
     }
 
     override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
         DisplayActivity.onHover(-1, ev, window.decorView.width)
+        if (QuestGamepadCapture.onGenericMotion(ev)) return true
         if (QuestInput.onGenericMotion(flutterMethodChannel, ev)) return true
         return super.dispatchGenericMotionEvent(ev)
     }

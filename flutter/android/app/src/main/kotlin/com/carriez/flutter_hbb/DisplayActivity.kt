@@ -34,6 +34,8 @@ class DisplayActivity : FlutterActivity() {
         fun open(from: Activity, display: Int, sid: String, args: String): Boolean {
             if (wanted.containsKey(sid)) return false
             wanted[sid] = args
+            // Gamepad mode: the capture release this focus move causes is not the Meta button.
+            QuestGamepadCapture.noteOwnFocus("panel open")
             return try {
                 from.startActivity(Intent(from, DisplayActivity::class.java).apply {
                     putExtra(EXTRA_DISPLAY, display)
@@ -60,6 +62,14 @@ class DisplayActivity : FlutterActivity() {
         fun closeAll() {
             wanted.clear()
             live.values.toList().forEach { it.finishAndRemoveTask() }
+        }
+
+        /** Game mode: every panel's task behind the immersive view (kept alive, not finished). */
+        fun moveAllToBack() {
+            live.values.toList().forEach {
+                val ok = try { it.moveTaskToBack(true) } catch (e: Exception) { false }
+                Log.i(TAG, "game mode: panel task to back: $ok")
+            }
         }
 
         // The window the laser left last, on which side, and when.
@@ -323,6 +333,12 @@ class DisplayActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         Log.d(TAG, "onResume display=$display")
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Gamepad mode (QuestGamepadCapture): focus moved to our own panel, not to the system UI.
+        if (hasFocus) QuestGamepadCapture.noteOwnFocus("panel display=$display")
     }
 
     override fun onPause() {

@@ -114,6 +114,9 @@ mod surface;
 // Quest 3 immersive game mode (XrActivity): OpenXR session, Touch controllers -> pad state.
 #[cfg(all(target_os = "android", feature = "quest-xr"))]
 mod xr;
+// Quest 2D gamepad mode (QuestGamepadCapture.kt): FFI.sendGamepad -> Misc.gamepad_state.
+#[cfg(target_os = "android")]
+mod gamepad_jni;
 
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
@@ -4094,6 +4097,12 @@ impl LoginConfigHandler {
         } else {
             !self.get_option(name).is_empty()
         }
+    }
+
+    /// The host's `Features.gamepad` (0 none, 1 virtual pad available, 2 no driver), `None`
+    /// before its PeerInfo arrived.
+    pub fn gamepad_feature(&self) -> Option<u32> {
+        self.features.as_ref().map(|f| f.gamepad)
     }
 
     pub fn is_privacy_mode_supported(&self) -> bool {

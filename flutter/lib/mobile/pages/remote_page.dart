@@ -238,6 +238,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     _windowResizeTimer?.cancel();
     // The extra display windows belong to this connection.
     if (!_isPanel) unawaited(androidDisplayPanels.closeAll());
+    // Gamepad mode: let go of the controllers. The off = true this sends usually arrives after
+    // `sessionClose` below has removed the session (the platform call runs on Kotlin's main
+    // looper later), so it is dropped; the host unplugs the pad anyway when the connection
+    // closes (gamepad::release). Not awaited, see the comment below.
+    if (!_isPanel) gFFI.inputModel.quest.stopGamepadMode();
     // Close the session up-front. `gFFI.close()` below only calls `sessionClose`
     // after several awaits (canvas save, image update, the `enable_soft_keyboard`
     // platform call), so if the app is backgrounded while this page is disposing,
@@ -1540,6 +1545,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         icon: const Icon(Icons.sports_esports, color: Colors.white),
         tooltip: 'Quest controller',
         onSelected: (v) {
+          if (v == 'gamepad') {
+            unawaited(quest.setGamepadMode(
+                !quest.gamepadCapture.value, gFFI.sessionId.toString()));
+          }
           if (v == 'gamemode') _enterGameMode();
           if (v == 'pointer') quest.setPointerMode(!quest.pointerMode.value);
           if (v == 'cursor') quest.setCursorOverlay(!quest.cursorOverlay.value);
@@ -1556,6 +1565,11 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           }
         },
         itemBuilder: (_) => [
+          CheckedPopupMenuItem(
+            value: 'gamepad',
+            checked: quest.gamepadCapture.value,
+            child: const Text('Gamepad mód (Xbox-kontroller a gépen)'),
+          ),
           PopupMenuItem(
             value: 'gamemode',
             enabled: gFFI.ffiModel.pi.displays.isNotEmpty &&
