@@ -1584,6 +1584,10 @@ impl Connection {
                     conn.video_feedback_second().await;
                     if conn.microphone_route.is_some() && Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
                         conn.stop_microphone_forwarding("Receiving microphone permission revoked").await;
+                    } else if conn.microphone_route.as_ref().map_or(false, |r| !r.is_current()) {
+                        // Fork: another connection took the microphone over (this one may send
+                        // nothing, e.g. a sleeping headset): tell this viewer and let go.
+                        conn.stop_microphone_forwarding(crate::microphone_forwarding::TAKEN_OVER).await;
                     }
                     #[cfg(windows)]
                     conn.portable_check();
@@ -5522,6 +5526,13 @@ impl Connection {
     async fn stop_microphone_forwarding(&mut self, reason: &str) {
         self.microphone_sender = None;
         if let Some(route) = self.microphone_route.take() {
+            log::info!(
+                "MIC conn={} request={:?} stop reason={:?} owner={}",
+                self.inner.id(),
+                self.microphone_id,
+                reason,
+                route.is_current()
+            );
             if let Err(error) = tokio::task::spawn_blocking(move || drop(route)).await {
                 log::warn!("Microphone route cleanup failed: {error}");
             }
@@ -5533,6 +5544,11 @@ impl Connection {
 
     async fn handle_microphone_packet(&mut self, packet: MicrophonePacket) {
         if self.microphone_id != Some(packet.request_id) || self.microphone_route.is_none() { return; }
+        // Fork: another connection took the microphone over; drop this one's audio at once.
+        if !self.microphone_route.as_ref().map_or(false, |r| r.is_current()) {
+            self.stop_microphone_forwarding(crate::microphone_forwarding::TAKEN_OVER).await;
+            return;
+        }
         if !self.audio_enabled() || Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
             self.stop_microphone_forwarding("Microphone permission revoked").await;
             return;
@@ -5573,17 +5589,43 @@ impl Connection {
             self.stop_microphone_forwarding("").await;
             return;
         }
+        let conn_id = self.inner.id();
         let error = if !self.is_authed_remote_conn() || Config::get_option(crate::microphone_forwarding::ALLOW) != "Y" {
             "Enable receiving a forwarded microphone in this computer's settings".to_owned()
-        } else if !self.audio_enabled() || self.voice_calling || self.microphone_route.is_some() {
+        } else if !self.audio_enabled() || self.voice_calling {
             "Audio is disabled or a voice/microphone session is already active".to_owned()
+        } else if self.microphone_route.as_ref().map_or(false, |r| r.is_current()) {
+            // Fork: a new request from the connection that owns the route keeps the route; its
+            // audio restarts with the next format packet.
+            self.microphone_sender = None;
+            self.microphone_id = Some(request.request_id);
+            log::info!("MIC conn={} request={} ok (already the owner)", conn_id, request.request_id);
+            String::new()
         } else {
-            match tokio::task::spawn_blocking(crate::microphone_forwarding::RouteLease::open).await {
-                Ok(Ok(route)) => { self.microphone_route = Some(route); self.microphone_id = Some(request.request_id); String::new() }
+            // Fork: the newest connection that turns forwarding on takes the route over (one
+            // owner, no mixing); the previous owner is told TAKEN_OVER by its own second timer
+            // or next packet. A stale lease of this connection is dropped first (no restore).
+            if self.microphone_route.is_some() {
+                self.microphone_sender = None;
+                self.microphone_id = None;
+                if let Some(stale) = self.microphone_route.take() {
+                    let _ = tokio::task::spawn_blocking(move || drop(stale)).await;
+                }
+            }
+            match tokio::task::spawn_blocking(move || crate::microphone_forwarding::RouteLease::open_or_take_over(conn_id)).await {
+                Ok(Ok((route, previous))) => {
+                    log::info!("MIC conn={} request={} ok took_over_from={:?}", conn_id, request.request_id, previous);
+                    self.microphone_route = Some(route);
+                    self.microphone_id = Some(request.request_id);
+                    String::new()
+                }
                 Ok(Err(error)) => error.to_string(),
                 Err(error) => error.to_string(),
             }
         };
+        if !error.is_empty() {
+            log::info!("MIC conn={} request={} refused: {}", conn_id, request.request_id, error);
+        }
         self.send(crate::microphone_forwarding::message(request.request_id, error.is_empty(), true, &error)).await;
     }
 

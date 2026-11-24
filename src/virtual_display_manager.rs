@@ -9,6 +9,10 @@ pub const AMYUNI_IDD_DEVICE_STRING: &'static str = "USB Mobile Monitor Virtual D
 
 const IDD_IMPL_RUSTDESK: &str = "rustdesk_idd";
 const IDD_IMPL_AMYUNI: &str = "amyuni_idd";
+/// Fork: "virtual-display-impl" asks for the RustDesk IDD but its driver is not installed.
+const IDD_IMPL_NONE: &str = "none";
+pub const NO_RUSTDESK_IDD: &str =
+    "The RustDesk virtual display driver is not installed (virtual-display-impl = rustdesk)";
 const IDD_PLUG_OUT_ALL_INDEX: i32 = -1;
 
 /// Fork: host option choosing the virtual display backend: "amyuni" (default, unset) or
@@ -43,14 +47,16 @@ fn wanted_impl() -> &'static str {
     }
 }
 
-/// The virtual display backend in effect: the option, except that "rustdesk" falls back to
-/// Amyuni while no RustDeskIddDriver package is in the driver store (never installed here).
+/// The virtual display backend in effect: the option. Fork: "rustdesk" without a
+/// RustDeskIddDriver package in the driver store gives no backend (IDD_IMPL_NONE) instead of
+/// falling back to Amyuni, whose displays are 60 Hz only and cannot be plugged out one by one.
 fn idd_impl() -> &'static str {
     let mut selected = lock(&SELECTED_IMPL);
     if let Some(cur) = *selected {
         let in_use = match cur {
             IDD_IMPL_RUSTDESK => rustdesk_idd::has_displays(),
-            _ => amyuni_idd::plugged_count() > 0,
+            IDD_IMPL_AMYUNI => amyuni_idd::plugged_count() > 0,
+            _ => false,
         };
         if in_use {
             return cur;
@@ -58,7 +64,7 @@ fn idd_impl() -> &'static str {
     }
     let mut next = wanted_impl();
     if next == IDD_IMPL_RUSTDESK && !driver_store::has_rustdesk_idd_package() {
-        next = IDD_IMPL_AMYUNI;
+        next = IDD_IMPL_NONE;
     }
     if *selected != Some(next) {
         log::info!(
@@ -80,6 +86,27 @@ pub fn is_amyuni_idd() -> bool {
 /// Fork: the RustDesk IDD backend is in effect.
 pub fn is_rustdesk_idd() -> bool {
     idd_impl() == IDD_IMPL_RUSTDESK
+}
+
+/// Fork: "virtual-display-impl" = rustdesk, but its driver is not installed: no backend, so no
+/// virtual display can be plugged in at all.
+pub fn is_no_idd() -> bool {
+    idd_impl() == IDD_IMPL_NONE
+}
+
+/// Fork: a backend is in effect, so a virtual display can be plugged in for a PC without one.
+pub fn can_plug_headless() -> bool {
+    !is_no_idd()
+}
+
+/// Fork: `name` ("\\.\DISPLAYn") is an active display of the RustDesk IDD or the Amyuni driver,
+/// told by the DeviceString Windows reports for it (not by the names this process remembers,
+/// which may be unknown for a display whose name could not be resolved at plug-in time).
+pub fn is_virtual_device(name: &str) -> bool {
+    windows::get_device_names(Some(RUSTDESK_IDD_DEVICE_STRING))
+        .iter()
+        .chain(windows::get_device_names(Some(AMYUNI_IDD_DEVICE_STRING)).iter())
+        .any(|s| windows::is_device_name(s, name))
 }
 
 /// Fork: refresh rate for new RustDesk IDD displays, from `OPTION_VIRTUAL_DISPLAY_HZ`.
@@ -140,6 +167,7 @@ pub fn plug_in_headless() -> ResultType<()> {
     match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_headless(),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_headless(),
+        IDD_IMPL_NONE => bail!(NO_RUSTDESK_IDD),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -177,6 +205,14 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
                 "virtual_display_targeted_unplug".into(),
                 serde_json::json!(true),
             );
+            // Fork: the headless display that stands in for a missing monitor (index 0, not in
+            // rustdesk_virtual_displays, plugged out by the host itself once a monitor is back).
+            if let Some(name) = rustdesk_idd::headless_name() {
+                map.insert(
+                    "rustdesk_headless_display".into(),
+                    serde_json::json!(name),
+                );
+            }
         }
         IDD_IMPL_AMYUNI => {
             let c = amyuni_idd::get_monitor_count();
@@ -203,6 +239,7 @@ pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> Re
     match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_index_modes(idx, modes),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_monitor(),
+        IDD_IMPL_NONE => bail!(NO_RUSTDESK_IDD),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -218,6 +255,7 @@ pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultT
             rustdesk_idd::plug_out_peer_request(&indices)
         }
         IDD_IMPL_AMYUNI => amyuni_idd::plug_out_monitor(index, force_all, force_one),
+        IDD_IMPL_NONE => bail!(NO_RUSTDESK_IDD),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -229,6 +267,7 @@ pub fn plug_in_peer_request(modes: Vec<Vec<virtual_display::MonitorMode>>) -> Re
             amyuni_idd::plug_in_monitor()?;
             Ok(vec![0])
         }
+        IDD_IMPL_NONE => bail!(NO_RUSTDESK_IDD),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -246,13 +285,14 @@ pub fn plug_out_monitor_indices(
             }
             Ok(())
         }
+        IDD_IMPL_NONE => bail!(NO_RUSTDESK_IDD),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
 
 pub fn reset_all() -> ResultType<()> {
     let res = match idd_impl() {
-        IDD_IMPL_RUSTDESK => Ok(()),
+        IDD_IMPL_RUSTDESK | IDD_IMPL_NONE => Ok(()),
         IDD_IMPL_AMYUNI => amyuni_idd::reset_all(),
         _ => bail!("Unsupported virtual display implementation."),
     };
@@ -273,9 +313,9 @@ mod driver_store {
     };
 
     // A missing package is looked for again after this long (it may be installed meanwhile).
+    // Fork: a package found stays found for the life of the process (no rescan of every
+    // oem*.inf every 5 minutes); a removed one makes the next plug-in fail with its error.
     const RECHECK_MISSING: Duration = Duration::from_secs(30);
-    // A package found is looked for again after this long (it may have been removed).
-    const RECHECK_FOUND: Duration = Duration::from_secs(300);
 
     lazy_static::lazy_static! {
         static ref CHECKED: Mutex<Option<(bool, Instant)>> = Mutex::new(None);
@@ -284,8 +324,7 @@ mod driver_store {
     pub(super) fn has_rustdesk_idd_package() -> bool {
         let mut checked = lock(&CHECKED);
         if let Some((found, at)) = *checked {
-            let recheck = if found { RECHECK_FOUND } else { RECHECK_MISSING };
-            if at.elapsed() < recheck {
+            if found || at.elapsed() < RECHECK_MISSING {
                 return found;
             }
         }
@@ -303,7 +342,8 @@ mod driver_store {
         } else {
             log::warn!(
                 "LATENCY vdisplay driver: no RustDeskIddDriver package in the driver store; \
-                 using amyuni (the service never installs the driver, install it by hand)"
+                 no virtual displays with virtual-display-impl=rustdesk (the service never \
+                 installs the driver, install it by hand)"
             );
             false
         };
@@ -367,7 +407,7 @@ pub mod rustdesk_idd {
     use std::{
         collections::{HashMap, HashSet},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc, Mutex,
         },
         time::{Duration, Instant},
@@ -708,6 +748,92 @@ pub mod rustdesk_idd {
     pub fn plug_out_headless() -> bool {
         let _plug = lock(&PLUG_LOCK);
         plug_out_headless_locked()
+    }
+
+    /// Fork: the headless display (index 0) is plugged in.
+    pub fn has_headless() -> bool {
+        lock(&STATE).headless.is_some()
+    }
+
+    /// Fork: the Windows device name of the headless display, once known.
+    pub fn headless_name() -> Option<String> {
+        let state = lock(&STATE);
+        let name = state.headless.as_ref()?.1.name.as_deref()?;
+        Some(trimmed(name).to_owned())
+    }
+
+    /// Fork: no request is queued for the worker or running on it.
+    pub fn is_idle() -> bool {
+        PENDING.load(Ordering::SeqCst) == 0
+    }
+
+    /// Fork: waits up to `timeout` until the requests queued before now (a reset queued by the
+    /// last connection that closed, say) have finished. False when they still run.
+    pub fn wait_idle(timeout: Duration) -> bool {
+        let started = Instant::now();
+        while !is_idle() {
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+
+    // A headless plug-in is queued and not done yet.
+    static HEADLESS_IN_QUEUED: AtomicBool = AtomicBool::new(false);
+
+    /// Fork: `plug_in_headless` on the worker (after the requests queued before it), when the PC
+    /// lost its last display during a session. `still_needed` runs on the worker right before the
+    /// plug-in and must say again that a display is missing (a reset or the monitor may have come
+    /// in between).
+    pub fn plug_in_headless_queued<F>(still_needed: F)
+    where
+        F: FnOnce() -> bool + Send + 'static,
+    {
+        if HEADLESS_IN_QUEUED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        PENDING.fetch_add(1, Ordering::SeqCst);
+        run_queued(Box::new(move || {
+            if !still_needed() {
+                log::info!("LATENCY vdisplay headless: a display is there again, none plugged in");
+            } else if let Err(e) = plug_in_headless() {
+                log::error!("LATENCY vdisplay headless: plug in failed: {}", e);
+            } else {
+                log::info!("LATENCY vdisplay headless: plugged in for the missing display");
+            }
+            HEADLESS_IN_QUEUED.store(false, Ordering::SeqCst);
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            crate::server::display_service::resync_displays();
+        }));
+    }
+
+    // A headless plug-out is queued and not done yet.
+    static HEADLESS_OUT_QUEUED: AtomicBool = AtomicBool::new(false);
+
+    /// Fork: `plug_out_headless` on the worker (after the requests queued before it), when a
+    /// real display is back. Once per headless display. `still_wanted` runs on the worker right
+    /// before the plug-out and must say again that a real display is there, so that a layout
+    /// change in between (privacy mode, the monitor gone again) never takes away the only one.
+    pub fn plug_out_headless_queued<F>(still_wanted: F)
+    where
+        F: FnOnce() -> bool + Send + 'static,
+    {
+        if HEADLESS_OUT_QUEUED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        PENDING.fetch_add(1, Ordering::SeqCst);
+        run_queued(Box::new(move || {
+            if !still_wanted() {
+                log::info!("LATENCY vdisplay: the real display is gone again, headless display kept");
+            } else if plug_out_headless() {
+                log::info!("LATENCY vdisplay: a real display is back, headless display plugged out");
+            }
+            HEADLESS_OUT_QUEUED.store(false, Ordering::SeqCst);
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+            crate::server::display_service::resync_displays();
+        }));
     }
 
     /// Fills in names that could not be told apart at plug-in time when exactly one display of

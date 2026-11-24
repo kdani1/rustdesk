@@ -140,7 +140,8 @@ impl PrivacyModeImpl {
 
             let ds = virtual_display_manager::get_cur_device_string();
             if let Ok(s) = String::from_utf16(&dd.DeviceString) {
-                if s.len() >= ds.len() && &s[..ds.len()] == ds {
+                // Fork: no backend (IDD_IMPL_NONE) gives "", which every display starts with.
+                if !ds.is_empty() && s.starts_with(ds) {
                     self.virtual_displays.push(display);
                     continue;
                 }
@@ -461,6 +462,11 @@ impl PrivacyMode for PrivacyModeImpl {
     fn turn_on_privacy(&mut self, conn_id: i32) -> ResultType<bool> {
         if !virtual_display_manager::is_virtual_display_supported() {
             bail!("idd_not_support_under_win10_2004_tip");
+        }
+        // Fork: virtual-display-impl = rustdesk without its driver: say so, instead of finding
+        // "no physical displays" (every display would look virtual with no device string).
+        if virtual_display_manager::is_no_idd() {
+            bail!(virtual_display_manager::NO_RUSTDESK_IDD);
         }
 
         if self.check_on_conn_id(conn_id)? {

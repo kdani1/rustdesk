@@ -16,6 +16,29 @@ pub const NAME: &'static str = "display";
 
 #[cfg(windows)]
 const DUMMY_DISPLAY_SIDE_MAX_SIZE: usize = 1024;
+/// Fork: host option. "N": never plug a virtual display in for a PC without one. Otherwise one
+/// is plugged in only when a viewer logs in and Windows has no display output at all.
+#[cfg(windows)]
+const OPTION_HEADLESS_VIRTUAL_DISPLAY: &str = "enable-headless-virtual-display";
+/// Fork: how long a real display must have been back before the headless RustDesk IDD display
+/// that stood in for it is plugged out.
+#[cfg(windows)]
+const HEADLESS_PLUG_OUT_AFTER: Duration = Duration::from_secs(2);
+/// Fork: how long a session must have been without any display (no present monitor device and
+/// no real output) before the poll plugs in one RustDesk IDD display for it.
+#[cfg(windows)]
+const HEADLESS_PLUG_IN_AFTER: Duration = Duration::from_secs(3);
+/// Fork: the poll tries a headless plug-in at most this often (a failing driver, a flapping
+/// monitor).
+#[cfg(windows)]
+const HEADLESS_PLUG_IN_RETRY: Duration = Duration::from_secs(30);
+/// Fork: how long a login waits for virtual display requests still queued (a reset queued by
+/// the last connection that closed) before it looks at the displays.
+#[cfg(windows)]
+const HEADLESS_WAIT_IDLE: Duration = Duration::from_secs(3);
+/// Fork: the last `try_get_displays` (the 300 ms poll among others) found no real display.
+#[cfg(windows)]
+static NO_DISPLAYS_SEEN: AtomicBool = AtomicBool::new(false);
 
 struct ChangedResolution {
     original: (i32, i32),
@@ -716,6 +739,10 @@ fn get_displays_msg() -> Option<Message> {
 }
 
 fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
+    #[cfg(windows)]
+    let mut physical_back_since: Option<std::time::Instant> = None;
+    #[cfg(windows)]
+    let mut missing_watch = MissingDisplayWatch::default();
     while sp.ok() {
         sp.snapshot(|sps| {
             if !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
@@ -730,6 +757,12 @@ fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
         if let Some(msg_out) = check_get_displays_changed_msg() {
             sp.send(msg_out);
             log::info!("Displays changed");
+        }
+
+        #[cfg(windows)]
+        {
+            plug_out_headless_if_physical_back(&mut physical_back_since);
+            plug_in_headless_if_display_missing(&mut missing_watch);
         }
 
         #[cfg(target_os = "linux")]
@@ -916,8 +949,20 @@ pub async fn update_get_sync_displays_on_login() -> ResultType<(Vec<DisplayInfo>
     }
     #[cfg(not(windows))]
     let displays = display_service::try_get_displays();
+    // Fork: the headless check may wait (queued virtual display requests, Windows switching
+    // sessions) and plug a display in (driver calls of several seconds): off the runtime's
+    // worker threads. `Display` is not `Send`, so the list is taken here afterwards.
     #[cfg(windows)]
-    let displays = display_service::try_get_displays_add_amyuni_headless();
+    let displays = {
+        if headless_plug_possible() {
+            if let Err(e) =
+                hbb_common::tokio::task::spawn_blocking(plug_in_headless_if_no_displays).await
+            {
+                log::error!("LATENCY vdisplay headless: check failed: {}", e);
+            }
+        }
+        display_service::try_get_displays()
+    };
     let displays = displays?;
     let primary_display_idx = get_primary_2(&displays);
     let sync_displays = update_sync_displays(&displays);
@@ -975,75 +1020,206 @@ pub fn try_get_displays() -> ResultType<Vec<Display>> {
 #[inline]
 #[cfg(windows)]
 pub fn try_get_displays() -> ResultType<Vec<Display>> {
-    try_get_displays_(false)
+    let displays = Display::all()?;
+    NO_DISPLAYS_SEEN.store(no_displays(&displays), Ordering::Relaxed);
+    Ok(displays)
 }
 
-// We can't get full control of the virtual display if we use amyuni idd.
-// If we add a virtual display, we cannot remove it automatically.
-// So when using amyuni idd, we only add a virtual display for headless if it is required.
-// eg. when the client is connecting.
-#[inline]
+// Fork: a virtual main display is plugged in only for a PC without any real display, never next
+// to one (as in the 11-17 build: a single monitor is captured as it is, a monitor that is switched
+// off but still listed by Windows included). A viewer logging in plugs one in (either backend,
+// plug_in_headless_if_no_displays); during a session the 300 ms poll plugs one in after
+// HEADLESS_PLUG_IN_AFTER without any display (RustDesk IDD only, whose display the host plugs out
+// again by itself once a monitor is back; an Amyuni one could not be taken out on its own).
+
+/// Fork: a virtual display may be plugged in for a PC without displays at all.
 #[cfg(windows)]
-pub fn try_get_displays_add_amyuni_headless() -> ResultType<Vec<Display>> {
-    try_get_displays_(true)
+fn headless_plug_possible() -> bool {
+    crate::platform::is_installed()
+        && virtual_display_manager::is_virtual_display_supported()
+        && virtual_display_manager::can_plug_headless()
+        && hbb_common::config::Config::get_option(OPTION_HEADLESS_VIRTUAL_DISPLAY) != "N"
 }
 
-#[inline]
+/// Fork: the login check. Blocking (up to ~3 s waiting for queued requests, 1.5 s looking again,
+/// then the plug-in itself): run it with `spawn_blocking`.
 #[cfg(windows)]
-pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> {
-    let mut displays = Display::all()?;
-
-    // Do not add virtual display if the platform is not installed or the virtual display is not supported.
-    if !crate::platform::is_installed() || !virtual_display_manager::is_virtual_display_supported()
+fn plug_in_headless_if_no_displays() {
+    // The last connection that closed may have queued a reset that is about to plug out the
+    // headless display listed now: let it finish, or this login would see a display that is gone
+    // a moment later and plug none in.
+    if virtual_display_manager::is_rustdesk_idd()
+        && !virtual_display_manager::rustdesk_idd::wait_idle(HEADLESS_WAIT_IDLE)
     {
-        return Ok(displays);
+        log::warn!("LATENCY vdisplay headless: virtual display requests still running");
     }
-
-    // Enable headless virtual display when
-    // 1. `amyuni` idd is not used.
-    // 2. `amyuni` idd is used and `add_amyuni_headless` is true.
-    if virtual_display_manager::is_amyuni_idd() && !add_amyuni_headless {
-        return Ok(displays);
+    let none_now = || Display::all().map_or(false, |d| no_displays(&d));
+    if !none_now() {
+        return;
     }
-
-    // The following code causes a bug.
-    // The virtual display cannot be added when there's no session(eg. when exiting from RDP).
-    // Because `crate::platform::desktop_changed()` always returns true at that time.
-    //
-    // The code only solves a rare case:
-    // 1. The control side is connecting.
-    // 2. The windows session is switching, no displays are detected, but they're there.
-    // Then the controlled side plugs in a virtual display for "headless".
-    //
-    // No need to do the following check. But the code is kept here for marking the issue.
-    // If there're someones reporting the issue, we may add a better check by waiting for a while. (switching session).
-    // But I don't think it's good to add the timeout check without any issue.
-    //
-    // If is switching session, no displays may be detected.
-    // if displays.is_empty() && crate::platform::desktop_changed() {
-    //     return Ok(displays);
-    // }
-
-    let no_displays_v = no_displays(&displays);
-    // Fork: host option "enable-headless-virtual-display" = "N" leaves a monitor-less PC on
-    // its own fallback display (captured the slow way), for comparing the two.
-    if no_displays_v && hbb_common::config::Config::get_option("enable-headless-virtual-display") == "N" {
-        return Ok(displays);
-    }
-    if no_displays_v {
-        log::debug!("no displays, create virtual display");
-        if let Err(e) = virtual_display_manager::plug_in_headless() {
-            log::error!("plug in headless failed {}", e);
-        } else {
-            displays = Display::all()?;
+    // Upstream noted that while Windows switches sessions no displays may be listed although
+    // they are there. Fork: look again for a moment before plugging one in.
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(500));
+        if !none_now() {
+            log::info!("LATENCY vdisplay headless: displays came back, none plugged in");
+            return;
         }
     }
-    Ok(displays)
+    log::info!("LATENCY vdisplay headless: no displays, create virtual display");
+    if let Err(e) = virtual_display_manager::plug_in_headless() {
+        log::error!("plug in headless failed {}", e);
+    }
+}
+
+#[cfg(windows)]
+fn has_remote_connection() -> bool {
+    AUTHED_CONNS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.conn_type == AuthConnType::Remote)
+}
+
+/// Fork: no present monitor device and no real output. Blocking (device enumeration).
+#[cfg(windows)]
+fn display_missing_now() -> bool {
+    crate::platform::windows::present_monitor_count() == 0
+        && Display::all().map_or(false, |d| no_displays(&d))
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct MissingDisplayWatch {
+    since: Option<std::time::Instant>,
+    last_try: Option<std::time::Instant>,
+}
+
+/// Fork: the PC lost its last display during a session (monitor unplugged or powered off so
+/// that it leaves the device list, a reconnect that raced the plug-out of the last session's
+/// headless display): after HEADLESS_PLUG_IN_AFTER plug one RustDesk IDD display in (at the
+/// configured rate), on the worker. plug_out_headless_if_physical_back takes it out again once
+/// a monitor is back.
+#[cfg(windows)]
+fn plug_in_headless_if_display_missing(watch: &mut MissingDisplayWatch) {
+    use virtual_display_manager::rustdesk_idd;
+    // Cheap checks first; the device enumeration only runs while no real display is listed.
+    let missing = NO_DISPLAYS_SEEN.load(Ordering::Relaxed)
+        && !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed)
+        && rustdesk_idd::is_idle()
+        && !rustdesk_idd::has_headless()
+        && has_remote_connection()
+        && virtual_display_manager::is_rustdesk_idd()
+        && crate::platform::windows::present_monitor_count() == 0;
+    if !missing {
+        watch.since = None;
+        return;
+    }
+    let since = *watch.since.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() < HEADLESS_PLUG_IN_AFTER
+        || watch
+            .last_try
+            .map_or(false, |t| t.elapsed() < HEADLESS_PLUG_IN_RETRY)
+        || !headless_plug_possible()
+    {
+        return;
+    }
+    watch.last_try = Some(std::time::Instant::now());
+    log::info!(
+        "LATENCY vdisplay headless: no display for {} ms during a session, plugging one in",
+        since.elapsed().as_millis()
+    );
+    rustdesk_idd::plug_in_headless_queued(|| {
+        !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed)
+            && has_remote_connection()
+            && display_missing_now()
+    });
+}
+
+/// Fork: a real display is back while a headless virtual display stands in for it. `displays`
+/// holds (width, height, is one of our virtual displays) per display; the present monitor
+/// devices must outnumber our virtual ones, so a powered-off monitor that Windows still lists
+/// (it delivers no image) does not count.
+#[cfg(windows)]
+fn physical_display_back(
+    displays: &[(usize, usize, bool)],
+    present_monitors: usize,
+    our_monitors: usize,
+) -> bool {
+    present_monitors > our_monitors
+        && displays.iter().any(|&(w, h, ours)| {
+            !ours && (w > DUMMY_DISPLAY_SIDE_MAX_SIZE || h > DUMMY_DISPLAY_SIDE_MAX_SIZE)
+        })
+}
+
+/// Fork: the check of physical_display_back on the current displays. A display counts as ours
+/// by the DeviceString Windows reports for it (a RustDesk IDD display whose name could not be
+/// resolved at plug-in time is still ours), so the real display must be an active output of
+/// another driver.
+#[cfg(windows)]
+fn physical_display_back_now() -> bool {
+    let Ok(all) = Display::all() else {
+        return false;
+    };
+    let displays: Vec<(usize, usize, bool)> = all
+        .iter()
+        .map(|d| {
+            (
+                d.width(),
+                d.height(),
+                virtual_display_manager::is_virtual_device(&d.name()),
+            )
+        })
+        .collect();
+    physical_display_back(
+        &displays,
+        crate::platform::windows::present_monitor_count(),
+        virtual_display_manager::virtual_display_counts().0,
+    )
+}
+
+/// Fork: plugs the headless RustDesk IDD display out once a real display has been back for
+/// HEADLESS_PLUG_OUT_AFTER, so the PC goes back to its own monitor as the only display. Not
+/// while privacy mode switches displays; the worker checks again right before the plug-out.
+#[cfg(windows)]
+fn plug_out_headless_if_physical_back(since: &mut Option<std::time::Instant>) {
+    use virtual_display_manager::rustdesk_idd;
+    if !rustdesk_idd::has_headless() || TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed) {
+        *since = None;
+        return;
+    }
+    let back = physical_display_back_now();
+    match since {
+        _ if !back => *since = None,
+        None => *since = Some(std::time::Instant::now()),
+        Some(t) if t.elapsed() >= HEADLESS_PLUG_OUT_AFTER => {
+            *since = None;
+            rustdesk_idd::plug_out_headless_queued(|| {
+                !TEMP_IGNORE_DISPLAYS_CHANGED.load(Ordering::Relaxed)
+                    && physical_display_back_now()
+            });
+        }
+        Some(_) => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::normalize_primary_display_idx;
+
+    #[test]
+    #[cfg(windows)]
+    fn physical_display_back_needs_a_real_answering_display() {
+        use super::physical_display_back;
+        // Only the headless virtual display.
+        assert!(!physical_display_back(&[(1920, 1080, true)], 1, 1));
+        // The monitor is back next to it.
+        assert!(physical_display_back(&[(1920, 1080, true), (1920, 1080, false)], 2, 1));
+        // Listed by Windows but powered off: no present monitor device of its own.
+        assert!(!physical_display_back(&[(1920, 1080, true), (1920, 1080, false)], 1, 1));
+        // A dummy fallback output is not a display.
+        assert!(!physical_display_back(&[(1920, 1080, true), (800, 600, false)], 2, 1));
+    }
 
     #[test]
     fn normalize_primary_display_idx_bounds() {

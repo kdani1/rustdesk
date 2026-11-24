@@ -3489,6 +3489,9 @@ pub fn arrange_displays_in_row(names: &[String]) -> ResultType<()> {
     arrange_displays(&wanted)
 }
 
+/// Fork: see [arrange_displays].
+const LAYOUT_TOLERANCE_PX: i32 = 64;
+
 /// Moves the named displays to the given positions (pixels). The primary display (the one at
 /// 0,0 now) stays where it is: all positions are shifted by the one asked for it. Sizes,
 /// scaling and the primary are not changed; Windows itself closes gaps it does not accept.
@@ -3516,6 +3519,27 @@ pub fn arrange_displays(wanted: &[(String, i32, i32)]) -> ResultType<()> {
                 shift_y = *y;
                 break;
             }
+        }
+        // Fork: a viewer sends a new layout whenever a window moved a little; every applied one
+        // resets the whole desktop's mode and restarts every capturer. Moves under
+        // LAYOUT_TOLERANCE_PX on both axes for every display are left alone.
+        let all_within_tolerance = modes.iter().all(|(_, dm, x, y)| {
+            let pos = dm.u1.s2().dmPosition;
+            (*x - shift_x - pos.x).abs() < LAYOUT_TOLERANCE_PX
+                && (*y - shift_y - pos.y).abs() < LAYOUT_TOLERANCE_PX
+        });
+        if all_within_tolerance {
+            let moved = modes.iter().any(|(_, dm, x, y)| {
+                let pos = dm.u1.s2().dmPosition;
+                pos.x != *x - shift_x || pos.y != *y - shift_y
+            });
+            if moved {
+                log::info!(
+                    "LATENCY layout skipped: every display within {} px of its place",
+                    LAYOUT_TOLERANCE_PX
+                );
+            }
+            return Ok(());
         }
         let mut changed = false;
         for (device_name, dm, x, y) in modes.iter_mut() {
