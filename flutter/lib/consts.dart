@@ -24,6 +24,13 @@ const String kPlatformAdditionsRustDeskVirtualDisplays =
     "rustdesk_virtual_displays";
 const String kPlatformAdditionsAmyuniVirtualDisplays =
     "amyuni_virtual_displays";
+// Hosts of this fork with the RustDesk IDD backend (virtual-display-impl = rustdesk):
+// {"<idd index>": "\\.\DISPLAYnn"}, the refresh rate of new virtual displays, and whether
+// ToggleVirtualDisplay(on: false, display: idx) unplugs exactly that index.
+const String kPlatformAdditionsVirtualDisplayNames = "virtual_display_names";
+const String kPlatformAdditionsVirtualDisplayHz = "virtual_display_hz";
+const String kPlatformAdditionsVirtualDisplayTargetedUnplug =
+    "virtual_display_targeted_unplug";
 const String kPlatformAdditionsHasFileClipboard = "has_file_clipboard";
 const String kPlatformAdditionsSupportedPrivacyModeImpl =
     "supported_privacy_mode_impl";
@@ -187,6 +194,8 @@ const String kOptionEnableTrustedDevices = "enable-trusted-devices";
 const String kOptionShowVirtualMouse = "show-virtual-mouse";
 const String kOptionVirtualMouseScale = "virtual-mouse-scale";
 const String kOptionShowVirtualJoystick = "show-virtual-joystick";
+// Android: hardware decoding straight into a Flutter texture; on unless "N".
+const String kOptionEnableAndroidSurfaceDecode = "enable-android-surface-decode";
 const String kOptionAllowAskForNoteAtEndOfConnection = "allow-ask-for-note";
 const String kOptionAllowMonitorSwitchMainToolbar = "allow-monitor-switch-main-toolbar";
 const String kOptionAllowMonitorSwitchMinToolbar = "allow-monitor-switch-min-toolbar";

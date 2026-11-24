@@ -38,7 +38,14 @@ default = ["use_dasp"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
-drm = ["scrap/drm"]
+# Android viewer: MediaCodec decodes into a Surface shown as a Flutter Texture; the software
+# decoder stays the automatic fallback (local option enable-android-surface-decode).
+surface-decode = ["scrap/surface-decode"]
+# Quest 3 immersive "game mode" (src/client/xr): an OpenXR session started from XrActivity, the
+# Khronos loader (AAR org.khronos.openxr:openxr_loader_for_android) loaded at run time. Android only.
+# openxr-sys and libloading are pinned directly so the lock cannot float past the approved versions.
+quest-xr = ["surface-decode", "dep:openxr", "dep:openxr-sys", "dep:libloading"]
+drm =["scrap/drm"]
 # The display wake, as its OWN compile gate on top of `drm`. Everything else in the drm backend
 # READS (it captures a scanout); the wake WRITES, injecting one synthetic pointer event from the
 # root service so a compositor that idle-disabled its outputs re-enables them. That is a different
@@ -227,6 +234,10 @@ openssl = { version = "0.10", features = ["vendored"] }
 android_logger = "0.13"
 jni = "0.21"
 android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
+# feature quest-xr only
+openxr = { version = "=0.22.0", default-features = false, features = ["loaded"], optional = true }
+openxr-sys = { version = "=0.14.0", optional = true }
+libloading = { version = "=0.9.0", optional = true }
 
 [workspace]
 members = ["libs/scrap", "libs/hbb_common", "libs/base", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer"]

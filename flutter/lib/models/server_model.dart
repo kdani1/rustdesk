@@ -190,7 +190,7 @@ class ServerModel with ChangeNotifier {
     }
 
     // Initial keyboard status is off on mobile
-    if (isMobile) {
+    if (isMobile && !isDisplayPanel) {
       bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
     }
   }

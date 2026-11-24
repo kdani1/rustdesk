@@ -1151,7 +1151,7 @@ Roadmap gate (4a/5): on a phone hotspot and another network, the live window lin
 
 ### Per-frame feedback (M23)
 
-Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows
+Host server option `enable-video-feedback=Y` (off by default) and a fork viewer on Windows or Android
 (`enable-video-feedback` not `N`): the viewer reports every video frame's arrival, size, decode
 and present time and, on a live UDP lane, its losses, at most every 50 ms over the session
 stream; the host turns that into a one-way queueing delay, a GCC trend, jitter and loss rates
@@ -1217,13 +1217,13 @@ the congestion while the host's TCP meter `rtt` (`LATENCY tcp`) does not.
 ### Viewer (Rust)
 
 ```
-LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 shown_gap=… gap50=0 gap_long=0 gap_max_ms=34 discard=0 dec_fail=0 via=TCP
+LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 owed_lost=0 recheck_rej=0 rej_before=0 shown_gap=… gap50=0 gap_long=0 gap_max_ms=34 discard=0 dec_fail=0 via=TCP render=soft
 ```
 
 | Field | Meaning |
 |---|---|
 | `codec` | negotiated codec of the decoded frames |
-| `hw` | `true` only when the frame was decoded to a GPU texture (VRAM decoder, Windows). `false` covers both software decoding and the FFmpeg "hwram" decoders, which can be hardware on desktop. On the Quest build (no `mediacodec` feature) `false` means software. The decoder actually created is in the log ("create … decoder"). |
+| `hw` | `true` only when the frame was decoded to a GPU texture (VRAM decoder, Windows). `false` covers both software decoding and the FFmpeg "hwram" decoders, which can be hardware on desktop. On the Quest build (no `mediacodec` feature) `false` means software. The decoder actually created is in the log ("create … decoder"). Also `true` with Android surface decoding (`render=surface`): MediaCodec renders into the view's texture. |
 | `pacing` | present pacing (`enable-viewer-present-pacing`) of this display: `on` / `off` |
 | `fps` | decoded frames per second, shown or skipped |
 | `net+server(est)` | host loop tick (`pts`) → message parsed in `io_loop` on the viewer. Includes host grab, encode, host queueing, socket buffers, network, retransmits. See "Clock estimate". |
@@ -1244,11 +1244,13 @@ LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=
 | `decode_skip` | `decode` of the skipped frames that were decoded without output (`DecodeOutput::DecodedNoOutput`, see "Decode without output" below), p50/p95/max ms, `n/a` when there was none. `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
 | `decode_skip_conv` | `decode` of the skipped frames that were converted anyway, p50/p95/max ms, `n/a` when there was none: a frame that turned stale only during its decode, every skipped frame with `enable-viewer-decode-no-output` off, and every skipped frame of a decoder that always outputs (AMF/MFX GPU decoders). Kept apart so `decode_skip` stays a pure no-output time. |
 | `noout` | of the decoded frames, those decoded without output (`DecodeOutput::DecodedNoOutput`), count in the window. Equal to `skip` when every skipped frame was decided before its decode; lower when a frame turned stale only during its decode (the callback is skipped then, the conversion was already done) or the decoder always outputs (AMF/MFX GPU decoders) |
+| `owed_lost` / `recheck_rej` / `rej_before` | why decoded frames were not shown, counts in the window: `owed_lost` frames present pacing would show whose picture was not out after the decode (`DecodedNoOutput`; with surface decoding nothing is rendered for them, and their late picture is lost unless the thread goes idle before the next frame), `recheck_rej` frames that had their picture but the check after the decode rejected, `rej_before` frames rejected before the decode. They do not add up to `skip`: a frame the check after the decode rejected before its picture was out is in none of them, and an `owed_lost` frame whose picture `surface::idle` renders later is also counted as shown |
 | `gap50` / `gap_long` / `gap_max_ms` | shown gaps (as `shown_gap`) over 50 ms up to 1 s (stutters), over 1 s (an idle screen or a freeze; a live lane's `UDPVIDEO viewer` `fix_ms` / `request stop` tell which), and the longest one, not clipped at 1 s. Counts per window, so TCP and UDP runs compare as gaps per minute |
 | `shown_gap` | time between two consecutive frames that reached the screen (`to_ui` done → next `to_ui` done; frames counted in `ui_dropped`, and frames a later one replaced (`ui_replaced`), are left out: the gap runs from the frame shown before the replaced one to the replacing one), p50/p95/max ms. A gap is added once the next frame did not replace its frame, so the newest one lands in the next window. Gaps over 1 s (static screen) are left out. Its p95 shows stutter: with pacing on it must not grow in calm use. |
 | `discard` | received frames dropped undecoded, count in the window: `discard_queue` after a refresh request, or evicted by a full 120-deep queue |
 | `dec_fail` | `handle_frame` calls that returned no picture or an error (a frame decoded without output is not one) |
 | `via` | the session's transport, the `type` of the `TRANSPORT viewer` line (`TCP`, `UDP`, `IPv6`, `WebRTC`, `WebRTC/IPv6`, `Relay`, `WebSocket`) |
+| `render` | which path drew the window's last decoded frame: `soft` (software or RAM decoding, RGBA handed to Flutter), `texture` (GPU texture, Windows vram), `surface` (Android surface decoding: MediaCodec renders into the view's Flutter texture). With `render=surface` several fields change their meaning, see "Viewer: Android surface decoding". |
 
 The `rx_fps` / `dec_fps` / `shown_fps` / `skip` / `discard` / `dec_fail` counters come
 from `VideoCounters` (`src/client.rs`), which count always, whether or not latency is
@@ -1284,11 +1286,123 @@ RACE site=start rule=relay_hold preferred=ok@640 tcp_punch_round=ok@95 winner=UD
 | `mmcss` | MMCSS "Playback" on a display's decoder thread (`enable-viewer-mmcss`, Windows): `state=on` when the decoder outputs GPU textures (vram) and the registration succeeded, `failed` (a `MMCSS Playback registration failed` warning has the error), `reverted` when the decoder stops being a GPU one (codec switch to software or RAM decoding), `off` once at the thread start with option `N`. Nothing is logged while the decoder never was a GPU one. |
 | `audio_policy` | once per audio format of a session (`AudioBuffer` creation): `adaptive` (the `audio-target-ms` target, `floor_ms` its lower bound) or `legacy` (`try_shrink`) |
 | `audio trim` | each trim of the adaptive policy: how much buffered audio was dropped, the target it trimmed to, and the playback discontinuity generation (crossfade). Not tied to the latency option; at most one every 2 s. The legacy rule logs `skip <samples>, based …` instead. |
-| `path` | `vram/<driver>` (hwcodec GPU decoder, D3D11 texture output; driver `FFMPEG`, `AMF`, `MFX` or `NV`), `hwram/<FFmpeg decoder>/<hw device>` (FFmpeg decoder with CPU output, converted to RGBA), `vpx`, `aom` (software), `other` (MediaCodec), `none` (creation failed) |
+| `path` | `mediacodec-surface/<decoder name>` (Android surface decoding: the hardware decoder that renders into the view's texture; this line also carries `render=surface`, the display's size, `cfg` and `gen`), `vram/<driver>` (hwcodec GPU decoder, D3D11 texture output; driver `FFMPEG`, `AMF`, `MFX` or `NV`), `hwram/<FFmpeg decoder>/<hw device>` (FFmpeg decoder with CPU output, converted to RGBA), `vpx`, `aom` (software), `other` (MediaCodec), `none` (creation failed) |
 | `hw` | `true` for the `vram` path: frames reach the UI as GPU textures (the `hw` of the LATENCY line) |
 | `use_texture_render` | the viewer's texture-render setting. With `vram` and this off nothing is displayed. On desktop the RGBA path uses the texture renderer when this is on or the session shows more than one display, otherwise the soft renderer (`ui_take`, `ui_dropped`). |
 | `TRANSPORT viewer` | once per connection round, right after the connection is established: `type` the transport label, `direct` whether it is peer to peer, `secured` the encrypted handshake, `kcp` KCP over UDP, `rendezvous` the rendezvous server used, `connect_ms` from the start of `Client::start` (rendezvous, punching, race, secure handshake) |
 | `RACE` | one line per connection race. `site`: `start` (the preferred punch request against the TCP-punch-only request, `preferred` / `tcp_punch_round`), `connect` (the direct attempts after a punch: `tcp`, `udp`, `v6`, `webrtc`, then `relay` when the relay was requested afterwards), `relay_response` (`v6`, `relay`, `webrtc` after a relay answer). Each candidate: `ok@ms` / `err@ms`, milliseconds since the race started, or `pending` when the race ended before it finished (it was dropped). `winner` is the transport label of the result, `none` if all failed; `ms` the race's total time. `rule` (sites `start` and `relay_response` only): which race decided. `first`: the first success wins (the stock rule; at `start` with `enable-relay-hold` = `N`, at `relay_response` without a v6 attempt or with relay-only WebRTC). `relay_hold`: a relay result is held for `relay-fallback-delay` (default 2.5 s) while a direct attempt still runs (M8 2a; with WebRTC as before, now also without it). `prefer_udp` / `prefer_tcp`: `direct-transport-preference` is set (M8 2b); a direct result of the other kind is also held, for 300 ms, while the preferred kind still runs. A held candidate that loses shows as `ok@ms` before the winner's time. |
+
+### Viewer: Android surface decoding
+
+Android only (build feature `surface-decode`, local option `enable-android-surface-decode`,
+on unless `N`; read when a display's video thread starts and when a view starts, so a change
+applies from the next connection). H.264 and H.265 are decoded by the device's hardware
+decoder (MediaCodec) straight into a Surface that Flutter shows as a `Texture`: no YUV to
+RGBA conversion and no copy of the picture to Dart. Each view (the main window, each display
+panel) has its own engine and its own texture; Kotlin `VideoTextures` creates it and hands
+its Surface to Rust, keyed by the view's UI session id and the display.
+
+The software decoder stays the fallback, automatically and per display:
+
+- no surface registered for the display (the texture could not be made, Android below 10);
+- two views show the display, or the view shows several displays (the merged view);
+- the session is being recorded, or the codec is not H.264 / H.265;
+- the option is `N`;
+- the decoder cannot be created, configured or started, or queueing, dequeueing or rendering
+  fails;
+- the oldest frame given to the decoder has waited 1 s for its picture.
+
+A decoder that failed blocks its surface: that display stays on software until the view makes
+a new texture (another size, a reconnect), or until the block's retry is due: 3 s after the
+first failure, then 10 s, 30 s, 60 s and 60 s (`retry_in_s=` on the `state=fallback` line).
+The retry (`state=retry attempt=K`) only lifts the block, while the view still shows that
+surface, the option is on and nothing is recorded; the decoder then starts the normal way
+below (a key frame asked for, at most once a second). Its failure blocks again with the next
+delay. After 6 failures of the same surface generation without stable output, or a start
+failure that cannot pass (a surface without a size), that surface is not tried again
+(`retry_in_s=-1` and `state=retry_exhausted gen=G fails=N`): each retry costs a key frame
+request, a picture frozen up to 1 s when it fails by stalling, and the decoder setup on the
+video thread. A new texture (another generation) starts with a fresh count. A picture rendered
+60 s or more after a decoder's first picture starts the delays over (`state=stable
+backoff=reset`; a still screen in between counts as stable). A surface failure never counts towards
+`fail_counter` and never marks the codec unsupported towards the host. A decoder starts only
+on a key frame; the display's video thread asks for one (`refresh_video`) at most once a
+second, and until it arrives the picture is frozen (the queue is discarded up to the key
+frame, as after every refresh). It asks with the first frame that finds a usable surface
+without a decoder, and on a still screen 0.7 s after the surface was registered (it looks
+twice a second), or at its next look when a decoder was given up before (the surface came
+back: see below); after three requests without a key frame it stops asking until one comes.
+The view (Dart) never asks, except when the merged all-displays view takes over a display
+whose picture was in a texture.
+
+Every stop of a window's activity (a hidden panel, the headset taken off) takes the Surfaces
+of its textures: Flutter's `FlutterActivityAndFragmentDelegate.onStop` trims the renderer,
+whether or not the system sent a memory trim. Kotlin gives Rust the new Surfaces when the
+activity starts again (`VideoTextures.reattach`, and the engine's own callback when the whole
+process resumes): `state=unregistered`, `state=released` (still screen) or `state=fallback`
+(frames were coming: software meanwhile), then `state=registered` with a new `gen`,
+`state=refresh` and a new `decoder` line. Until that decoder's first picture the window shows
+the software picture, or nothing when the screen was still while it was stopped (up to about
+0.5 s plus the refresh).
+
+```
+LATENCY client surface display=1 state=option value=on
+LATENCY client surface display=1 state=registered gen=3 texture=2 size=1920x1080 hevc="c2.qti.hevc.decoder" avc="c2.qti.avc.decoder" sid=…
+LATENCY client surface display=1 state=refresh
+LATENCY client decoder display=1 codec=H265 path=mediacodec-surface/c2.qti.hevc.decoder hw=true use_texture_render=false render=surface size=1920x1080 cfg=0 gen=3
+LATENCY client surface display=1 state=format decoder=c2.qti.hevc.decoder buffer=1920x1088 picture=1920x1080 crop=Some((0, 0, 1919, 1079)) format=…
+SURFDEC display=1 name=c2.qti.hevc.decoder in=150 out=150 rendered=148 dropped=2 out_ms=7.9/11.2/14.0 late=0 lag=0 waiting=0
+LATENCY client surface display=1 state=fallback render=soft decoder=c2.qti.hevc.decoder reason="decode: no output for 1003 ms (1 access units waiting)" retry_in_s=3
+LATENCY client surface display=1 state=retry attempt=1 gen=3
+LATENCY client surface display=1 state=refresh
+LATENCY client decoder display=1 codec=H265 path=mediacodec-surface/c2.qti.hevc.decoder … gen=3
+```
+
+The surface state lines (`state=fallback` with its reason, `state=retry`, `state=retry_exhausted`,
+`state=stable`, `state=config_retry`, the `decoder … path=mediacodec-surface` start and
+`state=released`) also go to logcat with tag
+`RustDeskSurface`, in release builds too: `adb logcat -s RustDeskSurface`.
+
+| Line / field | Meaning |
+|---|---|
+| `state=option` | once per video thread: the option as that thread read it |
+| `state=registered` / `unregistered` | a view gave Rust its texture's Surface, or took it back. `gen`: the registration's number (a decoder never outlives it); `texture`: the view's Flutter texture id; `hevc` / `avc`: the hardware decoders Kotlin picked from `MediaCodecList` (logcat tag `VideoTextures` lists all candidates with `lowLatency` and `maxInstances`) |
+| `state=refresh` | the video thread asked the host for a key frame, to start a decoder on |
+| `decoder … path=mediacodec-surface/<name>` | a surface decoder started. `cfg`: the configuration step that worked: 0 all keys (`low-latency`, `priority` 0, `operating-rate` = the session's custom fps (at least 60; 120 without one), and on Qualcomm decoders `vendor.qti-ext-dec-low-latency.enable` and `vendor.qti-ext-dec-picture-order.enable`), 1 without the vendor keys, 2 also without `operating-rate`, 3 also without `low-latency`, 4 also without `priority`. Steps 0 and 1 are tried with that rate, then again with 60 (order 0, 0@60, 1, 1@60, 2, 3, 4); `rate=`: the rate that worked, 0 from step 2 on. A refused try is logged as `state=config_retry` with its `step` and `rate` |
+| `state=format` | the decoder's output format: the buffer it renders, the picture inside it, and the format as the system prints it. A buffer larger than the picture is padding; the view cuts it off (Flutter draws the whole buffer) |
+| `state=fallback` | the surface decoder is gone and the software decoder takes over with the next key frame; `reason` says why. `retry_in_s` (a failure only): the surface is blocked and tried again after this many seconds, logged as `state=retry attempt=K gen=G` when it is. `state=reset`: the stream restarted (display switch, resolution change), a new decoder starts with the next key frame. `state=released`: no frame came and the decoder's surface is no longer registered (a closed panel, a switched display, a stopped activity, a memory trim): the hardware decoder is given back, checked twice a second |
+| `SURFDEC` | every 5 s while frames flow: access units queued (`in`), output buffers taken (`out`), rendered to the surface, released without rendering (`dropped`: a newer one was out, or present pacing did not show the frame); `out_ms` p50/p95/max from an access unit being queued to its output buffer being taken (the decoder's latency, late pictures included); `late`: frames whose picture was not out within the decode's wait (30 ms, 9 ms during a backlog); a late picture is shown only if the thread goes idle first (or in place of the next shown frame's late picture, `lag`), otherwise the next frame's decode drops it; `lag`: of those, the ones for which an older picture was shown instead; `waiting`: access units still without a picture |
+
+The `LATENCY client` line with `render=surface`:
+
+| Field | Meaning with `render=surface` |
+|---|---|
+| `hw` | `true` |
+| `decode` | access unit queued → its output buffer available, as far as the decode waited for it (at most 30 ms; while newer frames wait at most 9 ms, option `enable-android-surface-backlog-wait`, "N": not at all): the decoder's latency, not CPU time. `SURFDEC out_ms` has it without the cap |
+| `to_ui` | the output buffer released to the surface (`releaseOutputBuffer`) → the call returned. What Flutter does with it afterwards (one of its frames, its raster thread, the system compositor) is not in any Rust number |
+| `ui_take` | `n/a`: no picture goes through Dart |
+| `ui_dropped`, `ui_replaced` | 0 |
+| `shown_fps` | output buffers rendered to the surface per second: an upper bound of what reaches the screen. The Flutter line `[surface stat]` has the frames the view's engine drew |
+| `noout`, `decode_skip` | also the frames whose picture was not out in time (shown late, between frames, and then counted in `shown_fps`) |
+| `skip` | frames present pacing did not render. With surface decoding a frame is rendered only when no newer frame is waiting (or the backlog has lasted 50 ms): Flutter's texture queue shows the older of two pictures that arrive within one of its frames and keeps the newer one back until the next picture |
+
+The fps controllers' busy time leaves out the wait for the decoder's output (it is idle time
+of a pipeline; counted, it would cap the frame rate at one frame per decoder latency). A
+decoder that cannot keep up shows as a growing queue, as before.
+
+Flutter side (logcat, per engine, every 5 s while a texture shows the picture):
+
+```
+[surface] main texture=2 display=0 1920x1080
+[surface] main display=0 active decoder=c2.qti.hevc.decoder picture=1920x1080 buffer=1920x1088 texture=2
+[surface stat] main d=0 flutter_fps=30.1 raster_ms avg=3.9 max=9.8 build_ms avg=1.2
+[surface] display=0 software picture shown (fallback)
+```
+
+`flutter_fps` is the frames that engine drew (any cause, a texture picture or a cursor move):
+lower than Rust's `shown_fps` for the display means pictures were replaced in the texture's
+queue before they were drawn. Kotlin asks for one extra engine frame every 250 ms while
+pictures are rendered and one after the last, so the newest picture never stays in that queue.
 
 ### Viewer: fps control
 
@@ -1345,7 +1459,7 @@ user's fps as before.
 #### Gentle fps control
 
 `io_loop.rs` `GentleFpsControl`, local option `enable-gentle-fps-control`: on by
-default on Windows (`N` brings back the legacy controller above), off by default on
+default on Windows and Android (`N` brings back the legacy controller above), off by default on
 other platforms (`Y` turns it on). Read when a connection starts. It sends the same
 message as the legacy controller (`Misc` `OptionMessage{custom_fps}`), with values in
 10..custom, so a stock host accepts it; no wire change. It works from the decoder
@@ -1430,7 +1544,7 @@ are not used); after the second `|` the gentle state per display:
 ### Viewer: present pacing
 
 "Always show the newest frame" (`src/client.rs` `PresentPacer`), local option
-`enable-viewer-present-pacing`: on by default on Windows (`N` turns it off), off
+`enable-viewer-present-pacing`: on by default on Windows and Android (`N` turns it off), off
 by default on other platforms (`Y` turns it on). Read when a display's video thread
 starts, so a change applies from the next connection (or display switch). No wire
 change; the host is not involved.
@@ -1473,8 +1587,8 @@ the frame will be shown. A frame that will not be shown is still decoded, but:
   hand-off; one GPU event query still waits for the decode, so `decode_skip` stays an
   honest decode time and the GPU queue cannot run ahead of the decoder. AMF/MFX
   decoders ignore the flag and always output (counted in `skip`, not in `noout`).
-- Android MediaCodec: the output buffer is released without conversion (only with
-  pacing turned on there, `Y`).
+- Android MediaCodec: the output buffer is released without conversion (pacing is on
+  by default there too, `N` turns it off).
 
 `handle_frame` returns `DecodeOutput::DecodedNoOutput` for such a frame, a success:
 it resets the decoder's fail counter like a shown frame, so skipped frames never get
@@ -1569,7 +1683,7 @@ lines do not say which session they belong to. Capacity overwrites past 3 s of a
 not counted in `trim` (they have their own debug log line).
 
 Adaptive audio target (`src/client/audio_target.rs`), local option `audio-target-ms`:
-empty is adaptive on Windows and the legacy rule elsewhere, `0` is the legacy rule
+empty is adaptive on Windows and Android and the legacy rule elsewhere, `0` is the legacy rule
 everywhere, a number N > 0 is adaptive with N ms as the lower bound (at most 2000).
 Read when the audio format of a session starts. Only the viewer's received audio
 (`start_audio_thread`) follows it; the microphone audio a host plays into its virtual
@@ -1712,7 +1826,8 @@ adb logcat | grep LATENCY
 The Rust lines are also in the app's log file
 (`<app files>/RustDesk/Logs`), readable with `adb shell run-as <package>` only
 on debuggable builds. Debug builds log Rust directly to logcat (tag `ffi`), so
-there each client line appears twice.
+there each client line appears twice. The Android surface decoder's state lines are
+written to logcat directly, tag `RustDeskSurface` (see "Android surface decoding").
 
 ## Reading the numbers together
 

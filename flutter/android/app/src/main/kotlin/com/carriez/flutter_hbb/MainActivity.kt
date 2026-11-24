@@ -19,6 +19,8 @@ import android.os.Bundle
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.media.MediaCodecInfo
 import android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -75,6 +77,9 @@ class MainActivity : FlutterActivity() {
     private var isAudioStart = false
     private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
 
+    // Hardware decoding into Flutter textures of this engine (see VideoTextures).
+    private var videoTextures: VideoTextures? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         if (MainService.isReady) {
@@ -87,6 +92,7 @@ class MainActivity : FlutterActivity() {
             channelTag
         )
         initFlutterChannel(flutterMethodChannel!!)
+        videoTextures = VideoTextures(flutterEngine, "main")
         thread {
             try {
                 setCodecInfo()
@@ -98,6 +104,9 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Back from game mode: Dart reopens the panels the system closed meanwhile.
+        GameMode.mainResumed = true
+        GameMode.onMainResumed(flutterMethodChannel)
         val inputPer = InputService.isOpen
         activity.runOnUiThread {
             flutterMethodChannel?.invokeMethod(
@@ -105,6 +114,11 @@ class MainActivity : FlutterActivity() {
                 mapOf("name" to "input", "value" to inputPer.toString())
             )
         }
+    }
+
+    override fun onPause() {
+        GameMode.mainResumed = false
+        super.onPause()
     }
 
     private fun requestMediaProjection() {
@@ -229,10 +243,81 @@ class MainActivity : FlutterActivity() {
             _rdClipboardManager = RdClipboardManager(getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager)
             FFI.setClipboardManager(_rdClipboardManager!!)
         }
+        // Quest gamepad mode in this 2D panel (QuestGamepadCapture.kt).
+        if (QuestInput.isQuest) {
+            QuestGamepadCapture.init(this, { c ->
+                flutterMethodChannel?.invokeMethod(
+                    "on_state_changed",
+                    mapOf("name" to "gamepad_capture", "value" to c.toString())
+                )
+            }, { v ->
+                flutterMethodChannel?.invokeMethod("quest_gamepad_host", mapOf("value" to v))
+            })
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        QuestGamepadCapture.onWindowFocusChanged(hasFocus)
+    }
+
+    // At background level the engine closes the buffers behind its textures: the decoders
+    // must have let go of them first.
+    override fun onTrimMemory(level: Int) {
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            videoTextures?.beforeTrim()
+        }
+        super.onTrimMemory(level)
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        videoTextures?.disposeAll()
+        videoTextures = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    private fun questStatus(): Map<String, Any> {
+        val out = HashMap<String, Any>()
+        try {
+            val b = registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (b != null) {
+                val level = b.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+                val scale = b.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100)
+                if (level >= 0 && scale > 0) out["battery"] = level * 100 / scale
+                val st = b.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
+                out["charging"] = st == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    st == android.os.BatteryManager.BATTERY_STATUS_FULL
+                out["plugged"] = b.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0
+            }
+        } catch (e: Throwable) {
+            Log.w(logTag, "quest_status battery: $e")
+        }
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                out["wifi"] = true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val wi = caps.transportInfo as? android.net.wifi.WifiInfo
+                    if (wi != null) {
+                        out["rssi"] = wi.rssi
+                        out["linkMbps"] = wi.linkSpeed
+                        out["freqMHz"] = wi.frequency
+                    }
+                }
+            } else {
+                out["wifi"] = false
+            }
+        } catch (e: Throwable) {
+            Log.w(logTag, "quest_status wifi: $e")
+        }
+        return out
     }
 
     override fun onDestroy() {
-        Log.e(logTag, "onDestroy")
+        Log.e(logTag, "onDestroy finishing=$isFinishing gameMode=${GameMode.active}")
+        // Sends the owed off = true and lets go of the capture before any session closes.
+        QuestGamepadCapture.release()
         // The process can outlive the UI whenever something keeps it alive:
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
@@ -240,8 +325,17 @@ class MainActivity : FlutterActivity() {
         // `isFinishing` distinguishes the user really leaving from a destroy
         // for recreation (configuration change, "don't keep activities"),
         // which must not tear down a live session.
-        if (isFinishing) {
+        // Game mode: the session lives on in the immersive view (XrActivity). If the system
+        // finishes this activity meanwhile, the teardown waits for the end of game mode
+        // (GameMode.end); test T1 must never see this line.
+        if (isFinishing && GameMode.active) {
+            Log.e(GameMode.TAG, "MainActivity FINISHED during game mode: sessions kept, teardown deferred")
+            GameMode.teardownDeferred = true
+        } else if (isFinishing) {
+            DisplayActivity.closeAll()
             FFI.closeAllSessions()
+        } else if (GameMode.active) {
+            Log.w(GameMode.TAG, "MainActivity destroyed (not finishing) during game mode")
         }
         mainService?.let {
             unbindService(serviceConnection)
@@ -647,6 +741,77 @@ class MainActivity : FlutterActivity() {
                 "on_voice_call_closed" -> {
                     onVoiceCallClosed()
                 }
+                "quest_get_info" -> {
+                    result.success(QuestInput.info())
+                }
+                "quest_status" -> {
+                    // Headset battery and Wi-Fi for the toolbar chip (no extra permission:
+                    // the battery intent is sticky, Wi-Fi comes from the active network).
+                    result.success(questStatus())
+                }
+                "quest_input_config" -> {
+                    result.success(QuestInput.configure(call.arguments))
+                }
+                "quest_gamepad_capture" -> {
+                    // {on: Boolean, sid: String?}: the Quest menu's gamepad-mode toggle, or
+                    // the remote page closing (on = false). The capture state comes back as
+                    // on_state_changed gamepad_capture; false here = no capture API.
+                    val a = call.arguments as? Map<*, *>
+                    val on = a?.get("on") as? Boolean ?: false
+                    if (on) {
+                        result.success(QuestGamepadCapture.enable(a?.get("sid") as? String))
+                    } else {
+                        QuestGamepadCapture.disable()
+                        result.success(true)
+                    }
+                }
+                "panel_open" -> {
+                    // One more Quest panel for one remote display (see DisplayActivity).
+                    val a = call.arguments as? Map<*, *>
+                    val d = a?.get("display") as? Int
+                    val sid = a?.get("sid") as? String
+                    val args = a?.get("args") as? String
+                    result.success(
+                        if (d == null || sid == null || args == null) false
+                        else DisplayActivity.open(this, d, sid, args)
+                    )
+                }
+                "panel_close" -> {
+                    (call.arguments as? String)?.let { DisplayActivity.close(it) }
+                    result.success(true)
+                }
+                "panel_close_all" -> {
+                    DisplayActivity.closeAll()
+                    result.success(true)
+                }
+                "game_mode_enter" -> {
+                    // Quest immersive game mode (XrActivity). This activity stays: no finish.
+                    val a = call.arguments as? Map<*, *>
+                    val sid = a?.get("sid") as? String
+                    val d = a?.get("display") as? Int
+                    val w = a?.get("w") as? Int ?: 0
+                    val h = a?.get("h") as? Int ?: 0
+                    val pad = a?.get("pad") as? Int ?: 0
+                    result.success(
+                        if (sid == null || d == null) false
+                        else GameMode.enter(this, sid, d, w, h, pad)
+                    )
+                }
+                "video_texture_create" -> {
+                    val a = call.arguments as? Map<*, *>
+                    val sid = a?.get("sid") as? String
+                    val d = a?.get("display") as? Int
+                    val w = a?.get("w") as? Int
+                    val h = a?.get("h") as? Int
+                    result.success(
+                        if (sid == null || d == null || w == null || h == null) -1L
+                        else videoTextures?.create(sid, d, w, h) ?: -1L
+                    )
+                }
+                "video_texture_dispose" -> {
+                    (call.arguments as? Int)?.let { videoTextures?.dispose(it) }
+                    result.success(true)
+                }
                 else -> {
                     result.error("-1", "No such method", null)
                 }
@@ -995,16 +1160,46 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private val poseWatcher = PoseWatcher(this) { -1 }
+
     override fun onStop() {
+        poseWatcher.stop()
         super.onStop()
+        if (GameMode.active) Log.i(GameMode.TAG, "MainActivity onStop (game mode)")
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
-        if (!disableFloatingWindow && MainService.isReady) {
+        // No floating window over the immersive view (critique #13).
+        if (!disableFloatingWindow && MainService.isReady && !GameMode.active) {
             startService(Intent(this, FloatingWindowService::class.java))
         }
     }
 
     override fun onStart() {
         super.onStart()
+        // The stop before this start took the textures' Surfaces (see VideoTextures.reattach).
+        videoTextures?.reattach()
+        poseWatcher.start()
         stopService(Intent(this, FloatingWindowService::class.java))
+    }
+
+    // Meta Quest controllers: their buttons and sticks never reach Flutter as pointer events,
+    // so the remote page gets them from QuestInput over the method channel. See QuestInput.kt.
+    // While gamepad mode holds the controllers, QuestGamepadCapture takes their events first, so
+    // they go to the host's virtual pad and never become mouse or scroll input.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (QuestGamepadCapture.onKey(event)) return true
+        if (QuestInput.onKey(flutterMethodChannel, event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        DisplayActivity.onHover(-1, ev, window.decorView.width)
+        if (QuestGamepadCapture.onGenericMotion(ev)) return true
+        if (QuestInput.onGenericMotion(flutterMethodChannel, ev)) return true
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        QuestInput.onTouch(flutterMethodChannel, ev)
+        return super.dispatchTouchEvent(ev)
     }
 }

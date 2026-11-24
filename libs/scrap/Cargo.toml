@@ -25,6 +25,9 @@ mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
 vram = ["hwcodec/vram"]
+# Android viewer: H.264/H.265 decoded by MediaCodec straight into a Surface that Flutter shows as a
+# Texture (src/android/surface_decoder.rs). Raw ndk-sys: the calls used are all API 21.
+surface-decode = ["dep:ndk-sys"]
 
 [dependencies]
 cfg-if = "1.0"
@@ -50,6 +53,7 @@ lazy_static = "1.4"
 log = "0.4"
 serde_json = "1.0"
 ndk = { version = "0.7", features = ["media"], optional = true}
+ndk-sys = { version = "0.4", features = ["media"], optional = true }
 ndk-context = "0.1"
 
 [target.'cfg(not(target_os = "android"))'.dev-dependencies]

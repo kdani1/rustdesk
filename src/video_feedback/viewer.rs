@@ -41,10 +41,10 @@ const ARRIVALS_KEPT: usize = 256;
 /// Done entries a video thread keeps between two batches.
 const DONE_CAP: usize = 256;
 
-/// Whether this viewer sends feedback to a host that advertised `host_version`: Windows only,
-/// and not with `enable-video-feedback=N`.
+/// Whether this viewer sends feedback to a host that advertised `host_version`: Windows and
+/// Android viewers (`client::VIEWER_LATENCY_DEFAULTS`), and not with `enable-video-feedback=N`.
 pub fn enabled(host_version: u32) -> bool {
-    cfg!(windows)
+    crate::client::VIEWER_LATENCY_DEFAULTS
         && host_version >= VERSION
         && LocalConfig::get_option(keys::OPTION_ENABLE_VIDEO_FEEDBACK) != "N"
 }

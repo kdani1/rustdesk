@@ -894,9 +894,42 @@ class ClientInfo extends StatelessWidget {
 
 void androidChannelInit() {
   gFFI.setMethodCallHandler((method, arguments) {
-    debugPrint("flutter got android msg,$method,$arguments");
+    // Quest controller events arrive at up to ~90 Hz: route them before the log line below.
+    if (method == "quest_input") {
+      gFFI.inputModel.quest.onPlatformEvent(arguments);
+      return "";
+    }
+    // Poses arrive every 500 ms and would push everything else out of logcat.
+    if (method != "panel_pose") {
+      debugPrint("flutter got android msg,$method,$arguments");
+    }
     try {
       switch (method) {
+        case "panel_pose":
+          androidDisplayPanels.onPose(
+              gFFI,
+              arguments["id"] as int,
+              (arguments["v"] as List)
+                  .map((e) => (e as num).toDouble())
+                  .toList());
+          break;
+        case "panel_neighbor":
+          androidDisplayPanels.onNeighbor(
+              gFFI, arguments["left"] as int, arguments["right"] as int);
+          break;
+        case "panel_closed":
+          androidDisplayPanels.onPanelClosed(
+              arguments["display"] as int, arguments["sid"] as String,
+              reason: arguments["reason"] as String? ?? kPanelCloseUser);
+          break;
+        case "game_mode_exited":
+          // Quest game mode ended (GameMode.onMainResumed in XrActivity.kt).
+          {
+            final reason = arguments["reason"] as String? ?? '';
+            if (reason.startsWith('error')) showToast('Játék mód: $reason');
+            androidDisplayPanels.onGameModeExited(gFFI, reason);
+          }
+          break;
         case "start_capture":
           {
             gFFI.dialogManager.dismissAll();
@@ -908,9 +941,16 @@ void androidChannelInit() {
             var name = arguments["name"] as String;
             var value = arguments["value"] as String == "true";
             debugPrint("from jvm:on_state_changed,$name:$value");
+            if (name == "gamepad_capture") {
+              gFFI.inputModel.quest.onGamepadCapture(value);
+              break;
+            }
             gFFI.serverModel.changeStatue(name, value);
             break;
           }
+        case "quest_gamepad_host":
+          gFFI.inputModel.quest.onGamepadHost(arguments["value"] as int);
+          break;
         case "on_android_permission_result":
           {
             var type = arguments["type"] as String;

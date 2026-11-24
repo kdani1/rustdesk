@@ -1755,6 +1755,25 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn on_voice_call_incoming(&self);
     fn get_rgba(&self, display: usize) -> *const u8;
     fn next_rgba(&self, display: usize);
+    /// Android surface decoding: the surface to decode `display` into, when exactly one view
+    /// shows that display alone and registered one. `None`: software decoding.
+    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+    fn video_surface(
+        &self,
+        _display: usize,
+    ) -> Option<scrap::android::surface_decoder::SurfaceRef> {
+        None
+    }
+    /// Android surface decoding: `display`'s picture is on the view's surface now (`active`,
+    /// with its size, after the first rendered buffer and after a format change), or no longer.
+    #[cfg(all(target_os = "android", feature = "surface-decode"))]
+    fn on_video_surface(
+        &self,
+        _display: usize,
+        _active: bool,
+        _info: Option<&scrap::android::surface_decoder::SurfaceInfo>,
+    ) {
+    }
     #[cfg(all(feature = "vram", feature = "flutter"))]
     fn on_texture(&self, display: usize, texture: *mut c_void);
     fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);

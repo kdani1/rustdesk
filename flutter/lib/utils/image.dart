@@ -131,3 +131,55 @@ class ImagePainter extends CustomPainter {
     return oldDelegate != this;
   }
 }
+
+/// One display's picture and where it goes: remote pixels relative to the top-left corner
+/// of all displays together.
+class DisplayTile {
+  const DisplayTile(this.image, this.dst);
+  final ui.Image image;
+  final Rect dst;
+}
+
+/// Mobile "all displays" view: every display's picture at its own position on the host's
+/// desktop, in one scaled canvas (ImagePainter is the single-display case).
+class MultiImagePainter extends CustomPainter {
+  MultiImagePainter({
+    required this.tiles,
+    required this.x,
+    required this.y,
+    required this.scale,
+  });
+
+  final List<DisplayTile> tiles;
+  final double x;
+  final double y;
+  final double scale;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (tiles.isEmpty) return;
+    if (x.isNaN || y.isNaN) return;
+    canvas.scale(scale, scale);
+    // No edge anti-aliasing: two tiles that meet must not let the background through.
+    final paint = Paint()..isAntiAlias = false;
+    if ((scale - 1.0).abs() > 0.001) {
+      paint.filterQuality = FilterQuality.medium;
+      if (scale > 10.00000) {
+        paint.filterQuality = FilterQuality.high;
+      }
+    }
+    // Whole pixels, as ImagePainter: the tiles then meet exactly, edge to edge.
+    final origin = Offset(x.toInt().toDouble(), y.toInt().toDouble());
+    for (final t in tiles) {
+      final image = t.image;
+      canvas.drawImageRect(
+          image,
+          Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+          t.dst.shift(origin),
+          paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(CustomPainter oldDelegate) => true;
+}

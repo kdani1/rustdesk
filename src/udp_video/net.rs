@@ -233,7 +233,22 @@ pub fn bind(ip: IpAddr, rcvbuf: usize, sndbuf: usize) -> io::Result<(UdpSocket, 
             }
         }
     }
-    #[cfg(not(windows))]
+    // Android viewers (Quest): the default receive buffer (about 200 KB) is smaller than one
+    // key frame burst, so ask for the same sizes as on Windows (capped by net.core.rmem_max).
+    #[cfg(target_os = "android")]
+    {
+        if rcvbuf > 0 {
+            if let Err(e) = unix::set_buf(&socket, hbb_common::libc::SO_RCVBUF, rcvbuf) {
+                notes.push(format!("SO_RCVBUF: {e}"));
+            }
+        }
+        if sndbuf > 0 {
+            if let Err(e) = unix::set_buf(&socket, hbb_common::libc::SO_SNDBUF, sndbuf) {
+                notes.push(format!("SO_SNDBUF: {e}"));
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
     let _ = (rcvbuf, sndbuf);
     Ok((socket, notes))
 }
@@ -363,6 +378,30 @@ mod win {
             Ok(())
         } else {
             Err(last_error())
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+mod unix {
+    use hbb_common::libc;
+    use std::{io, net::UdpSocket, os::unix::io::AsRawFd};
+
+    pub fn set_buf(socket: &UdpSocket, name: libc::c_int, bytes: usize) -> io::Result<()> {
+        let v = bytes.min(libc::c_int::MAX as usize) as libc::c_int;
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                name,
+                &v as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }

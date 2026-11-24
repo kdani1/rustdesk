@@ -3668,11 +3668,11 @@ fn lift_auto_fps_for(auto_sent: Option<usize>, custom: usize) -> Option<usize> {
     auto_sent.filter(|a| *a < custom).map(|_| custom)
 }
 
-/// Whether gentle fps control is on (`enable-gentle-fps-control`): by default on Windows ("N"
-/// turns it off), off elsewhere unless "Y". Read once per connection.
+/// Whether gentle fps control is on (`enable-gentle-fps-control`): by default on Windows and
+/// Android ("N" turns it off), off elsewhere unless "Y". Read once per connection.
 fn gentle_fps_control_enabled() -> bool {
     let option = LocalConfig::get_option(keys::OPTION_ENABLE_GENTLE_FPS_CONTROL);
-    if cfg!(windows) {
+    if crate::client::VIEWER_LATENCY_DEFAULTS {
         option != "N"
     } else {
         option == "Y"

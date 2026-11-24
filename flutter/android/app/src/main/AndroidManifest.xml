@@ -3,6 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.carriez.flutter_hbb">
 
+    <!-- Test: the window position call of Horizon OS (signature-level, so normally not granted). -->
+    <uses-permission android:name="horizonos.permission.MANAGE_APP_VOLUMETRIC_WINDOWS" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove" />
@@ -19,6 +21,20 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- Quest game mode (XrActivity): head tracking is used but not required, the 2D panel
+         stays the app's main surface. The OpenXR loader AAR merges in its own permissions
+         and <queries> (runtime broker); check the merged manifest. -->
+    <uses-feature
+        android:name="android.hardware.vr.headtracking"
+        android:required="false"
+        android:version="1" />
+    <!-- GAME MODE TOGGLE (critique #1, test T2 both ways): Meta's hybrid-app element. Left out
+         on purpose at first, since it may change how the 2D panel behaves. To test with it,
+         uncomment the single line below (verify the element name and versions against Meta's
+         current "hybrid apps" page first), rebuild, and repeat T1/T2.
+    <horizonos:uses-horizonos-sdk xmlns:horizonos="http://schemas.horizonos/sdk" horizonos:minSdkVersion="69" horizonos:targetSdkVersion="69" />
+    -->
+
     <queries>
         <intent>
             <!-- https://developer.android.com/training/package-visibility/use-cases#open-urls-custom-tabs -->
@@ -29,7 +45,7 @@
     <application
         android:name=".MainApplication"
         android:icon="@mipmap/ic_launcher"
-        android:label="RustDesk"
+        android:label="${appLabel}"
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true">
 
@@ -72,6 +88,8 @@
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
+                <!-- Quest: this is the 2D panel entry of a hybrid app (XrActivity is the VR one). -->
+                <category android:name="com.oculus.intent.category.2D" />
             </intent-filter>
 
             <!-- Intent for deep linking-->
@@ -80,6 +98,47 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="rustdesk" />
+            </intent-filter>
+        </activity>
+
+        <!-- One extra Quest panel per remote display, opened from the remote page. -->
+        <activity
+            android:name=".DisplayActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode|navigation"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="standard"
+            android:taskAffinity="com.carriez.flutter_hbb.display"
+            android:autoRemoveFromRecents="true"
+            android:resizeableActivity="true"
+            android:theme="@style/LaunchTheme"
+            android:windowSoftInputMode="adjustResize">
+            <layout
+                android:defaultWidth="1024dp"
+                android:defaultHeight="600dp"
+                android:minWidth="360dp"
+                android:minHeight="225dp" />
+        </activity>
+
+        <!-- Quest immersive game mode (XrActivity.kt, OpenXR in src/client/xr): a plain Activity
+             in a task of its own, started from MainActivity, never from the launcher. -->
+        <activity
+            android:name=".XrActivity"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|locale|layoutDirection|fontScale"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:screenOrientation="landscape"
+            android:taskAffinity="${applicationId}.xr"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            <meta-data
+                android:name="com.oculus.vr.focusaware"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
             </intent-filter>
         </activity>
 
@@ -109,6 +168,11 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- Quest game mode: the devices the immersive view is built for. App-level, so it
+             also describes the 2D panel app: keep every headset the APK goes onto. -->
+        <meta-data
+            android:name="com.oculus.supportedDevices"
+            android:value="quest3|quest3s" />
     </application>
 
 </manifest>
