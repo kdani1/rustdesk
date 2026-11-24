@@ -104,6 +104,9 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Back from game mode: Dart reopens the panels the system closed meanwhile.
+        GameMode.mainResumed = true
+        GameMode.onMainResumed(flutterMethodChannel)
         val inputPer = InputService.isOpen
         activity.runOnUiThread {
             flutterMethodChannel?.invokeMethod(
@@ -111,6 +114,11 @@ class MainActivity : FlutterActivity() {
                 mapOf("name" to "input", "value" to inputPer.toString())
             )
         }
+    }
+
+    override fun onPause() {
+        GameMode.mainResumed = false
+        super.onPause()
     }
 
     private fun requestMediaProjection() {
@@ -291,7 +299,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        Log.e(logTag, "onDestroy")
+        Log.e(logTag, "onDestroy finishing=$isFinishing gameMode=${GameMode.active}")
         // The process can outlive the UI whenever something keeps it alive:
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
@@ -299,9 +307,17 @@ class MainActivity : FlutterActivity() {
         // `isFinishing` distinguishes the user really leaving from a destroy
         // for recreation (configuration change, "don't keep activities"),
         // which must not tear down a live session.
-        if (isFinishing) {
+        // Game mode: the session lives on in the immersive view (XrActivity). If the system
+        // finishes this activity meanwhile, the teardown waits for the end of game mode
+        // (GameMode.end); test T1 must never see this line.
+        if (isFinishing && GameMode.active) {
+            Log.e(GameMode.TAG, "MainActivity FINISHED during game mode: sessions kept, teardown deferred")
+            GameMode.teardownDeferred = true
+        } else if (isFinishing) {
             DisplayActivity.closeAll()
             FFI.closeAllSessions()
+        } else if (GameMode.active) {
+            Log.w(GameMode.TAG, "MainActivity destroyed (not finishing) during game mode")
         }
         mainService?.let {
             unbindService(serviceConnection)
@@ -737,6 +753,19 @@ class MainActivity : FlutterActivity() {
                     DisplayActivity.closeAll()
                     result.success(true)
                 }
+                "game_mode_enter" -> {
+                    // Quest immersive game mode (XrActivity). This activity stays: no finish.
+                    val a = call.arguments as? Map<*, *>
+                    val sid = a?.get("sid") as? String
+                    val d = a?.get("display") as? Int
+                    val w = a?.get("w") as? Int ?: 0
+                    val h = a?.get("h") as? Int ?: 0
+                    val pad = a?.get("pad") as? Int ?: 0
+                    result.success(
+                        if (sid == null || d == null) false
+                        else GameMode.enter(this, sid, d, w, h, pad)
+                    )
+                }
                 "video_texture_create" -> {
                     val a = call.arguments as? Map<*, *>
                     val sid = a?.get("sid") as? String
@@ -1105,8 +1134,10 @@ class MainActivity : FlutterActivity() {
     override fun onStop() {
         poseWatcher.stop()
         super.onStop()
+        if (GameMode.active) Log.i(GameMode.TAG, "MainActivity onStop (game mode)")
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
-        if (!disableFloatingWindow && MainService.isReady) {
+        // No floating window over the immersive view (critique #13).
+        if (!disableFloatingWindow && MainService.isReady && !GameMode.active) {
             startService(Intent(this, FloatingWindowService::class.java))
         }
     }

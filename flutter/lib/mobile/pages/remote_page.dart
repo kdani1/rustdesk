@@ -1477,6 +1477,61 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     );
   }
 
+  /// Quest immersive game mode (XrActivity, phase 1: a black immersive view, the controllers
+  /// only logged). The main view shows a single display first; this page and its session stay
+  /// alive behind the immersive view, and the panels the system closes meanwhile come back
+  /// when it ends (AndroidDisplayPanels.gameModeSuspended).
+  Future<void> _enterGameMode() async {
+    final ffi = gFFI;
+    final pi = ffi.ffiModel.pi;
+    if (pi.displays.isEmpty || ffi.ffiModel.waitForFirstImage.isTrue) return;
+    // Asked before the switch: nothing of this page is visible in the immersive view, so the
+    // way out (and the warning about the system menu's Quit, risk 10) must be read here.
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Játék mód'),
+        content: const Text(
+            'Kilépés: tartsd nyomva a bal Menü gombot 1,5 mp-ig (vagy Menü+L3+R3).\n\n'
+            'A rendszermenü kilépés gombja az egész appot bezárhatja, a kapcsolattal együtt.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Mégse')),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('Belépés')),
+        ],
+      ),
+    );
+    if (go != true || !mounted || ffi.closed) return;
+    final panels = androidDisplayPanels;
+    final d = await panels.enterGameMode(ffi);
+    if (d < 0 || d >= pi.displays.length) {
+      await panels.onGameModeExited(ffi, 'no display');
+      return;
+    }
+    final disp = pi.displays[d];
+    bool ok = false;
+    try {
+      ok = await platformFFI.invokeMethodWithResult<bool>('game_mode_enter', {
+            'sid': ffi.sessionId.toString(),
+            'display': d,
+            'w': disp.width,
+            'h': disp.height,
+            // Features.gamepad comes with the host pad (phase 3); 0 = immersive view only.
+            'pad': 0,
+          }) ==
+          true;
+    } catch (e) {
+      debugPrint('[gamemode] enter failed: $e');
+    }
+    if (!ok) {
+      await panels.onGameModeExited(ffi, 'not started');
+      showToast('A játék mód nem indult el');
+    }
+  }
+
   Widget _questMenuButton() {
     final quest = inputModel.quest;
     return Obx(() {
@@ -1485,6 +1540,7 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
         icon: const Icon(Icons.sports_esports, color: Colors.white),
         tooltip: 'Quest controller',
         onSelected: (v) {
+          if (v == 'gamemode') _enterGameMode();
           if (v == 'pointer') quest.setPointerMode(!quest.pointerMode.value);
           if (v == 'cursor') quest.setCursorOverlay(!quest.cursorOverlay.value);
           if (v == 'autokbd') {
@@ -1500,6 +1556,12 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
           }
         },
         itemBuilder: (_) => [
+          PopupMenuItem(
+            value: 'gamemode',
+            enabled: gFFI.ffiModel.pi.displays.isNotEmpty &&
+                gFFI.ffiModel.waitForFirstImage.isFalse,
+            child: const Text('Játék mód'),
+          ),
           CheckedPopupMenuItem(
             value: 'pointer',
             checked: quest.pointerMode.value,

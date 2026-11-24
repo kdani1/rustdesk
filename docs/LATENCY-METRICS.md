@@ -1217,7 +1217,7 @@ the congestion while the host's TCP meter `rtt` (`LATENCY tcp`) does not.
 ### Viewer (Rust)
 
 ```
-LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 shown_gap=… gap50=0 gap_long=0 gap_max_ms=34 discard=0 dec_fail=0 via=TCP render=soft
+LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=… queue=… decode=… to_ui=… ui_take=… total_to_ui(est)=… offset_err<=1.5ms queue_len=2 ui_dropped=3 ui_replaced=0 rtt_min=3ms rx_fps=30.0 dec_fps=29.9 shown_fps=29.9 skip=0 decode_skip=n/a decode_skip_conv=n/a noout=0 owed_lost=0 recheck_rej=0 rej_before=0 shown_gap=… gap50=0 gap_long=0 gap_max_ms=34 discard=0 dec_fail=0 via=TCP render=soft
 ```
 
 | Field | Meaning |
@@ -1244,6 +1244,7 @@ LATENCY client display=0 codec=H265 hw=false pacing=on fps=29.9 net+server(est)=
 | `decode_skip` | `decode` of the skipped frames that were decoded without output (`DecodeOutput::DecodedNoOutput`, see "Decode without output" below), p50/p95/max ms, `n/a` when there was none. `decode_skip` p50 against `decode` p50 is what a skipped frame saves. |
 | `decode_skip_conv` | `decode` of the skipped frames that were converted anyway, p50/p95/max ms, `n/a` when there was none: a frame that turned stale only during its decode, every skipped frame with `enable-viewer-decode-no-output` off, and every skipped frame of a decoder that always outputs (AMF/MFX GPU decoders). Kept apart so `decode_skip` stays a pure no-output time. |
 | `noout` | of the decoded frames, those decoded without output (`DecodeOutput::DecodedNoOutput`), count in the window. Equal to `skip` when every skipped frame was decided before its decode; lower when a frame turned stale only during its decode (the callback is skipped then, the conversion was already done) or the decoder always outputs (AMF/MFX GPU decoders) |
+| `owed_lost` / `recheck_rej` / `rej_before` | why decoded frames were not shown, counts in the window: `owed_lost` frames present pacing would show whose picture was not out after the decode (`DecodedNoOutput`; with surface decoding nothing is rendered for them, and their late picture is lost unless the thread goes idle before the next frame), `recheck_rej` frames that had their picture but the check after the decode rejected, `rej_before` frames rejected before the decode. They do not add up to `skip`: a frame the check after the decode rejected before its picture was out is in none of them, and an `owed_lost` frame whose picture `surface::idle` renders later is also counted as shown |
 | `gap50` / `gap_long` / `gap_max_ms` | shown gaps (as `shown_gap`) over 50 ms up to 1 s (stutters), over 1 s (an idle screen or a freeze; a live lane's `UDPVIDEO viewer` `fix_ms` / `request stop` tell which), and the longest one, not clipped at 1 s. Counts per window, so TCP and UDP runs compare as gaps per minute |
 | `shown_gap` | time between two consecutive frames that reached the screen (`to_ui` done → next `to_ui` done; frames counted in `ui_dropped`, and frames a later one replaced (`ui_replaced`), are left out: the gap runs from the frame shown before the replaced one to the replacing one), p50/p95/max ms. A gap is added once the next frame did not replace its frame, so the newest one lands in the next window. Gaps over 1 s (static screen) are left out. Its p95 shows stutter: with pacing on it must not grow in calm use. |
 | `discard` | received frames dropped undecoded, count in the window: `discard_queue` after a refresh request, or evicted by a full 120-deep queue |
@@ -1312,7 +1313,18 @@ The software decoder stays the fallback, automatically and per display:
 - the oldest frame given to the decoder has waited 1 s for its picture.
 
 A decoder that failed blocks its surface: that display stays on software until the view makes
-a new texture (another size, a reconnect). A surface failure never counts towards
+a new texture (another size, a reconnect), or until the block's retry is due: 3 s after the
+first failure, then 10 s, 30 s, 60 s and 60 s (`retry_in_s=` on the `state=fallback` line).
+The retry (`state=retry attempt=K`) only lifts the block, while the view still shows that
+surface, the option is on and nothing is recorded; the decoder then starts the normal way
+below (a key frame asked for, at most once a second). Its failure blocks again with the next
+delay. After 6 failures of the same surface generation without stable output, or a start
+failure that cannot pass (a surface without a size), that surface is not tried again
+(`retry_in_s=-1` and `state=retry_exhausted gen=G fails=N`): each retry costs a key frame
+request, a picture frozen up to 1 s when it fails by stalling, and the decoder setup on the
+video thread. A new texture (another generation) starts with a fresh count. A picture rendered
+60 s or more after a decoder's first picture starts the delays over (`state=stable
+backoff=reset`; a still screen in between counts as stable). A surface failure never counts towards
 `fail_counter` and never marks the codec unsupported towards the host. A decoder starts only
 on a key frame; the display's video thread asks for one (`refresh_video`) at most once a
 second, and until it arrives the picture is frozen (the queue is discarded up to the key
@@ -1340,25 +1352,33 @@ LATENCY client surface display=1 state=refresh
 LATENCY client decoder display=1 codec=H265 path=mediacodec-surface/c2.qti.hevc.decoder hw=true use_texture_render=false render=surface size=1920x1080 cfg=0 gen=3
 LATENCY client surface display=1 state=format decoder=c2.qti.hevc.decoder buffer=1920x1088 picture=1920x1080 crop=Some((0, 0, 1919, 1079)) format=…
 SURFDEC display=1 name=c2.qti.hevc.decoder in=150 out=150 rendered=148 dropped=2 out_ms=7.9/11.2/14.0 late=0 lag=0 waiting=0
-LATENCY client surface display=1 state=fallback render=soft decoder=c2.qti.hevc.decoder reason="decode: no output for 1003 ms (1 access units waiting)"
+LATENCY client surface display=1 state=fallback render=soft decoder=c2.qti.hevc.decoder reason="decode: no output for 1003 ms (1 access units waiting)" retry_in_s=3
+LATENCY client surface display=1 state=retry attempt=1 gen=3
+LATENCY client surface display=1 state=refresh
+LATENCY client decoder display=1 codec=H265 path=mediacodec-surface/c2.qti.hevc.decoder … gen=3
 ```
+
+The surface state lines (`state=fallback` with its reason, `state=retry`, `state=retry_exhausted`,
+`state=stable`, `state=config_retry`, the `decoder … path=mediacodec-surface` start and
+`state=released`) also go to logcat with tag
+`RustDeskSurface`, in release builds too: `adb logcat -s RustDeskSurface`.
 
 | Line / field | Meaning |
 |---|---|
 | `state=option` | once per video thread: the option as that thread read it |
 | `state=registered` / `unregistered` | a view gave Rust its texture's Surface, or took it back. `gen`: the registration's number (a decoder never outlives it); `texture`: the view's Flutter texture id; `hevc` / `avc`: the hardware decoders Kotlin picked from `MediaCodecList` (logcat tag `VideoTextures` lists all candidates with `lowLatency` and `maxInstances`) |
 | `state=refresh` | the video thread asked the host for a key frame, to start a decoder on |
-| `decoder … path=mediacodec-surface/<name>` | a surface decoder started. `cfg`: the configuration step that worked: 0 all keys (`low-latency`, `priority` 0, `operating-rate` 60, and on Qualcomm decoders `vendor.qti-ext-dec-low-latency.enable` and `vendor.qti-ext-dec-picture-order.enable`), 1 without the vendor keys, 2 also without `operating-rate`, 3 also without `low-latency`, 4 also without `priority`. A refused step is logged as `state=config_retry` |
+| `decoder … path=mediacodec-surface/<name>` | a surface decoder started. `cfg`: the configuration step that worked: 0 all keys (`low-latency`, `priority` 0, `operating-rate` = the session's custom fps (at least 60; 120 without one), and on Qualcomm decoders `vendor.qti-ext-dec-low-latency.enable` and `vendor.qti-ext-dec-picture-order.enable`), 1 without the vendor keys, 2 also without `operating-rate`, 3 also without `low-latency`, 4 also without `priority`. Steps 0 and 1 are tried with that rate, then again with 60 (order 0, 0@60, 1, 1@60, 2, 3, 4); `rate=`: the rate that worked, 0 from step 2 on. A refused try is logged as `state=config_retry` with its `step` and `rate` |
 | `state=format` | the decoder's output format: the buffer it renders, the picture inside it, and the format as the system prints it. A buffer larger than the picture is padding; the view cuts it off (Flutter draws the whole buffer) |
-| `state=fallback` | the surface decoder is gone and the software decoder takes over with the next key frame; `reason` says why. `state=reset`: the stream restarted (display switch, resolution change), a new decoder starts with the next key frame. `state=released`: no frame came and the decoder's surface is no longer registered (a closed panel, a switched display, a stopped activity, a memory trim): the hardware decoder is given back, checked twice a second |
-| `SURFDEC` | every 5 s while frames flow: access units queued (`in`), output buffers taken (`out`), rendered to the surface, released without rendering (`dropped`: a newer one was out, or present pacing did not show the frame); `out_ms` p50/p95/max from an access unit being queued to its output buffer being taken (the decoder's latency, late pictures included); `late`: frames whose picture was not out within the 30 ms the decode waits (it is shown when it comes, between frames); `lag`: of those, the ones for which an older picture was shown instead; `waiting`: access units still without a picture |
+| `state=fallback` | the surface decoder is gone and the software decoder takes over with the next key frame; `reason` says why. `retry_in_s` (a failure only): the surface is blocked and tried again after this many seconds, logged as `state=retry attempt=K gen=G` when it is. `state=reset`: the stream restarted (display switch, resolution change), a new decoder starts with the next key frame. `state=released`: no frame came and the decoder's surface is no longer registered (a closed panel, a switched display, a stopped activity, a memory trim): the hardware decoder is given back, checked twice a second |
+| `SURFDEC` | every 5 s while frames flow: access units queued (`in`), output buffers taken (`out`), rendered to the surface, released without rendering (`dropped`: a newer one was out, or present pacing did not show the frame); `out_ms` p50/p95/max from an access unit being queued to its output buffer being taken (the decoder's latency, late pictures included); `late`: frames whose picture was not out within the decode's wait (30 ms, 9 ms during a backlog); a late picture is shown only if the thread goes idle first (or in place of the next shown frame's late picture, `lag`), otherwise the next frame's decode drops it; `lag`: of those, the ones for which an older picture was shown instead; `waiting`: access units still without a picture |
 
 The `LATENCY client` line with `render=surface`:
 
 | Field | Meaning with `render=surface` |
 |---|---|
 | `hw` | `true` |
-| `decode` | access unit queued → its output buffer available, as far as the decode waited for it (at most 30 ms, and not at all while newer frames wait): the decoder's latency, not CPU time. `SURFDEC out_ms` has it without the cap |
+| `decode` | access unit queued → its output buffer available, as far as the decode waited for it (at most 30 ms; while newer frames wait at most 9 ms, option `enable-android-surface-backlog-wait`, "N": not at all): the decoder's latency, not CPU time. `SURFDEC out_ms` has it without the cap |
 | `to_ui` | the output buffer released to the surface (`releaseOutputBuffer`) → the call returned. What Flutter does with it afterwards (one of its frames, its raster thread, the system compositor) is not in any Rust number |
 | `ui_take` | `n/a`: no picture goes through Dart |
 | `ui_dropped`, `ui_replaced` | 0 |
@@ -1806,7 +1826,8 @@ adb logcat | grep LATENCY
 The Rust lines are also in the app's log file
 (`<app files>/RustDesk/Logs`), readable with `adb shell run-as <package>` only
 on debuggable builds. Debug builds log Rust directly to logcat (tag `ffi`), so
-there each client line appears twice.
+there each client line appears twice. The Android surface decoder's state lines are
+written to logcat directly, tag `RustDeskSurface` (see "Android surface decoding").
 
 ## Reading the numbers together
 

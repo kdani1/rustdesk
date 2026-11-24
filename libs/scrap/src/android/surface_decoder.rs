@@ -45,9 +45,15 @@ const INPUT_TRY: Duration = Duration::from_millis(10);
 const INPUT_TRIES: usize = 5;
 // A larger access unit is a decoder failure (software takes over).
 const MAX_INPUT_SIZE: i32 = 2 * 1024 * 1024;
-// The decoder's clock hint. Twice today's 30 fps stream rate, so the decoder does not idle
-// between frames; dropped first when the decoder refuses the configuration (several panels).
-const OPERATING_RATE: i32 = 60;
+// The decoder's clock hint ("operating-rate") is the caller's: the stream's expected fps. A
+// fixed 60 under-clocked the decoder for the 90 fps stream (decode p95 4.5 -> 8 ms with 2-3
+// panels). Set when a decoder starts (a custom-fps change reaches the next decoder). When the
+// decoder refuses the configuration (several panels) the step is retried with the old 60
+// before the rate is dropped. Bounds for what the caller passes; the floor is the old 60.
+const OPERATING_RATE_MIN: i32 = 60;
+const OPERATING_RATE_MAX: i32 = 240;
+// The rate every decoder was configured with before; the retry when the caller's is refused.
+const OPERATING_RATE_FALLBACK: i32 = 60;
 // The oldest access unit still waiting for its picture has waited this long: the decoder is
 // stuck or holds pictures back.
 const STALL: Duration = Duration::from_secs(1);
@@ -91,6 +97,22 @@ lazy_static::lazy_static! {
     static ref SURFACES: RwLock<HashMap<(String, usize), SurfaceRef>> = Default::default();
 }
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Writes a surface state line to logcat too (tag "RustDeskSurface"): a release build logs Rust
+/// only to a file in the app's private data, and a fallback's reason must be readable with adb.
+pub fn logcat(level: log::Level, line: &str) {
+    let prio = match level {
+        log::Level::Error => 6,
+        log::Level::Warn => 5,
+        _ => 4,
+    };
+    let Ok(text) = CString::new(line.replace('\0', " ")) else {
+        return;
+    };
+    unsafe {
+        ffi::__android_log_write(prio, c!("RustDeskSurface"), text.as_ptr());
+    }
+}
 
 /// The surface UI session `sid` (lowercase hyphenated uuid) registered for `display`.
 pub fn get_surface(sid: &str, display: usize) -> Option<SurfaceRef> {
@@ -234,6 +256,8 @@ pub struct SurfaceDecoder {
     pub name: String,
     /// The configuration step that worked (0: every key).
     pub config_step: usize,
+    /// The "operating-rate" the decoder was configured with, 0 when that step dropped it.
+    pub operating_rate: i32,
     display: usize,
     width: i32,
     height: i32,
@@ -313,21 +337,43 @@ unsafe fn crop_rect(fmt: *mut ffi::AMediaFormat) -> Option<(i32, i32, i32, i32)>
 impl SurfaceDecoder {
     /// Creates, configures and starts a decoder that renders into `s`. Tries the full low
     /// latency configuration first and drops keys step by step when the decoder refuses it.
-    pub fn new(hevc: bool, s: &SurfaceRef, display: usize) -> ResultType<Self> {
+    /// `operating_rate`: the stream's expected frames per second (the decoder's clock hint),
+    /// clamped to 60..=240.
+    pub fn new(
+        hevc: bool,
+        s: &SurfaceRef,
+        display: usize,
+        operating_rate: i32,
+    ) -> ResultType<Self> {
         if s.width <= 0 || s.height <= 0 {
             bail!("surface size {}x{}", s.width, s.height);
         }
+        let operating_rate = operating_rate.clamp(OPERATING_RATE_MIN, OPERATING_RATE_MAX);
         let mime = if hevc { "video/hevc" } else { "video/avc" };
         let cmime = CString::new(mime)?;
         let wanted = if hevc { &s.hevc } else { &s.avc };
         let qti = wanted.starts_with("c2.qti.") || wanted.starts_with("OMX.qcom.");
         let mut last = String::new();
         // 0: every key; 1: no vendor keys; 2: also no operating-rate; 3: also no low-latency;
-        // 4: also no priority.
+        // 4: also no priority. Steps 0 and 1 are tried with the caller's rate, then with the old
+        // 60 (admission of one more realtime decoder depends on size x rate: a higher rate
+        // refused must not cost the rate and the vendor keys), (step, rate):
+        // (0,R) (0,60) (1,R) (1,60) (2,-) (3,-) (4,-); the 60 retries only when R > 60.
+        let mut tries: Vec<(usize, i32)> = Vec::with_capacity(7);
         for step in 0..5usize {
             if step == 1 && !qti {
                 continue;
             }
+            if step < 2 {
+                tries.push((step, operating_rate));
+                if operating_rate > OPERATING_RATE_FALLBACK {
+                    tries.push((step, OPERATING_RATE_FALLBACK));
+                }
+            } else {
+                tries.push((step, 0));
+            }
+        }
+        for (step, rate) in tries {
             unsafe {
                 let Some((codec, name)) = create(wanted, &cmime) else {
                     bail!("no {mime} decoder (wanted {wanted:?})");
@@ -342,14 +388,16 @@ impl SurfaceDecoder {
                 ffi::AMediaFormat_setInt32(fmt, c!("height"), s.height);
                 ffi::AMediaFormat_setInt32(fmt, c!("max-input-size"), MAX_INPUT_SIZE);
                 if step < 4 {
-                    // 0: realtime.
+                    // 0: realtime. Kept as before for every decoder (the first panel's
+                    // included); a decoder that cannot admit one more realtime session
+                    // refuses the configuration and the ladder drops the keys below.
                     ffi::AMediaFormat_setInt32(fmt, c!("priority"), 0);
                 }
                 if step < 3 {
                     ffi::AMediaFormat_setInt32(fmt, c!("low-latency"), 1);
                 }
                 if step < 2 {
-                    ffi::AMediaFormat_setInt32(fmt, c!("operating-rate"), OPERATING_RATE);
+                    ffi::AMediaFormat_setInt32(fmt, c!("operating-rate"), rate);
                 }
                 if step < 1 && qti {
                     ffi::AMediaFormat_setInt32(
@@ -380,6 +428,7 @@ impl SurfaceDecoder {
                             hevc,
                             name,
                             config_step: step,
+                            operating_rate: rate,
                             display,
                             width: s.width,
                             height: s.height,
@@ -402,13 +451,16 @@ impl SurfaceDecoder {
                 }
                 ffi::AMediaCodec_delete(codec);
             }
-            log::warn!(
-                "LATENCY client surface display={} state=config_retry step={} decoder={:?} {}",
+            let line = format!(
+                "LATENCY client surface display={} state=config_retry step={} rate={} decoder={:?} {}",
                 display,
                 step,
+                rate,
                 wanted,
                 last
             );
+            log::warn!("{}", line);
+            logcat(log::Level::Warn, &line);
         }
         bail!("{mime} decoder {wanted:?}: {last}")
     }

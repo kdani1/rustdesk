@@ -5,3 +5,7 @@
 
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+# Quest game mode: called by name from Rust over JNI (src/client/xr/session.rs, notify_exit).
+-keep class com.carriez.flutter_hbb.XrActivity {
+    public void onXrExit(java.lang.String);
+}

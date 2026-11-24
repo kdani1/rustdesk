@@ -84,6 +84,9 @@ protobuf {
 android {
     namespace "com.carriez.flutter_hbb"
     compileSdkVersion 36
+    // The NDK installed for the Rust build (C:\RustDeskBuild\latency\env-android.cmd); without a
+    // pin AGP wants its default NDK to strip the native libraries (now also the OpenXR loader's).
+    ndkVersion "28.2.13676358"
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
 
@@ -100,7 +103,8 @@ android {
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId "com.carriez.flutter_hbb"
-        minSdkVersion 22
+        // 24: what the OpenXR loader AAR declares (Quest game mode). Quest runs API 32+.
+        minSdkVersion 24
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
@@ -145,4 +149,7 @@ dependencies {
     implementation("org.jetbrains.kotlin:kotlin-stdlib") { version { strictly("1.9.10") } }
     implementation 'com.caverock:androidsvg-aar:1.4'
     implementation "rustls:rustls-platform-verifier:0.1.1"
+    // Quest game mode: libopenxr_loader.so, loaded at run time by src/client/xr (openxr crate,
+    // feature "loaded"). Its manifest adds the OpenXR runtime-broker permissions and queries.
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.53'
 }

@@ -1672,6 +1672,14 @@ class AndroidDisplayPanels {
   /// The restore question was asked on this connection.
   bool restoreOffered = false;
 
+  /// Quest game mode (XrActivity) is on: the panels sit behind the immersive view and the
+  /// system may close them. Until it ends, a closed panel never unplugs its display (no
+  /// [trimTrailing] / [_trimIdd], no unplug in [onPanelClosed]); the displays whose panel
+  /// went are recorded and get one again when game mode ends ([onGameModeExited]).
+  bool gameModeSuspended = false;
+  // [_identity] of each display whose panel closed during game mode.
+  final _gameModeClosed = <String>[];
+
   bool get isOpen => _open.isNotEmpty;
   bool isPanelOpen(int display) => _open.containsKey(display);
   bool get _waitingForDisplay =>
@@ -1699,7 +1707,45 @@ class AndroidDisplayPanels {
     _iddFresh.clear();
     _orphans.clear();
     _resyncTimer?.cancel();
+    gameModeSuspended = false;
+    _gameModeClosed.clear();
     revision.value++;
+  }
+
+  /// Quest game mode is about to start: the main view shows one display (switching from
+  /// "all displays" if needed), and panels stop unplugging displays. Returns that display.
+  Future<int> enterGameMode(FFI ffi) async {
+    final pi = ffi.ffiModel.pi;
+    var d = pi.currentDisplay;
+    if (d == kAllDisplayValue || d < 0 || d >= pi.displays.length) {
+      d = mainDisplay(ffi);
+      _openMonitorInTheSameTab(d, ffi, pi);
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    gameModeSuspended = true;
+    _gameModeClosed.clear();
+    debugPrint('[panel] game mode on: display $d, ${_open.length} panels');
+    return d;
+  }
+
+  /// Quest game mode ended ([reason] from the XR side): displays may be unplugged again, and
+  /// the panels the system closed meanwhile are reopened.
+  Future<void> onGameModeExited(FFI ffi, String reason) async {
+    if (!gameModeSuspended) return;
+    gameModeSuspended = false;
+    final ids = List<String>.of(_gameModeClosed);
+    _gameModeClosed.clear();
+    if (ffi.closed || isDisplayPanel) return;
+    final displays = <int>[];
+    for (final id in ids) {
+      final d = _findIdentity(ffi, id);
+      if (d >= 0 && !_open.containsKey(d) && !displays.contains(d)) displays.add(d);
+    }
+    debugPrint('[panel] game mode over ($reason): reopen displays $displays');
+    if (displays.isNotEmpty) await _openPanels(ffi, displays);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!ffi.closed) trimTrailing(ffi);
+    });
   }
 
   /// The display the main window shows.
@@ -2129,6 +2175,8 @@ class AndroidDisplayPanels {
   /// here again for the next one ([onDisplaysShrunk]).
   void trimTrailing(FFI ffi) {
     if (!isAndroid || isDisplayPanel || _busy || _waitingForDisplay) return;
+    // Game mode: the panels are hidden, not gone (see [gameModeSuspended]).
+    if (gameModeSuspended) return;
     if (isIddMode(ffi)) {
       _trimIdd(ffi);
       return;
@@ -2153,6 +2201,7 @@ class AndroidDisplayPanels {
   /// (one per call; the shorter list brings this here again). Displays plugged in by
   /// someone else stay.
   void _trimIdd(FFI ffi) {
+    if (gameModeSuspended) return;
     // Windows are still being moved to their displays.
     if (_resyncing || _resyncTimer?.isActive == true || _orphans.isNotEmpty) {
       return;
@@ -2244,6 +2293,16 @@ class AndroidDisplayPanels {
     if (_open[display] == sid) {
       _open.remove(display);
       final id = _openId.remove(display);
+      if (gameModeSuspended && reason != kPanelCloseConn) {
+        // Closed by the system behind the immersive view: the display stays plugged in and
+        // gets its panel back when game mode ends. Not saved: the next connection should
+        // still offer the panels as they were.
+        _gameModeClosed.add(id ?? _identity(gFFI, display));
+        debugPrint('[panel] display $display closed during game mode: reopen later');
+        _changed(gFFI, save: false);
+        if (gFFI.id.isNotEmpty) bind.setCurSessionId(sessionId: gFFI.sessionId);
+        return;
+      }
       _changed(gFFI);
       if (isIddMode(gFFI)) {
         // RustDesk IDD: exactly this window's display goes.

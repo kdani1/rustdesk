@@ -29,6 +29,11 @@ allprojects {
         google()
         jcenter()
         maven { url 'https://jitpack.io' }
+        // Only the OpenXR loader AAR of Quest game mode comes from Maven Central; everything
+        // else keeps resolving where it did.
+        mavenCentral {
+            content { includeGroup "org.khronos.openxr" }
+        }
     }
 }
 

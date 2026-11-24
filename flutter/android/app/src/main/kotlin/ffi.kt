@@ -2,6 +2,7 @@
 
 package ffi
 
+import android.app.Activity
 import android.content.Context
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -35,4 +36,11 @@ object FFI {
     external fun setVideoSurface(sid: String, display: Int, surface: Surface?, texture: Long, width: Int, height: Int, hevc: String, avc: String)
     // Buffers rendered to that Surface so far, -1 without one.
     external fun videoSurfaceRendered(sid: String, display: Int): Long
+    // Quest game mode (Rust feature quest-xr, src/client/xr): absent from other builds, so
+    // callers catch UnsatisfiedLinkError. xrStart starts the OpenXR thread for XrActivity
+    // [activity] and returns at once; xrStop and xrRequestExit only raise flags (never block).
+    external fun xrStart(activity: Activity, sid: String, display: Int, width: Int, height: Int, pad: Int): Boolean
+    external fun xrStop()
+    external fun xrRequestExit()
+    external fun xrLifecycle(resumed: Boolean)
 }

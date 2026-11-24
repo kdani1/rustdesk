@@ -330,6 +330,9 @@ impl StreamLatency {
         c.discarded += t.discarded;
         c.decoded += t.decoded;
         c.no_output += t.no_output;
+        c.rej_before += t.rej_before;
+        c.owed_lost += t.owed_lost;
+        c.recheck_rej += t.recheck_rej;
         c.failed += t.failed;
         c.shown += t.shown;
         c.ui_lost += t.ui_lost;
@@ -483,7 +486,7 @@ impl StreamLatency {
             let fmt_rate = |n: usize| rate(n).map_or("n/a".to_owned(), |r| format!("{:.1}", r));
             let skipped = c.decoded.saturating_sub(c.shown);
             let line = format!(
-                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} shown_gap={} gap50={} gap_long={} gap_max_ms={} discard={} dec_fail={} via={} render={}",
+                "LATENCY client display={} codec={} hw={} pacing={} fps={:.1} net+server(est)={} queue={} decode={} to_ui={} ui_take={} total_to_ui(est)={} offset_err<={} queue_len={} ui_dropped={} ui_replaced={} rtt_min={} rx_fps={} dec_fps={} shown_fps={} skip={} decode_skip={} decode_skip_conv={} noout={} owed_lost={} recheck_rej={} rej_before={} shown_gap={} gap50={} gap_long={} gap_max_ms={} discard={} dec_fail={} via={} render={}",
                 self.display,
                 self.codec.map_or("-".to_owned(), |c| c.to_string()),
                 self.gpu_texture,
@@ -507,6 +510,10 @@ impl StreamLatency {
                 format_summary(decode_skip),
                 format_summary(decode_skip_conv),
                 c.no_output,
+                // Why decoded frames were not shown (`VideoCountersTick`).
+                c.owed_lost,
+                c.recheck_rej,
+                c.rej_before,
                 format_summary(shown_gap),
                 self.gap50,
                 self.gap_long,

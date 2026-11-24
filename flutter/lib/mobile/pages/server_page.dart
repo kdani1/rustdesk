@@ -922,6 +922,14 @@ void androidChannelInit() {
               arguments["display"] as int, arguments["sid"] as String,
               reason: arguments["reason"] as String? ?? kPanelCloseUser);
           break;
+        case "game_mode_exited":
+          // Quest game mode ended (GameMode.onMainResumed in XrActivity.kt).
+          {
+            final reason = arguments["reason"] as String? ?? '';
+            if (reason.startsWith('error')) showToast('Játék mód: $reason');
+            androidDisplayPanels.onGameModeExited(gFFI, reason);
+          }
+          break;
         case "start_capture":
           {
             gFFI.dialogManager.dismissAll();
